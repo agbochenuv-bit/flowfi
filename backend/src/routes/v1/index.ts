@@ -7,8 +7,14 @@ import adminRoutes from "./admin.routes.js";
 import webhookRoutes from "./webhook.routes.js";
 import analyticsRoutes from "./analytics.routes.js";
 import tokenRoutes from "./token.routes.js";
+import { validateRequest } from "../../middleware/validateRequest.js";
 
 const router = Router();
+
+// Centralized request validation for all versioned routes.
+// Runs before any route/controller handler so malformed payloads,
+// path parameters, and query parameters are rejected consistently.
+router.use(validateRequest);
 
 // V1 API Routes
 router.use("/streams", streamRoutes);

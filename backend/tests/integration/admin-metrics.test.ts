@@ -163,11 +163,13 @@ describe('GET /v1/events/stats', () => {
   it('enforces requireAdmin (401 without token, 403 with non-admin token)', async () => {
     const noTokenRes = await request(app).get('/v1/events/stats');
     expect(noTokenRes.status).toBe(401);
+    expect(noTokenRes.body).toEqual({ error: 'Unauthorized' });
 
     const nonAdminRes = await request(app)
       .get('/v1/events/stats')
       .set('Authorization', `Bearer ${createToken(NON_ADMIN_PUBLIC_KEY)}`);
     expect(nonAdminRes.status).toBe(403);
+    expect(nonAdminRes.body).toEqual({ error: 'Forbidden' });
 
     const adminRes = await request(app)
       .get('/v1/events/stats')
@@ -194,6 +196,25 @@ describe('GET /v1/admin/metrics', () => {
     // run as raw SQL aggregates; default to empty results so tests that don't
     // care about them see zeroed metrics.
     mocks.prisma.$queryRaw.mockResolvedValue([]);
+  });
+
+  it('rejects non-admin wallets with a standardized 403 error shape', async () => {
+    const res = await request(app)
+      .get('/v1/admin/metrics')
+      .set('Authorization', `Bearer ${createToken(NON_ADMIN_PUBLIC_KEY)}`);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'Forbidden' });
+    expect(mocks.prisma.stream.count).not.toHaveBeenCalled();
+    expect(mocks.prisma.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('rejects unauthenticated requests with a standardized 401 error shape', async () => {
+    const res = await request(app).get('/v1/admin/metrics');
+
+    expect(res.status).toBe(401);
+    expect(res.body).toEqual({ error: 'Unauthorized' });
+    expect(mocks.prisma.stream.count).not.toHaveBeenCalled();
   });
 
   it('returns the snake_case summary required by the public contract', async () => {
@@ -329,6 +350,27 @@ describe('GET /v1/admin/metrics', () => {
     expect(res.body).toMatchObject(cachedPayload);
     expect(mocks.prisma.stream.count).not.toHaveBeenCalled();
     expect(mocks.prisma.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('returns a standardized 500 error shape without leaking internals when aggregation fails', async () => {
+    mocks.prisma.stream.count.mockRejectedValue(
+      new Error('connect ECONNREFUSED 10.0.0.5:5432 prisma.stream'),
+    );
+
+    const res = await request(app)
+      .get('/v1/admin/metrics')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toHaveProperty('error');
+    expect(typeof res.body.error).toBe('string');
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('ECONNREFUSED');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('prisma');
+    expect(serialized).not.toContain('stack');
+    expect(res.body).not.toHaveProperty('stack');
+    expect(res.body).not.toHaveProperty('details');
   });
 
   it('exposes indexer event-processing counters and degraded signal (#844)', async () => {
@@ -500,6 +542,26 @@ describe('GET /v1/admin/indexer/status', () => {
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Failed to fetch indexer status' });
   });
+
+  it('does not leak internal identifiers or stack traces on internal failure', async () => {
+    vi.mocked(getIndexerStatus).mockRejectedValueOnce(
+      new Error('connect ECONNREFUSED 10.0.0.5:5432 prisma.indexerState'),
+    );
+
+    const res = await request(app)
+      .get('/v1/admin/indexer/status')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Failed to fetch indexer status' });
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('ECONNREFUSED');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('prisma');
+    expect(serialized).not.toContain('stack');
+    expect(res.body).not.toHaveProperty('stack');
+    expect(res.body).not.toHaveProperty('details');
+  });
 });
 
 describe('POST /v1/admin/indexer/reset', () => {
@@ -573,6 +635,25 @@ describe('POST /v1/admin/indexer/reset', () => {
 
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Reset failed' });
+  });
+
+  it('does not leak internal identifiers or stack traces when reset fails', async () => {
+    vi.mocked(resetIndexer).mockRejectedValueOnce(
+      new Error('update failed for indexer_state at 10.0.0.5:5432'),
+    );
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/reset')
+      .set('Authorization', `Bearer ${createToken()}`)
+      .send({ ledger: 100 });
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Reset failed' });
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('indexer_state');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('stack');
+    expect(res.body).not.toHaveProperty('stack');
   });
 
   it('returns a dry-run preview without calling resetIndexer when dryRun=true', async () => {
@@ -686,6 +767,24 @@ describe('POST /v1/admin/indexer/replay', () => {
     expect(res.body).toEqual({ error: 'Replay failed' });
   });
 
+  it('does not leak internal identifiers or stack traces when replay fails', async () => {
+    vi.mocked(replayFromLedger).mockRejectedValueOnce(
+      new Error('replay failed: stream_events scan at 10.0.0.5:5432'),
+    );
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/replay?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Replay failed' });
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('stream_events');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('stack');
+    expect(res.body).not.toHaveProperty('stack');
+  });
+
   it('returns a dry-run preview without triggering a replay when dryRun=true', async () => {
     const preview = {
       fromLedger: 200,
@@ -728,6 +827,24 @@ describe('POST /v1/admin/indexer/replay', () => {
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ error: 'Replay failed' });
     expect(replayFromLedger).not.toHaveBeenCalled();
+  });
+
+  it('does not leak internal identifiers or stack traces when a dry-run preview fails', async () => {
+    vi.mocked(previewReplay).mockRejectedValueOnce(
+      new Error('preview failed: stream_events at 10.0.0.5:5432'),
+    );
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/replay?from_ledger=200&dryRun=true')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Replay failed' });
+    const serialized = JSON.stringify(res.body);
+    expect(serialized).not.toContain('stream_events');
+    expect(serialized).not.toContain('10.0.0.5');
+    expect(serialized).not.toContain('stack');
+    expect(res.body).not.toHaveProperty('stack');
   });
 });
 

@@ -186,6 +186,10 @@ app.get("/", (req: Request, res: Response) => {
 
 import { errorHandler } from "./middleware/error.middleware.js";
 
+// Centralized error handler. Must be registered last so every route,
+// validation middleware, and async controller rejection funnels through the
+// single error-mapping boundary. Express 5 forwards rejected promises from
+// async handlers to this middleware automatically.
 app.use(errorHandler);
 
 export default app;

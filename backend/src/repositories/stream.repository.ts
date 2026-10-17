@@ -41,6 +41,46 @@ export interface FindStreamsResult {
   hasMore: boolean;
 }
 
+export interface StreamOwnership {
+  streamId: bigint;
+  sender: string;
+  recipient: string;
+}
+
+/**
+ * Look up the on-chain sender/recipient for a stream directly from the DB.
+ * Used by authorization helpers so ownership is never derived from
+ * client-supplied addresses.
+ */
+export const findStreamOwnership = async (streamId: bigint): Promise<StreamOwnership | null> => {
+  const stream = await prisma.stream.findUnique({
+    where: { streamId },
+    select: { streamId: true, sender: true, recipient: true },
+  });
+
+  return stream ?? null;
+};
+
+/**
+ * Look up ownership for multiple streams in a single query.
+ * Returns a map keyed by the stringified streamId; missing streams are omitted.
+ */
+export const findStreamOwnershipBatch = async (streamIds: bigint[]): Promise<Map<string, StreamOwnership>> => {
+  const ownership = new Map<string, StreamOwnership>();
+  if (streamIds.length === 0) return ownership;
+
+  const streams = await prisma.stream.findMany({
+    where: { streamId: { in: streamIds } },
+    select: { streamId: true, sender: true, recipient: true },
+  });
+
+  for (const stream of streams) {
+    ownership.set(stream.streamId.toString(), stream);
+  }
+
+  return ownership;
+};
+
 export const findStreams = async (params: FindStreamsParams): Promise<FindStreamsResult> => {
   const where: StreamWhere = {};
 

@@ -218,6 +218,41 @@ describe("Stream Controller", () => {
         })
       );
     });
+
+    it('should return 400 for an invalid recipient address', async () => {
+      req.body.recipient = 'not-a-stellar-address';
+      await createStream(req as Request, res as Response);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 for a negative ratePerSecond', async () => {
+      req.body.ratePerSecond = '-5';
+      await createStream(req as Request, res as Response);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 for a non-numeric startTime', async () => {
+      req.body.startTime = 'yesterday';
+      await createStream(req as Request, res as Response);
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.upsert).not.toHaveBeenCalled();
+    });
+
+    it('should not leak internal identifiers or stack traces on unexpected failures', async () => {
+      (prisma.stream.findUnique as any).mockRejectedValue(
+        new Error('connect ECONNREFUSED 10.0.0.5:5432'),
+      );
+
+      await createStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      const body = (res.json as any).mock.calls[0][0];
+      expect(JSON.stringify(body)).not.toContain('ECONNREFUSED');
+      expect(JSON.stringify(body)).not.toContain('10.0.0.5');
+      expect(body.stack).toBeUndefined();
+    });
   });
 
   describe("listStreams", () => {
@@ -236,6 +271,41 @@ describe("Stream Controller", () => {
       expect(res.json).toHaveBeenCalledWith(
         expect.objectContaining({ total: 0 }),
       );
+    });
+
+    it('should return 400 for an invalid address query parameter', async () => {
+      req.query = { address: 'not-an-address', limit: '10', offset: '0' };
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findMany).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 for a non-numeric limit query parameter', async () => {
+      req.query = {
+        address: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ',
+        limit: 'abc',
+        offset: '0',
+      };
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findMany).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 for a negative offset query parameter', async () => {
+      req.query = {
+        address: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ',
+        limit: '10',
+        offset: '-1',
+      };
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findMany).not.toHaveBeenCalled();
     });
   });
 
@@ -268,6 +338,15 @@ describe("Stream Controller", () => {
         }),
       );
     });
+
+    it("should return 400 for a non-numeric streamId path parameter", async () => {
+      req.params = { streamId: "abc" };
+
+      await getStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findUnique).not.toHaveBeenCalled();
+    });
   });
 
   describe('getStreamEvents', () => {
@@ -289,6 +368,26 @@ describe("Stream Controller", () => {
         }),
       );
     });
+
+    it('should return 400 for an invalid streamId path parameter', async () => {
+      req.params = { streamId: 'abc' };
+      req.query = { limit: '10', offset: '0' };
+
+      await getStreamEvents(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
+    });
+
+    it('should return 400 for a non-numeric limit query parameter', async () => {
+      req.params = { streamId: '123' };
+      req.query = { limit: 'abc', offset: '0' };
+
+      await getStreamEvents(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
+    });
   });
 
   describe("getStreamClaimableAmount", () => {
@@ -308,6 +407,15 @@ describe("Stream Controller", () => {
       expect(res.json).toHaveBeenCalledWith(
         expect.objectContaining({ claimableAmount: "100" }),
       );
+    });
+
+    it("should return 400 for an invalid streamId path parameter", async () => {
+      req.params = { streamId: "abc" };
+
+      await getStreamClaimableAmount(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findUnique).not.toHaveBeenCalled();
     });
   });
 
@@ -449,6 +557,79 @@ describe("Stream Controller", () => {
 
       expect(res.status).toHaveBeenCalledWith(200);
     });
+
+    it("should return 401 when the request is unauthenticated", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = undefined;
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+    });
+
+    it("should return 403 when a different wallet tries to pause the stream", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GATTACKER" };
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        streamId: 123,
+        sender: "GVICTIM",
+        isPaused: false,
+        isActive: true,
+      });
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+      expect(prisma.stream.update).not.toHaveBeenCalled();
+    });
+
+    it("should return 400 for an invalid streamId path parameter", async () => {
+      req.params = { streamId: "abc" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+    });
+
+    it("should return 400 when the secret is missing", async () => {
+      req.params = { streamId: "123" };
+      req.body = {};
+      (req as any).user = { publicKey: "GUSER1" };
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+    });
+
+    it("should surface domain errors from the chain service without leaking details", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        streamId: 123,
+        sender: "GUSER1",
+        isPaused: false,
+        isActive: true,
+      });
+      (sorobanService.pauseStream as any).mockRejectedValue(
+        new Error("simulation failed: contract error #42"),
+      );
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(500);
+      const body = (res.json as any).mock.calls[0][0];
+      expect(body.stack).toBeUndefined();
+      expect(JSON.stringify(body)).not.toContain('contract error #42');
+    });
   });
 
   describe("resumeStream", () => {
@@ -474,6 +655,47 @@ describe("Stream Controller", () => {
       await resumeStream(req as Request, res as Response);
 
       expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    it("should return 401 when the request is unauthenticated", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = undefined;
+
+      await resumeStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(401);
+      expect(sorobanService.resumeStream).not.toHaveBeenCalled();
+    });
+
+    it("should return 403 when a different wallet tries to resume the stream", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GATTACKER" };
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        streamId: 123,
+        sender: "GVICTIM",
+        isPaused: true,
+        isActive: true,
+        pausedAt: Math.floor(Date.now() / 1000),
+      });
+
+      await resumeStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(sorobanService.resumeStream).not.toHaveBeenCalled();
+      expect(prisma.stream.update).not.toHaveBeenCalled();
+    });
+
+    it("should return 400 for an invalid streamId path parameter", async () => {
+      req.params = { streamId: "abc" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+
+      await resumeStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(sorobanService.resumeStream).not.toHaveBeenCalled();
     });
   });
 });

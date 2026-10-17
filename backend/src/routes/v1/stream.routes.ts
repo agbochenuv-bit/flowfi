@@ -15,6 +15,17 @@ import { simulateStreamHandler } from '../../controllers/stream/simulate.js';
 import { withdrawHandler } from './streams/withdraw.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { streamCreationRateLimiter } from '../../middleware/stream-rate-limiter.middleware.js';
+import { validateRequest } from '../../middleware/validate-request.middleware.js';
+import {
+  createStreamSchema,
+  listStreamsQuerySchema,
+  streamIdParamsSchema,
+  streamEventsQuerySchema,
+  claimableQuerySchema,
+  summaryParamsSchema,
+  topUpBodySchema,
+  simulateBodySchema,
+} from '../../validation/stream.schemas.js';
 
 const router = Router();
 
@@ -84,7 +95,7 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - sender does not match the authenticated wallet, or stream is owned by another wallet
+ *         description: Forbidden - the authenticated wallet is not the stream sender. The `sender` field is derived from the authenticated wallet; any client-supplied value that does not match is rejected.
  *         content:
  *           application/json:
  *             schema:
@@ -102,7 +113,13 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/', requireAuth, streamCreationRateLimiter, createStream);
+router.post(
+  '/',
+  requireAuth,
+  streamCreationRateLimiter,
+  validateRequest({ body: createStreamSchema }),
+  createStream,
+);
 
 /**
  * @openapi
@@ -217,7 +234,7 @@ router.post('/', requireAuth, streamCreationRateLimiter, createStream);
  *       503:
  *         description: Stream contract is not configured
  */
-router.post('/simulate', simulateStreamHandler);
+router.post('/simulate', validateRequest({ body: simulateBodySchema }), simulateStreamHandler);
 
 /**
  * @openapi
@@ -283,7 +300,7 @@ router.post('/simulate', simulateStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/StreamListResponse'
  *       400:
- *         description: Invalid status or pagination parameters
+ *         description: Invalid status or pagination parameters (validated centrally; response shape is `{ success: false, error: { code, message, details } }`)
  *         content:
  *           application/json:
  *             schema:
@@ -295,7 +312,7 @@ router.post('/simulate', simulateStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/', listStreams);
+router.get('/', validateRequest({ query: listStreamsQuerySchema }), listStreams);
 
 /**
  * @openapi
@@ -319,7 +336,19 @@ router.get('/', listStreams);
  *             schema:
  *               $ref: '#/components/schemas/UserStreamSummary'
  *       400:
- *         description: Address is required
+ *         description: Address is required or is not a valid Stellar public key
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       401:
+ *         description: Unauthorized - missing or invalid authentication token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - the authenticated wallet may only read its own summary
  *         content:
  *           application/json:
  *             schema:
@@ -331,7 +360,12 @@ router.get('/', listStreams);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/summary/:address', getUserStreamSummary);
+router.get(
+  '/summary/:address',
+  requireAuth,
+  validateRequest({ params: summaryParamsSchema }),
+  getUserStreamSummary,
+);
 
 /**
  * @openapi
@@ -356,7 +390,7 @@ router.get('/summary/:address', getUserStreamSummary);
  *             schema:
  *               $ref: '#/components/schemas/Stream'
  *       400:
- *         description: Invalid streamId parameter
+ *         description: Invalid streamId parameter (must be a positive integer)
  *         content:
  *           application/json:
  *             schema:
@@ -374,7 +408,7 @@ router.get('/summary/:address', getUserStreamSummary);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/:streamId', getStream);
+router.get('/:streamId', validateRequest({ params: streamIdParamsSchema }), getStream);
 
 /**
  * @openapi
@@ -439,7 +473,7 @@ router.get('/:streamId', getStream);
  *             schema:
  *               $ref: '#/components/schemas/StreamEventListResponse'
  *       400:
- *         description: Invalid request parameters
+ *         description: Invalid request parameters (streamId, pagination, eventType, order)
  *         content:
  *           application/json:
  *             schema:
@@ -457,7 +491,11 @@ router.get('/:streamId', getStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/:streamId/events', getStreamEvents);
+router.get(
+  '/:streamId/events',
+  validateRequest({ params: streamIdParamsSchema, query: streamEventsQuerySchema }),
+  getStreamEvents,
+);
 
 /**
  * @openapi
@@ -488,7 +526,7 @@ router.get('/:streamId/events', getStreamEvents);
  *             schema:
  *               $ref: '#/components/schemas/ClaimableResponse'
  *       400:
- *         description: Invalid streamId or `at` parameter
+ *         description: Invalid streamId or `at` parameter (must be a non-negative integer)
  *         content:
  *           application/json:
  *             schema:
@@ -506,7 +544,11 @@ router.get('/:streamId/events', getStreamEvents);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get('/:streamId/claimable', getStreamClaimableAmount);
+router.get(
+  '/:streamId/claimable',
+  validateRequest({ params: streamIdParamsSchema, query: claimableQuerySchema }),
+  getStreamClaimableAmount,
+);
 
 /**
  * @openapi
@@ -545,7 +587,7 @@ router.get('/:streamId/claimable', getStreamClaimableAmount);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - caller is not the stream sender
+ *         description: Forbidden - the authenticated wallet is not the stream sender
  *         content:
  *           application/json:
  *             schema:
@@ -569,7 +611,12 @@ router.get('/:streamId/claimable', getStreamClaimableAmount);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/pause', requireAuth, pauseStream);
+router.post(
+  '/:streamId/pause',
+  requireAuth,
+  validateRequest({ params: streamIdParamsSchema }),
+  pauseStream,
+);
 
 /**
  * @openapi
@@ -608,7 +655,7 @@ router.post('/:streamId/pause', requireAuth, pauseStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - caller is not the stream sender
+ *         description: Forbidden - the authenticated wallet is not the stream sender
  *         content:
  *           application/json:
  *             schema:
@@ -632,7 +679,12 @@ router.post('/:streamId/pause', requireAuth, pauseStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/resume', requireAuth, resumeStream);
+router.post(
+  '/:streamId/resume',
+  requireAuth,
+  validateRequest({ params: streamIdParamsSchema }),
+  resumeStream,
+);
 
 /**
  * @openapi
@@ -671,7 +723,7 @@ router.post('/:streamId/resume', requireAuth, resumeStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - caller is not the stream recipient
+ *         description: Forbidden - the authenticated wallet is not the stream recipient
  *         content:
  *           application/json:
  *             schema:
@@ -695,7 +747,12 @@ router.post('/:streamId/resume', requireAuth, resumeStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/withdraw', requireAuth, withdrawHandler as any);
+router.post(
+  '/:streamId/withdraw',
+  requireAuth,
+  validateRequest({ params: streamIdParamsSchema }),
+  withdrawHandler as any,
+);
 
 /**
  * @openapi
@@ -747,7 +804,7 @@ router.post('/:streamId/withdraw', requireAuth, withdrawHandler as any);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - caller is not the stream sender
+ *         description: Forbidden - the authenticated wallet is not the stream sender
  *         content:
  *           application/json:
  *             schema:
@@ -771,7 +828,12 @@ router.post('/:streamId/withdraw', requireAuth, withdrawHandler as any);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
+router.post(
+  '/:streamId/top-up',
+  requireAuth,
+  validateRequest({ params: streamIdParamsSchema, body: topUpBodySchema }),
+  topUpStreamHandler,
+);
 
 /**
  * @openapi
@@ -810,7 +872,7 @@ router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       403:
- *         description: Forbidden - only the sender can cancel
+ *         description: Forbidden - only the authenticated stream sender can cancel
  *         content:
  *           application/json:
  *             schema:
@@ -834,6 +896,11 @@ router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/cancel', requireAuth, cancelStreamHandler as any);
+router.post(
+  '/:streamId/cancel',
+  requireAuth,
+  validateRequest({ params: streamIdParamsSchema }),
+  cancelStreamHandler as any,
+);
 
 export default router;

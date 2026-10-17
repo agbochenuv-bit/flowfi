@@ -2,6 +2,15 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireAdmin } from '../../middleware/auth.js';
 import { adminRateLimiter } from '../../middleware/admin-rate-limiter.middleware.js';
+import { validateRequest } from '../../middleware/validate-request.middleware.js';
+import { ApiError } from '../../lib/api-error.js';
+import {
+  adminDeadLetterIdParamsSchema,
+  adminDeadLetterQuerySchema,
+  adminIndexerResetBodySchema,
+  adminIndexerResetQuerySchema,
+  adminIndexerReplayQuerySchema,
+} from '../../schemas/admin.schemas.js';
 import {
   getIndexerStatus,
   resetIndexer,
@@ -300,7 +309,7 @@ router.get('/metrics', async (_req: Request, res: Response) => {
     res.json(withCalculatedAt(payload));
   } catch (err) {
     logger.error('Error fetching admin metrics:', err);
-    res.status(500).json({ error: 'Internal server error' });
+    throw new ApiError(500, 'Internal server error', 'INTERNAL_ERROR');
   }
 });
 
@@ -343,7 +352,8 @@ router.get('/indexer/status', async (req: Request, res: Response) => {
     const status = await getIndexerStatus();
     res.json(status);
   } catch (err) {
-    res.status(500).json({ error: 'Failed to fetch indexer status' });
+    logger.error('Error fetching indexer status:', err);
+    throw new ApiError(500, 'Failed to fetch indexer status', 'INTERNAL_ERROR');
   }
 });
 
@@ -382,7 +392,7 @@ router.get('/indexer/status', async (req: Request, res: Response) => {
  *                 ok: { type: boolean, example: true }
  *                 lastLedger: { type: integer }
  *       400:
- *         description: Invalid ledger value
+ *         description: Invalid ledger value or query parameters (validation error)
  *         content:
  *           application/json:
  *             schema:
@@ -406,27 +416,30 @@ router.get('/indexer/status', async (req: Request, res: Response) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/indexer/reset', async (req: Request, res: Response) => {
-  const ledger = Number(req.body?.ledger);
-  if (!Number.isInteger(ledger) || ledger < 0) {
-    res.status(400).json({ error: 'ledger must be a non-negative integer' });
-    return;
-  }
+router.post(
+  '/indexer/reset',
+  validateRequest({
+    body: adminIndexerResetBodySchema,
+    query: adminIndexerResetQuerySchema,
+  }),
+  async (req: Request, res: Response) => {
+    const { ledger } = req.body as { ledger: number };
+    const dryRun = req.query.dryRun === 'true';
 
-  const dryRun = req.query.dryRun === 'true';
-
-  try {
-    if (dryRun) {
-      const preview = await previewReset(ledger);
-      res.json({ dryRun: true, preview });
-      return;
+    try {
+      if (dryRun) {
+        const preview = await previewReset(ledger);
+        res.json({ dryRun: true, preview });
+        return;
+      }
+      await resetIndexer(ledger);
+      res.json({ ok: true, lastLedger: ledger });
+    } catch (err) {
+      logger.error('Error resetting indexer:', err);
+      throw new ApiError(500, 'Reset failed', 'INTERNAL_ERROR');
     }
-    await resetIndexer(ledger);
-    res.json({ ok: true, lastLedger: ledger });
-  } catch (err) {
-    res.status(500).json({ error: 'Reset failed' });
-  }
-});
+  },
+);
 
 /**
  * @openapi
@@ -461,7 +474,7 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
  *                 replayingFrom: { type: integer }
  *                 requestId: { type: string }
  *       400:
- *         description: Invalid from_ledger value
+ *         description: Invalid from_ledger value or query parameters (validation error)
  *         content:
  *           application/json:
  *             schema:
@@ -485,27 +498,27 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/indexer/replay', async (req: Request, res: Response) => {
-  const fromLedger = Number(req.query.from_ledger);
-  if (!Number.isInteger(fromLedger) || fromLedger < 0) {
-    res.status(400).json({ error: 'from_ledger must be a non-negative integer' });
-    return;
-  }
+router.post(
+  '/indexer/replay',
+  validateRequest({ query: adminIndexerReplayQuerySchema }),
+  async (req: Request, res: Response) => {
+    const fromLedger = Number(req.query.from_ledger);
+    const dryRun = req.query.dryRun === 'true';
 
-  const dryRun = req.query.dryRun === 'true';
-
-  try {
-    if (dryRun) {
-      const preview = await previewReplay(fromLedger);
-      res.json({ dryRun: true, preview });
-      return;
+    try {
+      if (dryRun) {
+        const preview = await previewReplay(fromLedger);
+        res.json({ dryRun: true, preview });
+        return;
+      }
+      const requestId = await replayFromLedger(fromLedger);
+      res.status(202).json({ ok: true, replayingFrom: fromLedger, requestId });
+    } catch (err) {
+      logger.error('Error replaying indexer events:', err);
+      throw new ApiError(500, 'Replay failed', 'INTERNAL_ERROR');
     }
-    const requestId = await replayFromLedger(fromLedger);
-    res.status(202).json({ ok: true, replayingFrom: fromLedger, requestId });
-  } catch (err) {
-    res.status(500).json({ error: 'Replay failed' });
-  }
-});
+  },
+);
 
 // ─── Dead-letter quarantine ───────────────────────────────────────────────────
 //
@@ -551,13 +564,21 @@ router.post('/indexer/replay', async (req: Request, res: Response) => {
  *       200:
  *         description: Paginated dead-letter records
  *       400:
- *         description: Invalid query parameters
+ *         description: Invalid query parameters (validation error)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       401:
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - admin access required
  */
-router.get('/indexer/dead-letter', listDeadLetterHandler);
+router.get(
+  '/indexer/dead-letter',
+  validateRequest({ query: adminDeadLetterQuerySchema }),
+  listDeadLetterHandler,
+);
 
 /**
  * @openapi
@@ -599,12 +620,22 @@ router.post('/indexer/dead-letter/replay-all', replayAllDeadLetterHandler);
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - admin access required
+ *       400:
+ *         description: Invalid path parameter (validation error)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: Dead-letter event not found
  *       422:
  *         description: Replay ran but failed, or the payload is undecodable
  */
-router.post('/indexer/dead-letter/:id/replay', replayDeadLetterHandler);
+router.post(
+  '/indexer/dead-letter/:id/replay',
+  validateRequest({ params: adminDeadLetterIdParamsSchema }),
+  replayDeadLetterHandler,
+);
 
 /**
  * @openapi
@@ -629,9 +660,19 @@ router.post('/indexer/dead-letter/:id/replay', replayDeadLetterHandler);
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - admin access required
+ *       400:
+ *         description: Invalid path parameter (validation error)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: Dead-letter event not found
  */
-router.delete('/indexer/dead-letter/:id', discardDeadLetterHandler);
+router.delete(
+  '/indexer/dead-letter/:id',
+  validateRequest({ params: adminDeadLetterIdParamsSchema }),
+  discardDeadLetterHandler,
+);
 
 export default router;

@@ -70,6 +70,52 @@ describe('JWT helpers', () => {
     expect(verifyJwt(token)).toBeNull();
   });
 
+  it('accepts a token whose audience matches the configured environment', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now, exp: now + 3600, iss: 'flowfi-api', aud: 'flowfi-api' });
+
+    expect(verifyJwt(token)).toEqual({ publicKey: 'GTESTPUBLICKEY123' });
+  });
+
+  it('rejects a token minted for a different environment audience', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now, exp: now + 3600, iss: 'flowfi-api', aud: 'flowfi-api-staging' });
+
+    expect(verifyJwt(token)).toBeNull();
+  });
+
+  it('rejects a token minted by a different environment issuer', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now, exp: now + 3600, iss: 'flowfi-api-staging', aud: 'flowfi-api' });
+
+    expect(verifyJwt(token)).toBeNull();
+  });
+
+  it('rejects a token that is expired by exactly one second', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now - 3600, exp: now - 1, iss: 'flowfi-api', aud: 'flowfi-api' });
+
+    expect(verifyJwt(token)).toBeNull();
+  });
+
+  it('accepts a token that expires in the near future', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now, exp: now + 5, iss: 'flowfi-api', aud: 'flowfi-api' });
+
+    expect(verifyJwt(token)).toEqual({ publicKey: 'GTESTPUBLICKEY123' });
+  });
+
+  it('rejects a token whose subject was swapped after issuance', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const token = signJwt({ sub: 'GTESTPUBLICKEY123', iat: now, exp: now + 3600, iss: 'flowfi-api', aud: 'flowfi-api' });
+    const parts = token.split('.') as [string, string, string];
+    const body = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8')) as Record<string, unknown>;
+    body.sub = 'GATTACKERPUBLICKEY456';
+    parts[1] = Buffer.from(JSON.stringify(body), 'utf8').toString('base64url');
+
+    expect(verifyJwt(parts.join('.'))).toBeNull();
+  });
+
   it('returns null for a malformed token missing dots', async () => {
     expect(verifyJwt('abc.def')).toBeNull();
   });

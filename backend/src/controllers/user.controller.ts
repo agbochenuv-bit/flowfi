@@ -1,10 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { prisma } from "../lib/prisma.js";
 import logger from "../logger.js";
-import {
-  registerUserSchema,
-  STELLAR_PUBLIC_KEY_REGEX,
-} from "../validators/user.validator.js";
+import { STELLAR_PUBLIC_KEY_REGEX } from "../validators/user.validator.js";
 import type { AuthenticatedRequest } from "../types/auth.types.js";
 import {
   listEventsForWallet,
@@ -13,7 +10,38 @@ import {
   resolveEventsPageSize,
 } from "../repositories/streamEvent.repository.js";
 import * as exportService from "../services/export.service.js";
-import { sendApiError } from "../types/api-error.js";
+import { ApiError } from "../types/api-error.js";
+
+/**
+ * Reads a validated value from `res.locals.validated`, populated by the
+ * centralized validation middleware. Falls back to the raw request value
+ * when the middleware has not run (e.g. legacy direct controller tests).
+ */
+const validated = <T>(
+  res: Response,
+  key: "body" | "params" | "query",
+  fallback: T,
+): T => {
+  const store = res.locals?.validated as
+    | Partial<Record<"body" | "params" | "query", unknown>>
+    | undefined;
+  const value = store?.[key];
+  return (value ?? fallback) as T;
+};
+
+/**
+ * Ensures the authenticated wallet matches the wallet addressed by the
+ * request. Throws a 403 ApiError otherwise. Requests without an
+ * authenticated user (public endpoints) are not restricted here.
+ */
+const assertWalletOwnership = (req: Request, publicKey: string): void => {
+  const authReq = req as AuthenticatedRequest;
+  const authenticatedKey = authReq.user?.publicKey;
+  if (!authenticatedKey) return;
+  if (authenticatedKey !== publicKey) {
+    throw new ApiError(403, "FORBIDDEN", "Not authorized for this wallet");
+  }
+};
 
 /**
  * Public shape of a Stream, used when embedding streams inside a public
@@ -72,8 +100,7 @@ export const registerUser = async (
   next: NextFunction,
 ) => {
   try {
-    const validated = registerUserSchema.parse(req.body);
-    const { publicKey } = validated;
+    const { publicKey } = validated<{ publicKey: string }>(res, "body", req.body);
 
     // Check if user already exists
     let user = await prisma.user.findUnique({
@@ -105,13 +132,19 @@ export const getUser = async (
   next: NextFunction,
 ) => {
   try {
-    const { publicKey } = req.params;
+    const { publicKey } = validated<{ publicKey: string }>(
+      res,
+      "params",
+      req.params as { publicKey: string },
+    );
     if (typeof publicKey !== "string") {
-      return sendApiError(res, 400, "INVALID_PUBLIC_KEY", "Invalid publicKey parameter");
+      throw new ApiError(400, "INVALID_PUBLIC_KEY", "Invalid publicKey parameter");
     }
     if (!STELLAR_PUBLIC_KEY_REGEX.test(publicKey)) {
-      return sendApiError(res, 400, "INVALID_PUBLIC_KEY", "Invalid Stellar public key format");
+      throw new ApiError(400, "INVALID_PUBLIC_KEY", "Invalid Stellar public key format");
     }
+
+    assertWalletOwnership(req, publicKey);
 
     const user = await prisma.user.findUnique({
       where: { publicKey },
@@ -119,7 +152,7 @@ export const getUser = async (
     });
 
     if (!user) {
-      return sendApiError(res, 404, "NOT_FOUND", "User not found");
+      throw new ApiError(404, "NOT_FOUND", "User not found");
     }
 
     return res.status(200).json(user);
@@ -147,31 +180,41 @@ export const getUserEvents = async (
   next: NextFunction,
 ) => {
   try {
-    const { publicKey } = req.params;
+    const { publicKey } = validated<{ publicKey: string }>(
+      res,
+      "params",
+      req.params as { publicKey: string },
+    );
     if (typeof publicKey !== "string") {
-      return sendApiError(res, 400, "INVALID_PUBLIC_KEY", "Invalid publicKey parameter");
+      throw new ApiError(400, "INVALID_PUBLIC_KEY", "Invalid publicKey parameter");
     }
     if (!STELLAR_PUBLIC_KEY_REGEX.test(publicKey)) {
-      return sendApiError(res, 400, "INVALID_PUBLIC_KEY", "Invalid Stellar public key format");
+      throw new ApiError(400, "INVALID_PUBLIC_KEY", "Invalid Stellar public key format");
     }
 
-    const { requested, types } = parseEventTypeFilter(req.query["type"]);
+    assertWalletOwnership(req, publicKey);
+
+    const query = validated<Record<string, unknown>>(
+      res,
+      "query",
+      req.query as Record<string, unknown>,
+    );
+
+    const { requested, types } = parseEventTypeFilter(query["type"]);
     if (requested.length > 0 && types.length === 0) {
-      return res
-        .status(400)
-        .json({ error: "No valid event types in `type` filter" });
+      throw new ApiError(400, "INVALID_EVENT_TYPE", "No valid event types in `type` filter");
     }
 
-    const limit = resolveEventsPageSize(req.query["limit"]);
+    const limit = resolveEventsPageSize(query["limit"]);
     const offset = resolveEventsOffset({
-      rawOffset: req.query["offset"],
-      rawPage: req.query["page"],
+      rawOffset: query["offset"],
+      rawPage: query["page"],
       limit,
     });
 
     // Preserve this endpoint's historical behavior of always embedding the
     // related stream, unless the caller opts out.
-    const includeStream = req.query["includeStream"] !== "false";
+    const includeStream = query["includeStream"] !== "false";
 
     const result = await listEventsForWallet({
       address: publicKey,
@@ -249,32 +292,45 @@ export const exportTransactions = async (
   next: NextFunction,
 ) => {
   try {
-    const addressParam = req.params.address;
+    const params = validated<{ address?: string | string[] }>(
+      res,
+      "params",
+      req.params as { address?: string | string[] },
+    );
+    const addressParam = params.address;
     const address = Array.isArray(addressParam)
       ? addressParam[0]
       : addressParam;
 
     if (!address || !STELLAR_PUBLIC_KEY_REGEX.test(address)) {
-      return sendApiError(res, 400, "INVALID_ADDRESS", "Invalid Stellar address");
+      throw new ApiError(400, "INVALID_ADDRESS", "Invalid Stellar address");
     }
 
-    const format = (req.query.format as string) || "csv";
+    assertWalletOwnership(req, address);
+
+    const query = validated<Record<string, unknown>>(
+      res,
+      "query",
+      req.query as Record<string, unknown>,
+    );
+
+    const format = (query.format as string) || "csv";
     const direction =
-      (req.query.direction as "incoming" | "outgoing" | "all") || "all";
-    const startDate = req.query.startDate
-      ? new Date(req.query.startDate as string)
+      (query.direction as "incoming" | "outgoing" | "all") || "all";
+    const startDate = query.startDate
+      ? new Date(query.startDate as string)
       : null;
-    const endDate = req.query.endDate
-      ? new Date(req.query.endDate as string)
+    const endDate = query.endDate
+      ? new Date(query.endDate as string)
       : null;
-    const tokenAddress = (req.query.tokenAddress as string | null) || null;
+    const tokenAddress = (query.tokenAddress as string | null) || null;
 
     if (!["csv", "json"].includes(format)) {
-      return sendApiError(res, 400, "INVALID_FORMAT", "Invalid format. Must be csv or json");
+      throw new ApiError(400, "INVALID_FORMAT", "Invalid format. Must be csv or json");
     }
 
     if (!["incoming", "outgoing", "all"].includes(direction)) {
-      return sendApiError(res, 400, "INVALID_DIRECTION", "Invalid direction. Must be incoming, outgoing, or all");
+      throw new ApiError(400, "INVALID_DIRECTION", "Invalid direction. Must be incoming, outgoing, or all");
     }
 
     const options: exportService.ExportOptions = {

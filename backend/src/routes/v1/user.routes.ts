@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { z } from "zod";
 import {
   registerUser,
   getUser,
@@ -8,8 +9,35 @@ import {
 } from "../../controllers/user.controller.js";
 import { getUserStreamSummary } from "../../controllers/stream.controller.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { validateRequest } from "../../middleware/validateRequest.js";
+import { requireWalletOwnership } from "../../middleware/requireWalletOwnership.js";
 
 const router = Router();
+
+const publicKeyParam = z.object({
+  publicKey: z.string().min(1, "publicKey is required"),
+});
+
+const addressParam = z.object({
+  address: z.string().min(1, "address is required"),
+});
+
+const registerUserBody = z.object({
+  publicKey: z.string().min(1, "publicKey is required"),
+});
+
+const userEventsQuery = z.object({
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  offset: z.coerce.number().int().min(0).optional(),
+});
+
+const exportQuery = z.object({
+  format: z.enum(["csv", "json"]).optional(),
+  direction: z.enum(["incoming", "outgoing", "all"]).optional(),
+  startDate: z.string().optional(),
+  endDate: z.string().optional(),
+  tokenAddress: z.string().optional(),
+});
 
 /**
  * @openapi
@@ -78,6 +106,18 @@ const router = Router();
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/User'
+ *       401:
+ *         description: Unauthorized - missing or invalid token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - wallet does not own this resource
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: User not found
  *         content:
@@ -119,7 +159,7 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post("/", registerUser);
+router.post("/", validateRequest({ body: registerUserBody }), registerUser);
 router.get("/me", requireAuth, getCurrentUser);
 /**
  * @openapi
@@ -161,8 +201,18 @@ router.get("/me", requireAuth, getCurrentUser);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:address/summary", getUserStreamSummary);
-router.get("/:publicKey", getUser);
+router.get(
+  "/:address/summary",
+  validateRequest({ params: addressParam }),
+  getUserStreamSummary,
+);
+router.get(
+  "/:publicKey",
+  requireAuth,
+  validateRequest({ params: publicKeyParam }),
+  requireWalletOwnership("publicKey"),
+  getUser,
+);
 
 /**
  * @openapi
@@ -205,6 +255,18 @@ router.get("/:publicKey", getUser);
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       401:
+ *         description: Unauthorized - missing or invalid token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - wallet does not own this resource
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: User not found
  *         content:
@@ -218,7 +280,13 @@ router.get("/:publicKey", getUser);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:publicKey/events", getUserEvents);
+router.get(
+  "/:publicKey/events",
+  requireAuth,
+  validateRequest({ params: publicKeyParam, query: userEventsQuery }),
+  requireWalletOwnership("publicKey"),
+  getUserEvents,
+);
 
 export default router;
 
@@ -285,6 +353,18 @@ export default router;
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       401:
+ *         description: Unauthorized - missing or invalid token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - wallet does not own this resource
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       404:
  *         description: User not found
  *         content:
@@ -298,4 +378,10 @@ export default router;
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:address/export", exportTransactions);
+router.get(
+  "/:address/export",
+  requireAuth,
+  validateRequest({ params: addressParam, query: exportQuery }),
+  requireWalletOwnership("address"),
+  exportTransactions,
+);

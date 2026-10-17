@@ -222,6 +222,290 @@ describe('Authentication & Middleware Tests', () => {
     });
   });
 
+  describe('Wallet challenge flow (single-use & replay resistance)', () => {
+    /** Request a challenge and return the full response body. */
+    async function requestChallenge(publicKey: string) {
+      const res = await request(app).post('/v1/auth/challenge').send({ publicKey });
+      expect(res.status).toBe(200);
+      return res.body as {
+        nonce: string;
+        expiresAt: number;
+        audience?: string;
+        network?: string;
+        networkPassphrase?: string;
+      };
+    }
+
+    /** Build a signed transaction bound to a specific network passphrase. */
+    function buildSignedTransactionForNetwork(
+      keypair: StellarSdk.Keypair,
+      nonce: string,
+      networkPassphrase: string,
+    ): string {
+      const account = new StellarSdk.Account(keypair.publicKey(), '0');
+      const tx = new StellarSdk.TransactionBuilder(account, {
+        fee: '100',
+        networkPassphrase,
+      })
+        .addOperation(
+          StellarSdk.Operation.manageData({
+            name: 'auth',
+            value: Buffer.from(nonce, 'hex'),
+          }),
+        )
+        .setTimeout(60)
+        .build();
+
+      tx.sign(keypair);
+      return tx.toXDR();
+    }
+
+    it('test_challenge_flow_allows_exactly_one_successful_exchange', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const first = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(first.status).toBe(200);
+      expect(first.body).toHaveProperty('token');
+      expect(first.body.token.split('.').length).toBe(3);
+
+      // The challenge must be consumed after a successful exchange.
+      expect(__authChallengeTestUtils.challenges.has(keypair.publicKey())).toBe(false);
+    });
+
+    it('test_verify_rejects_reused_nonce_after_successful_exchange', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const first = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+      expect(first.status).toBe(200);
+
+      // Replay the exact same signed transaction.
+      const replay = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(replay.status).toBe(401);
+      expect(replay.body.error).toMatch(/Challenge expired or not found/i);
+    });
+
+    it('test_verify_rejects_reused_nonce_after_failed_attempt', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+
+      // First attempt fails signature verification.
+      const verifySpy = vi
+        .spyOn(StellarSdk.Keypair.prototype, 'verify')
+        .mockReturnValue(false);
+
+      const failed = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+      expect(failed.status).toBe(401);
+      expect(failed.body.error).toMatch(/Invalid signature/i);
+
+      // Even with a valid signature, the consumed challenge cannot be reused.
+      verifySpy.mockReturnValue(true);
+
+      const retry = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+      expect(retry.status).toBe(401);
+      expect(retry.body.error).toMatch(/Challenge expired or not found/i);
+    });
+
+    it('test_verify_rejects_expired_challenge', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+
+      // Force the stored challenge to be expired.
+      const stored = __authChallengeTestUtils.challenges.get(keypair.publicKey());
+      expect(stored).toBeDefined();
+      __authChallengeTestUtils.challenges.set(keypair.publicKey(), {
+        ...stored!,
+        expiresAt: Date.now() - 1,
+      });
+
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Challenge expired or not found/i);
+      expect(__authChallengeTestUtils.challenges.has(keypair.publicKey())).toBe(false);
+    });
+
+    it('test_verify_rejects_challenge_at_exact_expiry_boundary', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+
+      const stored = __authChallengeTestUtils.challenges.get(keypair.publicKey());
+      expect(stored).toBeDefined();
+      __authChallengeTestUtils.challenges.set(keypair.publicKey(), {
+        ...stored!,
+        expiresAt: Date.now(),
+      });
+
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Challenge expired or not found/i);
+    });
+
+    it('test_verify_rejects_cross_wallet_signature', async () => {
+      const victim = makeKeypair();
+      const attacker = makeKeypair();
+
+      // Challenge is issued for the victim wallet.
+      const challenge = await requestChallenge(victim.publicKey());
+
+      // Attacker signs the victim's nonce with their own key.
+      const signedTransaction = buildSignedTransaction(attacker, challenge.nonce);
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: victim.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Transaction source does not match publicKey/i);
+
+      // The victim's challenge must remain intact (not consumed by the attacker).
+      expect(__authChallengeTestUtils.challenges.has(victim.publicKey())).toBe(true);
+    });
+
+    it('test_verify_rejects_cross_wallet_nonce_substitution', async () => {
+      const victim = makeKeypair();
+      const attacker = makeKeypair();
+
+      // Attacker obtains their own challenge.
+      const attackerChallenge = await requestChallenge(attacker.publicKey());
+
+      // Attacker tries to redeem their nonce as the victim.
+      const signedTransaction = buildSignedTransaction(attacker, attackerChallenge.nonce);
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: victim.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/Challenge expired or not found/i);
+    });
+
+    it('test_verify_rejects_cross_network_signature', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+
+      // Sign the nonce for a different network than the challenge was issued for.
+      const foreignNetwork =
+        challenge.networkPassphrase === StellarSdk.Networks.PUBLIC
+          ? StellarSdk.Networks.TESTNET
+          : StellarSdk.Networks.PUBLIC;
+      const signedTransaction = buildSignedTransactionForNetwork(
+        keypair,
+        challenge.nonce,
+        foreignNetwork,
+      );
+
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/network|Challenge expired or not found/i);
+    });
+
+    it('test_verify_rejects_cross_audience_signature', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+
+      // Tamper with the stored challenge audience to simulate a token minted
+      // for a different relying party being replayed here.
+      const stored = __authChallengeTestUtils.challenges.get(keypair.publicKey());
+      expect(stored).toBeDefined();
+      __authChallengeTestUtils.challenges.set(keypair.publicKey(), {
+        ...stored!,
+        audience: 'some-other-app',
+      });
+
+      const signedTransaction = buildSignedTransaction(keypair, challenge.nonce);
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const res = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+
+      expect(res.status).toBe(401);
+      expect(res.body.error).toMatch(/audience|Challenge expired or not found/i);
+    });
+
+    it('test_challenge_binds_wallet_audience_network_and_expiry', async () => {
+      const keypair = makeKeypair();
+      const challenge = await requestChallenge(keypair.publicKey());
+
+      const stored = __authChallengeTestUtils.challenges.get(keypair.publicKey());
+      expect(stored).toBeDefined();
+      expect(stored!.nonce).toBe(challenge.nonce);
+      expect(stored!.expiresAt).toBe(challenge.expiresAt);
+      expect(stored!.expiresAt).toBeGreaterThan(Date.now());
+      expect(stored!.publicKey ?? keypair.publicKey()).toBe(keypair.publicKey());
+      expect(stored!.audience).toBeDefined();
+      expect(stored!.networkPassphrase ?? stored!.network).toBeDefined();
+    });
+
+    it('test_challenge_rotation_invalidates_previous_nonce', async () => {
+      const keypair = makeKeypair();
+      const first = await requestChallenge(keypair.publicKey());
+      const second = await requestChallenge(keypair.publicKey());
+
+      expect(second.nonce).not.toBe(first.nonce);
+
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      // The superseded nonce must no longer be redeemable.
+      const stale = await request(app)
+        .post('/v1/auth/verify')
+        .send({
+          publicKey: keypair.publicKey(),
+          signedTransaction: buildSignedTransaction(keypair, first.nonce),
+        });
+      expect(stale.status).toBe(401);
+
+      // The current nonce still works exactly once.
+      const fresh = await request(app)
+        .post('/v1/auth/verify')
+        .send({
+          publicKey: keypair.publicKey(),
+          signedTransaction: buildSignedTransaction(keypair, second.nonce),
+        });
+      expect(fresh.status).toBe(200);
+      expect(fresh.body).toHaveProperty('token');
+    });
+  });
+
   describe('Auth Middleware (requireAuth)', () => {
     async function getValidJwt(keypair: StellarSdk.Keypair): Promise<string> {
       const challengeRes = await request(app)
