@@ -55,6 +55,11 @@ model Stream {
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+  // Query-plan-backed composite indexes for list/history/analytics reads.
+  // See docs/indexes.md for the EXPLAIN ANALYZE before/after evidence.
+  @@index([isActive, isPaused, startTime])
+  @@index([sender, startTime])
+  @@index([recipient, startTime])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker
@@ -63,6 +68,21 @@ model IndexerState {
   lastLedger  Int      @default(0)
   lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
   updatedAt   DateTime @updatedAt
+}
+
+// IndexerLease model - single-row (id = "singleton") renewable lease that
+// coordinates poll ownership across backend replicas. Only the replica whose
+// ownerId matches and whose expiresAt is in the future may advance the cursor.
+// fencingToken is monotonically incremented on every acquisition so stale
+// owners can be rejected when they attempt to write after a lease turnover.
+model IndexerLease {
+  id           String   @id @default("singleton")
+  ownerId      String?  // Identity of the current poll owner (null when free)
+  expiresAt    DateTime? // Lease expiry; owner must renew before this instant
+  fencingToken BigInt   @default(0) // Incremented on each acquisition; guards stale writes
+  updatedAt    DateTime @updatedAt
+
+  @@index([expiresAt])
 }
 
 // LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
@@ -104,6 +124,10 @@ model StreamEvent {
   @@index([transactionHash])
   @@index([createdAt])
   @@index([streamId, timestamp])
+  // Query-plan-backed composite indexes for event history/cursor reads.
+  // See docs/indexes.md for the EXPLAIN ANALYZE before/after evidence.
+  @@index([streamId, ledgerSequence])
+  @@index([ledgerSequence, timestamp])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)

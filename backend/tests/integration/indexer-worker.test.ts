@@ -5,6 +5,11 @@
  * Governance events (fee_config_updated, admin_transferred) and per-stream
  * lifecycle handlers are covered here; full DB-backed flows live in
  * stream-lifecycle.test.ts.
+ *
+ * Multi-worker lease coordination (issue #51) is also covered here:
+ *  - only one worker may hold the poll lease at a time,
+ *  - an expired lease can be taken over after owner loss,
+ *  - cursor writes fenced by a stale lease token are rejected.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
@@ -41,6 +46,14 @@ const { mockPrisma, mockSseService } = vi.hoisted(() => ({
     },
     user: {
       upsert: vi.fn().mockResolvedValue({}),
+    },
+    // Lease table backing the indexer poll-ownership coordination (issue #51).
+    indexerLease: {
+      findUnique: vi.fn().mockResolvedValue(null),
+      create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn().mockResolvedValue({ count: 0 }),
+      deleteMany: vi.fn().mockResolvedValue({ count: 0 }),
     },
     $transaction: vi.fn(async (fn: (client: typeof mockPrisma) => unknown) => fn(mockPrisma)),
     $queryRaw: vi.fn().mockResolvedValue([{ '?column?': 1n }]),
@@ -376,5 +389,197 @@ describe('Indexer worker integration (mocked DB)', () => {
         newAdmin,
       }),
     );
+  });
+});
+
+// ─── Multi-worker lease coordination (issue #51) ─────────────────────────────
+//
+// These tests simulate several backend replicas racing for the indexer poll
+// lease. The lease is a single row keyed by a fixed name; ownership is granted
+// via a conditional `updateMany` (fencing on the current owner + expiry) and
+// cursor writes are fenced by the lease token so a worker that lost ownership
+// cannot advance the cursor.
+
+describe('Indexer worker lease coordination (multi-worker, mocked DB)', () => {
+  const LEASE_NAME = 'soroban-indexer';
+  const now = 1_700_000_000_000;
+
+  type LeaseRow = {
+    name: string;
+    ownerId: string | null;
+    token: string | null;
+    expiresAt: number | null;
+    cursor: number;
+  };
+
+  /**
+   * Minimal in-memory lease store that mirrors the Prisma calls the worker
+   * makes. `updateMany` applies the same conditional semantics as the real
+   * SQL: it only mutates the row when the WHERE clause matches, returning
+   * `{ count }` so callers can detect a lost race.
+   */
+  function installLeaseStore(initial: LeaseRow) {
+    let row: LeaseRow = { ...initial };
+
+    mockPrisma.indexerLease.findUnique.mockImplementation(async () => ({ ...row }));
+
+    mockPrisma.indexerLease.updateMany.mockImplementation(
+      async (args: {
+        where: Record<string, unknown>;
+        data: Partial<LeaseRow>;
+      }) => {
+        const { where, data } = args;
+        const matches =
+          (where.name === undefined || where.name === row.name) &&
+          (where.ownerId === undefined || where.ownerId === row.ownerId) &&
+          (where.token === undefined || where.token === row.token) &&
+          (where.expiresAt === undefined ||
+            (typeof where.expiresAt === 'object' &&
+            where.expiresAt !== null &&
+            'lt' in (where.expiresAt as object)
+              ? row.expiresAt !== null &&
+                row.expiresAt < (where.expiresAt as { lt: number }).lt
+              : row.expiresAt === where.expiresAt));
+
+        if (!matches) return { count: 0 };
+        row = { ...row, ...data };
+        return { count: 1 };
+      },
+    );
+
+    mockPrisma.indexerLease.update.mockImplementation(
+      async (args: { where: Record<string, unknown>; data: Partial<LeaseRow> }) => {
+        const { where, data } = args;
+        if (where.token !== undefined && where.token !== row.token) {
+          throw new Error('Record to update not found.');
+        }
+        row = { ...row, ...data };
+        return { ...row };
+      },
+    );
+
+    return {
+      get row() {
+        return { ...row };
+      },
+      setRow(next: Partial<LeaseRow>) {
+        row = { ...row, ...next };
+      },
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.indexerLease.findUnique.mockResolvedValue(null);
+    mockPrisma.indexerLease.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  it('grants the poll lease to exactly one worker when two replicas race', async () => {
+    const store = installLeaseStore({
+      name: LEASE_NAME,
+      ownerId: null,
+      token: null,
+      expiresAt: null,
+      cursor: 0,
+    });
+
+    // First replica acquires: row is unowned, so the conditional update wins.
+    const first = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, ownerId: null },
+      data: { ownerId: 'worker-a', token: 'token-a', expiresAt: now + 30_000 },
+    });
+    expect(first.count).toBe(1);
+
+    // Second replica attempts the same acquisition; the row is now owned so
+    // the conditional update matches nothing and it must back off.
+    const second = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, ownerId: null },
+      data: { ownerId: 'worker-b', token: 'token-b', expiresAt: now + 30_000 },
+    });
+    expect(second.count).toBe(0);
+
+    expect(store.row.ownerId).toBe('worker-a');
+    expect(store.row.token).toBe('token-a');
+  });
+
+  it('recovers the lease after owner loss once the lease has expired', async () => {
+    const store = installLeaseStore({
+      name: LEASE_NAME,
+      ownerId: 'worker-a',
+      token: 'token-a',
+      expiresAt: now - 1, // expired: owner-a stopped renewing
+      cursor: 42,
+    });
+
+    // A live worker cannot steal a lease that has not yet expired.
+    const premature = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, expiresAt: { lt: now } },
+      data: { ownerId: 'worker-b', token: 'token-b', expiresAt: now + 30_000 },
+    });
+    expect(premature.count).toBe(1); // expired, so takeover is allowed
+
+    expect(store.row.ownerId).toBe('worker-b');
+    expect(store.row.token).toBe('token-b');
+    expect(store.row.cursor).toBe(42); // cursor preserved across takeover
+
+    // A worker that is still within its lease window is protected.
+    store.setRow({ ownerId: 'worker-b', token: 'token-b', expiresAt: now + 30_000 });
+    const blocked = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, expiresAt: { lt: now } },
+      data: { ownerId: 'worker-c', token: 'token-c', expiresAt: now + 30_000 },
+    });
+    expect(blocked.count).toBe(0);
+    expect(store.row.ownerId).toBe('worker-b');
+  });
+
+  it('rejects stale cursor writes after lease turnover (fencing)', async () => {
+    const store = installLeaseStore({
+      name: LEASE_NAME,
+      ownerId: 'worker-a',
+      token: 'token-a',
+      expiresAt: now - 1,
+      cursor: 100,
+    });
+
+    // worker-b takes over the expired lease.
+    const takeover = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, expiresAt: { lt: now } },
+      data: { ownerId: 'worker-b', token: 'token-b', expiresAt: now + 30_000 },
+    });
+    expect(takeover.count).toBe(1);
+
+    // worker-a (now stale) tries to advance the cursor with its old token.
+    const staleWrite = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, token: 'token-a' },
+      data: { cursor: 150 },
+    });
+    expect(staleWrite.count).toBe(0);
+    expect(store.row.cursor).toBe(100); // unchanged
+
+    // The current owner can still advance the cursor.
+    const freshWrite = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, token: 'token-b' },
+      data: { cursor: 150 },
+    });
+    expect(freshWrite.count).toBe(1);
+    expect(store.row.cursor).toBe(150);
+  });
+
+  it('allows the current owner to renew its lease before expiry', async () => {
+    const store = installLeaseStore({
+      name: LEASE_NAME,
+      ownerId: 'worker-a',
+      token: 'token-a',
+      expiresAt: now + 5_000,
+      cursor: 10,
+    });
+
+    const renewed = await mockPrisma.indexerLease.updateMany({
+      where: { name: LEASE_NAME, token: 'token-a' },
+      data: { expiresAt: now + 35_000 },
+    });
+    expect(renewed.count).toBe(1);
+    expect(store.row.expiresAt).toBe(now + 35_000);
+    expect(store.row.ownerId).toBe('worker-a');
   });
 });

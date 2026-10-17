@@ -58,9 +58,52 @@ vi.mock('../src/logger.js', async (importOriginal) => {
   };
 });
 
+// Mock metrics registry so we can assert on instrumentation without a real registry
+const mockMetrics = vi.hoisted(() => {
+  const counters = new Map<string, { inc: ReturnType<typeof vi.fn> }>();
+  const gauges = new Map<string, { set: ReturnType<typeof vi.fn> }>();
+  const histograms = new Map<string, { observe: ReturnType<typeof vi.fn> }>();
+  const getOrCreate = <T extends { inc?: any; set?: any; observe?: any }>(
+    map: Map<string, T>,
+    name: string,
+    factory: () => T,
+  ): T => {
+    if (!map.has(name)) map.set(name, factory());
+    return map.get(name)!;
+  };
+  return {
+    counters,
+    gauges,
+    histograms,
+    counter: (name: string) =>
+      getOrCreate(counters, name, () => ({ inc: vi.fn() })),
+    gauge: (name: string) =>
+      getOrCreate(gauges, name, () => ({ set: vi.fn() })),
+    histogram: (name: string) =>
+      getOrCreate(histograms, name, () => ({ observe: vi.fn() })),
+    reset: () => {
+      counters.clear();
+      gauges.clear();
+      histograms.clear();
+    },
+  };
+});
+
+vi.mock('../src/lib/metrics.js', () => ({
+  indexerMetrics: {
+    ledgerLag: mockMetrics.gauge('indexer_ledger_lag'),
+    eventsPerLedger: mockMetrics.histogram('indexer_events_per_ledger'),
+    decodeLatency: mockMetrics.histogram('indexer_decode_latency_ms'),
+    persistenceLatency: mockMetrics.histogram('indexer_persistence_latency_ms'),
+    retryCount: mockMetrics.counter('indexer_retry_total'),
+    lastSuccessTime: mockMetrics.gauge('indexer_last_success_timestamp_seconds'),
+  },
+}));
+
 import { SorobanEventWorker } from '../src/workers/soroban-event-worker.js';
 import { prisma } from '../src/lib/prisma.js';
 import logger from '../src/logger.js';
+import { indexerMetrics } from '../src/lib/metrics.js';
 
 // ─── ScVal v17 mock helpers (property-based, not method-based) ──────────────
 const mockSym = (name: string) => ({ sym: { toString: () => name } } as any);
@@ -891,6 +934,282 @@ describe('SorobanEventWorker', () => {
       await Promise.all([triggerPromise, drainPromise]);
       expect(drained).toBe(true);
       expect((worker as any).activeBatch).toBeNull();
+    });
+  });
+
+  describe('observability metrics (#54)', () => {
+    beforeEach(() => {
+      mockMetrics.reset();
+    });
+
+    it('records ledger lag, events-per-ledger, latencies and last-success on a successful poll', async () => {
+      (prisma.indexerState.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'singleton',
+        lastLedger: 1000,
+        lastCursor: 'cursor-1000',
+        updatedAt: new Date(),
+      });
+
+      const event: rpc.Api.EventResponse = {
+        id: 'metrics-event-1',
+        type: 'contract',
+        ledger: 1005,
+        ledgerClosedAt: '2024-01-01T00:00:00Z',
+        txHash: 'metrics-tx-1',
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        topic: [mockSym('admin_transferred')],
+        value: {
+          type: 'scvMap',
+          map: [
+            mockMapEntry('previous_admin', mockAccountAddr()),
+            mockMapEntry('new_admin', mockAccountAddr()),
+          ],
+        } as any,
+      };
+
+      vi.spyOn((worker as any).server, 'getEvents').mockResolvedValue({
+        events: [event],
+        latestLedger: 1010,
+      });
+
+      const mockTx = {
+        user: { upsert: vi.fn().mockResolvedValue({}) },
+        stream: { upsert: vi.fn().mockResolvedValue({ streamId: 0n, isActive: false }) },
+        streamEvent: {
+          findUnique: vi.fn().mockResolvedValue(null),
+          upsert: vi.fn().mockResolvedValue({ id: 'event-metrics' }),
+        },
+      };
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => cb(mockTx));
+
+      await (worker as any).fetchAndProcessEvents();
+
+      // Lag gauge reflects the distance between the chain head and the last
+      // ingested ledger (1010 - 1005 = 5).
+      expect(indexerMetrics.ledgerLag.set).toHaveBeenCalledWith(5);
+
+      // Events-per-ledger histogram observed once for the batch.
+      expect(indexerMetrics.eventsPerLedger.observe).toHaveBeenCalledWith(1);
+
+      // Decode and persistence latencies are observed (non-negative ms).
+      expect(indexerMetrics.decodeLatency.observe).toHaveBeenCalled();
+      expect(indexerMetrics.persistenceLatency.observe).toHaveBeenCalled();
+      for (const call of (indexerMetrics.decodeLatency.observe as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(call[0]).toBeGreaterThanOrEqual(0);
+      }
+      for (const call of (indexerMetrics.persistenceLatency.observe as ReturnType<typeof vi.fn>).mock.calls) {
+        expect(call[0]).toBeGreaterThanOrEqual(0);
+      }
+
+      // Last-success timestamp is set to a unix-seconds value.
+      expect(indexerMetrics.lastSuccessTime.set).toHaveBeenCalled();
+      const lastSuccessArg = (indexerMetrics.lastSuccessTime.set as ReturnType<typeof vi.fn>).mock
+        .calls[0]![0];
+      expect(typeof lastSuccessArg).toBe('number');
+      expect(lastSuccessArg).toBeGreaterThan(0);
+    });
+
+    it('increments the retry counter when an event fails to process', async () => {
+      (prisma.indexerState.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'singleton',
+        lastLedger: 100,
+        lastCursor: 'cursor-initial',
+        updatedAt: new Date(),
+      });
+      (prisma.indexerDeadLetterEvent.upsert as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'dl-metrics',
+        eventId: 'metrics-fail-1',
+        attempts: 1,
+      });
+
+      const failingEvent: rpc.Api.EventResponse = {
+        id: 'metrics-fail-1',
+        type: 'contract',
+        ledger: 101,
+        ledgerClosedAt: '2024-01-01T00:00:00Z',
+        txHash: 'metrics-fail-tx',
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        topic: [mockSym('fee_config_updated')],
+        value: { type: 'scvMap', map: [] as any } as any,
+      };
+
+      vi.spyOn((worker as any).server, 'getEvents').mockResolvedValue({
+        events: [failingEvent],
+        latestLedger: 101,
+      });
+
+      await (worker as any).fetchAndProcessEvents();
+
+      expect(indexerMetrics.retryCount.inc).toHaveBeenCalled();
+    });
+
+    it('does not use high-cardinality labels on metric calls', async () => {
+      (prisma.indexerState.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'singleton',
+        lastLedger: 1000,
+        lastCursor: 'cursor-1000',
+        updatedAt: new Date(),
+      });
+
+      const event: rpc.Api.EventResponse = {
+        id: 'metrics-labels-event',
+        type: 'contract',
+        ledger: 1001,
+        ledgerClosedAt: '2024-01-01T00:00:00Z',
+        txHash: 'metrics-labels-tx',
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        topic: [mockSym('admin_transferred')],
+        value: {
+          type: 'scvMap',
+          map: [
+            mockMapEntry('previous_admin', mockAccountAddr()),
+            mockMapEntry('new_admin', mockAccountAddr()),
+          ],
+        } as any,
+      };
+
+      vi.spyOn((worker as any).server, 'getEvents').mockResolvedValue({
+        events: [event],
+        latestLedger: 1001,
+      });
+
+      const mockTx = {
+        user: { upsert: vi.fn().mockResolvedValue({}) },
+        stream: { upsert: vi.fn().mockResolvedValue({ streamId: 0n, isActive: false }) },
+        streamEvent: {
+          findUnique: vi.fn().mockResolvedValue(null),
+          upsert: vi.fn().mockResolvedValue({ id: 'event-labels' }),
+        },
+      };
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => cb(mockTx));
+
+      await (worker as any).fetchAndProcessEvents();
+
+      const allCalls = [
+        ...(indexerMetrics.ledgerLag.set as ReturnType<typeof vi.fn>).mock.calls,
+        ...(indexerMetrics.eventsPerLedger.observe as ReturnType<typeof vi.fn>).mock.calls,
+        ...(indexerMetrics.decodeLatency.observe as ReturnType<typeof vi.fn>).mock.calls,
+        ...(indexerMetrics.persistenceLatency.observe as ReturnType<typeof vi.fn>).mock.calls,
+        ...(indexerMetrics.retryCount.inc as ReturnType<typeof vi.fn>).mock.calls,
+        ...(indexerMetrics.lastSuccessTime.set as ReturnType<typeof vi.fn>).mock.calls,
+      ];
+      for (const call of allCalls) {
+        const labels = call[1];
+        if (labels && typeof labels === 'object') {
+          const serialized = JSON.stringify(labels);
+          expect(serialized).not.toContain('metrics-labels-tx');
+          expect(serialized.toLowerCase()).not.toContain('wallet');
+          expect(serialized.toLowerCase()).not.toContain('address');
+        }
+      }
+    });
+  });
+
+  describe('lease-gated polling (#51)', () => {
+    it('does not advance the cursor when the worker does not hold the lease', async () => {
+      (prisma.indexerState.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'singleton',
+        lastLedger: 1000,
+        lastCursor: 'cursor-1000',
+        updatedAt: new Date(),
+      });
+
+      const event: rpc.Api.EventResponse = {
+        id: 'no-lease-event-1',
+        type: 'contract',
+        ledger: 1005,
+        ledgerClosedAt: '2024-01-01T00:00:00Z',
+        txHash: 'no-lease-tx-1',
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        topic: [mockSym('admin_transferred')],
+        value: {
+          type: 'scvMap',
+          map: [
+            mockMapEntry('previous_admin', mockAccountAddr()),
+            mockMapEntry('new_admin', mockAccountAddr()),
+          ],
+        } as any,
+      };
+
+      const getEvents = vi
+        .spyOn((worker as any).server, 'getEvents')
+        .mockResolvedValue({ events: [event], latestLedger: 1005 });
+
+      // Simulate a worker that lost / never acquired the lease.
+      (worker as any).leaseAcquired = false;
+      if (typeof (worker as any).hasLease === 'function') {
+        vi.spyOn(worker as any, 'hasLease').mockReturnValue(false);
+      }
+
+      await (worker as any).fetchAndProcessEvents();
+
+      // Cursor must not be advanced by a non-owner.
+      expect(prisma.indexerState.upsert).not.toHaveBeenCalled();
+      // And the worker should not have polled the RPC at all.
+      expect(getEvents).not.toHaveBeenCalled();
+    });
+
+    it('advances the cursor when the worker holds the lease', async () => {
+      (prisma.indexerState.findUnique as ReturnType<typeof vi.fn>).mockResolvedValue({
+        id: 'singleton',
+        lastLedger: 1000,
+        lastCursor: 'cursor-1000',
+        updatedAt: new Date(),
+      });
+
+      const event: rpc.Api.EventResponse = {
+        id: 'with-lease-event-1',
+        type: 'contract',
+        ledger: 1005,
+        ledgerClosedAt: '2024-01-01T00:00:00Z',
+        txHash: 'with-lease-tx-1',
+        transactionIndex: 0,
+        operationIndex: 0,
+        inSuccessfulContractCall: true,
+        topic: [mockSym('admin_transferred')],
+        value: {
+          type: 'scvMap',
+          map: [
+            mockMapEntry('previous_admin', mockAccountAddr()),
+            mockMapEntry('new_admin', mockAccountAddr()),
+          ],
+        } as any,
+      };
+
+      vi.spyOn((worker as any).server, 'getEvents').mockResolvedValue({
+        events: [event],
+        latestLedger: 1005,
+      });
+
+      const mockTx = {
+        user: { upsert: vi.fn().mockResolvedValue({}) },
+        stream: { upsert: vi.fn().mockResolvedValue({ streamId: 0n, isActive: false }) },
+        streamEvent: {
+          findUnique: vi.fn().mockResolvedValue(null),
+          upsert: vi.fn().mockResolvedValue({ id: 'event-with-lease' }),
+        },
+      };
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => cb(mockTx));
+
+      (worker as any).leaseAcquired = true;
+      if (typeof (worker as any).hasLease === 'function') {
+        vi.spyOn(worker as any, 'hasLease').mockReturnValue(true);
+      }
+
+      await (worker as any).fetchAndProcessEvents();
+
+      expect(prisma.indexerState.upsert).toHaveBeenCalled();
+      const calls = (prisma.indexerState.upsert as ReturnType<typeof vi.fn>).mock.calls;
+      const lastSaveCall = calls[calls.length - 1]![0];
+      expect(lastSaveCall.update.lastCursor).toBe('with-lease-event-1');
     });
   });
 

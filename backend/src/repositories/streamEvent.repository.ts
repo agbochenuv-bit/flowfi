@@ -139,7 +139,10 @@ export async function listEventsForWallet(
   const [events, total] = await Promise.all([
     prisma.streamEvent.findMany({
       where,
-      orderBy: { timestamp: "desc" },
+      // Deterministic tie-breaker on `id` keeps offset/cursor pagination
+      // stable when multiple events share the same `timestamp`, and matches
+      // the (timestamp DESC, id DESC) index used for this access pattern.
+      orderBy: [{ timestamp: "desc" }, { id: "desc" }],
       skip: offset,
       take: limit,
       ...(includeStream ? { include: { stream: true } } : {}),

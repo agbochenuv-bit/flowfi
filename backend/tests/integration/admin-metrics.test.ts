@@ -731,3 +731,221 @@ describe('POST /v1/admin/indexer/replay', () => {
   });
 });
 
+describe('GET /v1/admin/indexer/replay/preview', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.ADMIN_PUBLIC_KEY = ADMIN_PUBLIC_KEY;
+  });
+
+  it('enforces requireAdmin (401 without token, 403 with non-admin token)', async () => {
+    const noTokenRes = await request(app).get(
+      '/v1/admin/indexer/replay/preview?from_ledger=100',
+    );
+    expect(noTokenRes.status).toBe(401);
+
+    const nonAdminRes = await request(app)
+      .get('/v1/admin/indexer/replay/preview?from_ledger=100')
+      .set('Authorization', `Bearer ${createToken(NON_ADMIN_PUBLIC_KEY)}`);
+    expect(nonAdminRes.status).toBe(403);
+    expect(nonAdminRes.body.error).toBe('Forbidden');
+    expect(previewReplay).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when from_ledger is missing, negative, or non-integer', async () => {
+    const queryUrls = [
+      '/v1/admin/indexer/replay/preview',
+      '/v1/admin/indexer/replay/preview?from_ledger=-1',
+      '/v1/admin/indexer/replay/preview?from_ledger=3.14',
+      '/v1/admin/indexer/replay/preview?from_ledger=invalid',
+    ];
+
+    for (const url of queryUrls) {
+      const res = await request(app)
+        .get(url)
+        .set('Authorization', `Bearer ${createToken()}`);
+
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'from_ledger must be a non-negative integer' });
+    }
+
+    expect(previewReplay).not.toHaveBeenCalled();
+  });
+
+  it('returns the affected ledger range and expected record changes without mutating state', async () => {
+    const preview = {
+      fromLedger: 200,
+      currentLastLedger: 1000,
+      currentLastCursor: 'cursor_xyz',
+      eventCount: 42,
+      minLedgerInReplayRange: 210,
+      maxLedgerInReplayRange: 999,
+      expectedChanges: { streamEvents: 42, streams: 7 },
+    };
+    vi.mocked(previewReplay).mockResolvedValueOnce(preview as any);
+
+    const res = await request(app)
+      .get('/v1/admin/indexer/replay/preview?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ dryRun: true, preview });
+    expect(previewReplay).toHaveBeenCalledWith(200);
+    // Preview must never trigger a mutation.
+    expect(replayFromLedger).not.toHaveBeenCalled();
+    expect(resetIndexer).not.toHaveBeenCalled();
+  });
+
+  it('returns 500 when previewReplay throws', async () => {
+    vi.mocked(previewReplay).mockRejectedValueOnce(new Error('Preview failed'));
+
+    const res = await request(app)
+      .get('/v1/admin/indexer/replay/preview?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Replay failed' });
+    expect(replayFromLedger).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /v1/admin/indexer/replay/execute', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    process.env.ADMIN_PUBLIC_KEY = ADMIN_PUBLIC_KEY;
+  });
+
+  it('enforces requireAdmin (401 without token, 403 with non-admin token)', async () => {
+    const noTokenRes = await request(app).post(
+      '/v1/admin/indexer/replay/execute?from_ledger=100',
+    );
+    expect(noTokenRes.status).toBe(401);
+
+    const nonAdminRes = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=100')
+      .set('Authorization', `Bearer ${createToken(NON_ADMIN_PUBLIC_KEY)}`);
+    expect(nonAdminRes.status).toBe(403);
+    expect(replayFromLedger).not.toHaveBeenCalled();
+  });
+
+  it('returns 400 when from_ledger is missing, negative, or non-integer', async () => {
+    const queryUrls = [
+      '/v1/admin/indexer/replay/execute',
+      '/v1/admin/indexer/replay/execute?from_ledger=-1',
+      '/v1/admin/indexer/replay/execute?from_ledger=3.14',
+      '/v1/admin/indexer/replay/execute?from_ledger=invalid',
+    ];
+
+    for (const url of queryUrls) {
+      const res = await request(app)
+        .post(url)
+        .set('Authorization', `Bearer ${createToken()}`);
+
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ error: 'from_ledger must be a non-negative integer' });
+    }
+
+    expect(replayFromLedger).not.toHaveBeenCalled();
+  });
+
+  it('returns a structured execution report with request ID, duration, counts, and outcome', async () => {
+    vi.mocked(replayFromLedger).mockResolvedValueOnce({
+      requestId: 'req-abc-123',
+      fromLedger: 200,
+      toLedger: 1000,
+      durationMs: 1234,
+      recordsProcessed: 42,
+      recordsWritten: 40,
+      recordsSkipped: 2,
+      recordsFailed: 0,
+      outcome: 'success',
+      failurePosition: null,
+    } as any);
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      requestId: 'req-abc-123',
+      fromLedger: 200,
+      toLedger: 1000,
+      durationMs: 1234,
+      recordsProcessed: 42,
+      recordsWritten: 40,
+      recordsSkipped: 2,
+      recordsFailed: 0,
+      outcome: 'success',
+      failurePosition: null,
+    });
+    expect(replayFromLedger).toHaveBeenCalledWith(200);
+  });
+
+  it('reports the failure position and preserves the live cursor on failure', async () => {
+    vi.mocked(replayFromLedger).mockResolvedValueOnce({
+      requestId: 'req-fail-456',
+      fromLedger: 200,
+      toLedger: 1000,
+      durationMs: 500,
+      recordsProcessed: 10,
+      recordsWritten: 9,
+      recordsSkipped: 0,
+      recordsFailed: 1,
+      outcome: 'failed',
+      failurePosition: { ledger: 250, cursor: 'cursor_at_250' },
+      liveCursorPreserved: true,
+    } as any);
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      requestId: 'req-fail-456',
+      outcome: 'failed',
+      recordsFailed: 1,
+      failurePosition: { ledger: 250, cursor: 'cursor_at_250' },
+      liveCursorPreserved: true,
+    });
+  });
+
+  it('produces reproducible summaries across retries', async () => {
+    const report = {
+      requestId: 'req-retry-789',
+      fromLedger: 200,
+      toLedger: 1000,
+      durationMs: 800,
+      recordsProcessed: 42,
+      recordsWritten: 42,
+      recordsSkipped: 0,
+      recordsFailed: 0,
+      outcome: 'success',
+      failurePosition: null,
+    };
+    vi.mocked(replayFromLedger).mockResolvedValue(report as any);
+
+    const first = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+    const second = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(first.status).toBe(200);
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body);
+  });
+
+  it('returns 500 when replayFromLedger throws', async () => {
+    vi.mocked(replayFromLedger).mockRejectedValueOnce(new Error('Replay operation failed'));
+
+    const res = await request(app)
+      .post('/v1/admin/indexer/replay/execute?from_ledger=200')
+      .set('Authorization', `Bearer ${createToken()}`);
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ error: 'Replay failed' });
+  });
+});
+

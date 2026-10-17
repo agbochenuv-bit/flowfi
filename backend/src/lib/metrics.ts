@@ -10,6 +10,27 @@ import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom
  *
  * Metric names are prefixed with `flowfi_` so a shared Prometheus instance can
  * scrape several services without collisions.
+ *
+ * Indexer observability metrics (all labels are bounded — never transaction
+ * hashes, wallet addresses, or other unbounded identifiers):
+ *
+ * - `flowfi_indexer_current_ledger` (gauge, ledgers) — last ledger fully indexed.
+ * - `flowfi_indexer_network_ledger` (gauge, ledgers) — network tip as last seen.
+ * - `flowfi_indexer_lag_ledgers` (gauge, ledgers) — network tip minus current.
+ * - `flowfi_indexer_events_per_ledger` (histogram, events/ledger) — events
+ *   dispatched per processed ledger.
+ * - `flowfi_indexer_decode_duration_seconds` (histogram, seconds) — time spent
+ *   decoding a ledger's events; labels: `result` (success|error).
+ * - `flowfi_indexer_persist_duration_seconds` (histogram, seconds) — time spent
+ *   persisting a ledger's events; labels: `result` (success|error).
+ * - `flowfi_indexer_retries_total` (counter, retries) — retry attempts issued
+ *   by the worker; labels: `operation`, `outcome`.
+ * - `flowfi_indexer_last_success_timestamp_seconds` (gauge, unix seconds) —
+ *   wall-clock time of the last successful ledger commit.
+ *
+ * With multiple worker instances, aggregate with `max()` for lag/current-ledger
+ * gauges and `sum()`/`rate()` for counters; histograms aggregate across
+ * instances via `_sum`/`_count`.
  */
 
 /** Default histogram buckets — tuned for both sub-millisecond DB hits and slow RPC calls. */
@@ -79,6 +100,47 @@ export const indexerReorgEventsTotal = new Counter({
 export const indexerRevertedLedgers = new Gauge({
   name: 'flowfi_indexer_reverted_ledgers',
   help: 'Ledger count reverted by the most recent indexer rollback',
+  registers: [registry],
+});
+
+/** Events dispatched per processed ledger. */
+export const indexerEventsPerLedger = new Histogram({
+  name: 'flowfi_indexer_events_per_ledger',
+  help: 'Contract events dispatched per processed ledger',
+  buckets: [0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000],
+  registers: [registry],
+});
+
+/** Time spent decoding a ledger's events, by result. */
+export const indexerDecodeDuration = new Histogram({
+  name: 'flowfi_indexer_decode_duration_seconds',
+  help: 'Time spent decoding a ledger\'s events by result',
+  labelNames: ['result'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/** Time spent persisting a ledger's events, by result. */
+export const indexerPersistDuration = new Histogram({
+  name: 'flowfi_indexer_persist_duration_seconds',
+  help: 'Time spent persisting a ledger\'s events by result',
+  labelNames: ['result'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/** Retry attempts issued by the indexer worker, by operation and outcome. */
+export const indexerRetriesTotal = new Counter({
+  name: 'flowfi_indexer_retries_total',
+  help: 'Indexer retry attempts by operation and outcome',
+  labelNames: ['operation', 'outcome'] as const,
+  registers: [registry],
+});
+
+/** Unix timestamp (seconds) of the last successful ledger commit. */
+export const indexerLastSuccessTimestamp = new Gauge({
+  name: 'flowfi_indexer_last_success_timestamp_seconds',
+  help: 'Unix timestamp of the last successful indexer ledger commit',
   registers: [registry],
 });
 
@@ -289,6 +351,34 @@ export function setIndexerLedgers(currentLedger: number, networkLedger: number):
   } else {
     indexerLagLedgers.set(0);
   }
+}
+
+/** Record the number of events dispatched for a single processed ledger. */
+export function recordIndexerEventsPerLedger(count: number): void {
+  indexerEventsPerLedger.observe(count);
+}
+
+/** Record decode latency for a ledger. `result` is success | error. */
+export function recordIndexerDecode(seconds: number, result: string): void {
+  indexerDecodeDuration.observe({ result }, seconds);
+}
+
+/** Record persistence latency for a ledger. `result` is success | error. */
+export function recordIndexerPersist(seconds: number, result: string): void {
+  indexerPersistDuration.observe({ result }, seconds);
+}
+
+/** Record a retry attempt. `operation` and `outcome` must be bounded values. */
+export function recordIndexerRetry(operation: string, outcome: string): void {
+  indexerRetriesTotal.inc({ operation, outcome });
+}
+
+/**
+ * Stamp the last-success gauge. Defaults to "now" so callers can simply call
+ * this after a successful commit; pass an explicit epoch-seconds value in tests.
+ */
+export function markIndexerSuccess(timestampSeconds: number = Date.now() / 1000): void {
+  indexerLastSuccessTimestamp.set(timestampSeconds);
 }
 
 /**

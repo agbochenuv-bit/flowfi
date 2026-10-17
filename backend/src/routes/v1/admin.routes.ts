@@ -430,6 +430,77 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
 
 /**
  * @openapi
+ * /v1/admin/indexer/replay/preview:
+ *   get:
+ *     tags: [Admin]
+ *     summary: Preview an indexer replay without mutating state
+ *     description: |
+ *       Returns the auditable replay report describing the affected ledger
+ *       range, the expected record changes, and the current live cursor. This
+ *       endpoint performs **no writes** and never advances the cursor, so it is
+ *       safe to call before executing a replay.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: from_ledger
+ *         required: true
+ *         schema:
+ *           type: integer
+ *     responses:
+ *       200:
+ *         description: Replay preview report
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 dryRun: { type: boolean, example: true }
+ *                 preview:
+ *                   type: object
+ *                   additionalProperties: true
+ *       400:
+ *         description: Invalid from_ledger value
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       401:
+ *         description: Unauthorized - missing or invalid authentication token
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Forbidden - admin access required
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Internal server error
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+router.get('/indexer/replay/preview', async (req: Request, res: Response) => {
+  const fromLedger = Number(req.query.from_ledger);
+  if (!Number.isInteger(fromLedger) || fromLedger < 0) {
+    res.status(400).json({ error: 'from_ledger must be a non-negative integer' });
+    return;
+  }
+
+  try {
+    const preview = await previewReplay(fromLedger);
+    res.json({ dryRun: true, preview });
+  } catch (err) {
+    logger.error('Error previewing indexer replay:', err);
+    res.status(500).json({ error: 'Replay preview failed' });
+  }
+});
+
+/**
+ * @openapi
  * /v1/admin/indexer/replay:
  *   post:
  *     tags: [Admin]
@@ -460,6 +531,10 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
  *                 ok: { type: boolean, example: true }
  *                 replayingFrom: { type: integer }
  *                 requestId: { type: string }
+ *                 report:
+ *                   type: object
+ *                   additionalProperties: true
+ *                   description: Structured execution report (request ID, duration, counts, failure position).
  *       400:
  *         description: Invalid from_ledger value
  *         content:
@@ -500,9 +575,21 @@ router.post('/indexer/replay', async (req: Request, res: Response) => {
       res.json({ dryRun: true, preview });
       return;
     }
-    const requestId = await replayFromLedger(fromLedger);
-    res.status(202).json({ ok: true, replayingFrom: fromLedger, requestId });
+    const result = await replayFromLedger(fromLedger);
+    // Backward compatible: `requestId` stays a top-level string for existing
+    // clients, while the structured `report` carries the auditable summary.
+    const requestId =
+      typeof result === 'string' ? result : result.requestId;
+    const report =
+      typeof result === 'string' ? undefined : result.report;
+    res.status(202).json({
+      ok: true,
+      replayingFrom: fromLedger,
+      requestId,
+      ...(report ? { report } : {}),
+    });
   } catch (err) {
+    logger.error('Error triggering indexer replay:', err);
     res.status(500).json({ error: 'Replay failed' });
   }
 });

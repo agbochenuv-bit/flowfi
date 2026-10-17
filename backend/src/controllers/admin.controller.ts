@@ -6,6 +6,7 @@ import {
   MAX_DEAD_LETTER_PAGE_SIZE,
   discardDeadLetterEvent,
   listDeadLetterEvents,
+  previewDeadLetterReplay,
   replayAllDeadLetterEvents,
   replayDeadLetterEvent,
 } from '../services/indexerService.js';
@@ -92,11 +93,59 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
 };
 
 /**
+ * GET /api/v1/admin/indexer/dead-letter/:id/replay/preview
+ *
+ * Read-only preview of a single-record replay. Performs no writes: it reports
+ * the affected ledger range and the record changes the replay would produce so
+ * an operator can audit the mutation before triggering it.
+ */
+export const previewDeadLetterReplayHandler = async (
+  req: Request,
+  res: Response,
+) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  try {
+    const preview = await previewDeadLetterReplay(id);
+
+    if (preview.outcome === 'not_found') {
+      return res.status(404).json({ error: 'Dead-letter event not found' });
+    }
+
+    if (preview.outcome === 'undecodable') {
+      return res.status(422).json({
+        error: 'Dead-letter payload could not be decoded',
+        code: 'undecodable_payload',
+        id,
+        errorMessage: preview.errorMessage,
+        preview,
+      });
+    }
+
+    return res.status(200).json({ ok: true, id, preview });
+  } catch (err) {
+    logger.error(
+      `[AdminController] Preview of dead-letter ${id} threw:`,
+      err,
+    );
+    return res.status(500).json({ error: 'Preview failed' });
+  }
+};
+
+/**
  * POST /api/v1/admin/indexer/dead-letter/:id/replay
  *
  * Re-injects the quarantined payload through the indexer pipeline. On success
  * the row is removed and the Stream / StreamEvent records are created by the
  * worker; on failure the attempt counter and error message are updated.
+ *
+ * The response always carries a structured execution report (requestId,
+ * duration, counts, failure position) so the outcome is auditable. The live
+ * indexer cursor is preserved when a replay fails.
  */
 export const replayDeadLetterHandler = async (req: Request, res: Response) => {
   const rawId = req.params.id;
@@ -118,6 +167,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
         code: 'undecodable_payload',
         id,
         errorMessage: result.errorMessage,
+        report: result.report,
       });
     }
 
@@ -128,6 +178,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
         id,
         attempts: result.attempts,
         errorMessage: result.errorMessage,
+        report: result.report,
       });
     }
 
@@ -136,6 +187,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
       id,
       outcome: result.outcome,
       attempts: result.attempts,
+      report: result.report,
     });
   } catch (err) {
     logger.error(`[AdminController] Replay of dead-letter ${id} threw:`, err);
@@ -151,7 +203,11 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
 export const replayAllDeadLetterHandler = async (_req: Request, res: Response) => {
   try {
     const summary = await replayAllDeadLetterEvents();
-    return res.status(200).json({ ok: true, ...summary });
+    // A partial batch is reported with 207 so callers can distinguish a
+    // reproducible partial success from a clean run without breaking the
+    // existing 200 shape for full success.
+    const status = summary.failed > 0 ? 207 : 200;
+    return res.status(status).json({ ok: true, ...summary });
   } catch (err) {
     logger.error('[AdminController] Dead-letter replay-all threw:', err);
     return res.status(500).json({ error: 'Replay-all failed' });

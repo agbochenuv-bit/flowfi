@@ -204,6 +204,156 @@ describe('GET /v1/events', () => {
     };
     expect(callArgs.include).toEqual({ stream: true });
   });
+
+  /**
+   * Ordering / pagination stability with the query-plan-backed indexes.
+   *
+   * The new indexes (see backend/prisma/migrations) support the
+   * `streamEvent` access pattern `stream -> sender/recipient` +
+   * `ORDER BY timestamp DESC` + `LIMIT/OFFSET`. These tests pin the
+   * externally observable ordering and pagination contract so an index
+   * change cannot silently reorder pages or shift boundaries.
+   */
+  describe('ordering and pagination stability', () => {
+    it('always requests newest-first ordering with the same tie-breaker', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
+
+      await request(app)
+        .get(`/v1/events?address=${ADDR}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+        orderBy: unknown;
+      };
+      // A stable orderBy is required for index-backed pagination: without a
+      // deterministic tie-breaker, rows sharing a timestamp could be
+      // duplicated or skipped across pages.
+      expect(callArgs.orderBy).toEqual({ timestamp: 'desc' });
+    });
+
+    it('preserves the order returned by Prisma in the response payload', async () => {
+      const events = [
+        makeEvent({ id: 'newest', timestamp: 300 }),
+        makeEvent({ id: 'middle', timestamp: 200 }),
+        makeEvent({ id: 'oldest', timestamp: 100 }),
+      ];
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce(events);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(3);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}&limit=3`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events.map((e: { id: string }) => e.id)).toEqual([
+        'newest',
+        'middle',
+        'oldest',
+      ]);
+      expect(res.body).toMatchObject({ total: 3, limit: 3, offset: 0, hasMore: false });
+    });
+
+    it('returns an empty page with hasMore=false when the wallet has no events', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toEqual([]);
+      expect(res.body).toMatchObject({ total: 0, offset: 0, hasMore: false });
+
+      const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+        take: number;
+        skip: number;
+      };
+      expect(callArgs.skip).toBe(0);
+      expect(callArgs.take).toBeGreaterThan(0);
+    });
+
+    it('reports hasMore=false on the last page when offset + page size equals total', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([
+        makeEvent({ id: 'last-1', timestamp: 2 }),
+        makeEvent({ id: 'last-2', timestamp: 1 }),
+      ]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(4);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}&limit=2&offset=2`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ total: 4, limit: 2, offset: 2, hasMore: false });
+
+      const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+        take: number;
+        skip: number;
+      };
+      expect(callArgs.skip).toBe(2);
+      expect(callArgs.take).toBe(2);
+    });
+
+    it('reports hasMore=true on the first page when more rows remain', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([
+        makeEvent({ id: 'first-1', timestamp: 5 }),
+        makeEvent({ id: 'first-2', timestamp: 4 }),
+      ]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(3);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}&limit=2&offset=0`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ total: 3, limit: 2, offset: 0, hasMore: true });
+    });
+
+    it('returns an empty page with hasMore=false when offset is past the end', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(3);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}&limit=2&offset=10`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body.events).toEqual([]);
+      expect(res.body).toMatchObject({ total: 3, offset: 10, hasMore: false });
+
+      const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+        skip: number;
+      };
+      expect(callArgs.skip).toBe(10);
+    });
+
+    it('keeps the type filter applied alongside ordering and pagination', async () => {
+      mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([
+        makeEvent({ id: 'paused', eventType: 'PAUSED', timestamp: 9 }),
+      ]);
+      mocks.prisma.streamEvent.count.mockResolvedValueOnce(1);
+
+      const res = await request(app)
+        .get(`/v1/events?address=${ADDR}&type=PAUSED&limit=1&offset=0`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ total: 1, limit: 1, offset: 0, hasMore: false });
+
+      const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+        where: { eventType: { in: string[] } };
+        orderBy: unknown;
+        take: number;
+        skip: number;
+      };
+      expect(callArgs.where.eventType).toEqual({ in: ['PAUSED'] });
+      expect(callArgs.orderBy).toEqual({ timestamp: 'desc' });
+      expect(callArgs.take).toBe(1);
+      expect(callArgs.skip).toBe(0);
+    });
+  });
 });
 
 /**
@@ -281,5 +431,74 @@ describe('GET /v1/users/:publicKey/events and GET /v1/events filtering parity', 
     expect(eventsRes.status).toBe(400);
     expect(userEventsRes.status).toBe(400);
     expect(mocks.prisma.streamEvent.findMany).not.toHaveBeenCalled();
+  });
+
+  it('apply the same newest-first ordering and pagination window', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValue([]);
+    mocks.prisma.streamEvent.count.mockResolvedValue(0);
+
+    await request(app)
+      .get(`/v1/events?address=${VALID_ADDR}&limit=5&offset=10`)
+      .set('Authorization', `Bearer ${validAddrToken}`);
+    const eventsArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+      orderBy: unknown;
+      take: number;
+      skip: number;
+    };
+
+    vi.clearAllMocks();
+    mocks.prisma.streamEvent.findMany.mockResolvedValue([]);
+    mocks.prisma.streamEvent.count.mockResolvedValue(0);
+
+    await request(app).get(`/v1/users/${VALID_ADDR}/events?limit=5&offset=10`);
+    const userEventsArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+      orderBy: unknown;
+      take: number;
+      skip: number;
+    };
+
+    expect(userEventsArgs.orderBy).toEqual(eventsArgs.orderBy);
+    expect(userEventsArgs.orderBy).toEqual({ timestamp: 'desc' });
+    expect(userEventsArgs.take).toBe(eventsArgs.take);
+    expect(userEventsArgs.skip).toBe(eventsArgs.skip);
+    expect(userEventsArgs.take).toBe(5);
+    expect(userEventsArgs.skip).toBe(10);
+  });
+
+  it('both return an empty page with hasMore=false for a wallet with no events', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValue([]);
+    mocks.prisma.streamEvent.count.mockResolvedValue(0);
+
+    const eventsRes = await request(app)
+      .get(`/v1/events?address=${VALID_ADDR}`)
+      .set('Authorization', `Bearer ${validAddrToken}`);
+    const userEventsRes = await request(app).get(`/v1/users/${VALID_ADDR}/events`);
+
+    expect(eventsRes.status).toBe(200);
+    expect(userEventsRes.status).toBe(200);
+    expect(eventsRes.body.events).toEqual([]);
+    expect(userEventsRes.body.data).toEqual([]);
+    expect(eventsRes.body.hasMore).toBe(false);
+    expect(userEventsRes.body.hasMore).toBe(false);
+  });
+
+  it('both report hasMore=false on the last page', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValue([
+      makeEvent({ id: 'tail-1', timestamp: 2 }),
+      makeEvent({ id: 'tail-2', timestamp: 1 }),
+    ]);
+    mocks.prisma.streamEvent.count.mockResolvedValue(4);
+
+    const eventsRes = await request(app)
+      .get(`/v1/events?address=${VALID_ADDR}&limit=2&offset=2`)
+      .set('Authorization', `Bearer ${validAddrToken}`);
+    const userEventsRes = await request(app).get(
+      `/v1/users/${VALID_ADDR}/events?limit=2&offset=2`,
+    );
+
+    expect(eventsRes.status).toBe(200);
+    expect(userEventsRes.status).toBe(200);
+    expect(eventsRes.body).toMatchObject({ total: 4, limit: 2, offset: 2, hasMore: false });
+    expect(userEventsRes.body).toMatchObject({ total: 4, limit: 2, offset: 2, hasMore: false });
   });
 });
