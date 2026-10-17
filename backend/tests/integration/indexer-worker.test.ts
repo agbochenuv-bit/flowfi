@@ -42,6 +42,14 @@ const { mockPrisma, mockSseService } = vi.hoisted(() => ({
     user: {
       upsert: vi.fn().mockResolvedValue({}),
     },
+    webhookOutbox: {
+      create: vi.fn(),
+      findUnique: vi.fn(),
+      findMany: vi.fn().mockResolvedValue([]),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      count: vi.fn().mockResolvedValue(0),
+    },
     $transaction: vi.fn(async (fn: (client: typeof mockPrisma) => unknown) => fn(mockPrisma)),
     $queryRaw: vi.fn().mockResolvedValue([{ '?column?': 1n }]),
     $disconnect: vi.fn(),
@@ -61,6 +69,11 @@ vi.mock('../../src/services/sse.service.js', () => ({
 
 import app from '../../src/app.js';
 import { sorobanEventWorker } from '../../src/workers/soroban-event-worker.js';
+import {
+  enqueueWebhookEvent,
+  dispatchOutboxBatch,
+  MAX_DELIVERY_ATTEMPTS,
+} from '../../src/services/webhook-outbox.service.js';
 
 describe('Indexer worker integration (mocked DB)', () => {
   const senderPair = Keypair.random();
@@ -376,5 +389,159 @@ describe('Indexer worker integration (mocked DB)', () => {
         newAdmin,
       }),
     );
+  });
+});
+
+describe('Webhook transactional outbox (failure injection)', () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.stubGlobal('fetch', fetchMock);
+    mockPrisma.$transaction.mockImplementation(
+      async (fn: (client: typeof mockPrisma) => unknown) => fn(mockPrisma),
+    );
+    mockPrisma.webhookOutbox.create.mockImplementation(async ({ data }: any) => ({
+      id: 'outbox-1',
+      attempts: 0,
+      status: 'PENDING',
+      ...data,
+    }));
+    mockPrisma.webhookOutbox.update.mockImplementation(async ({ data }: any) => ({
+      id: 'outbox-1',
+      ...data,
+    }));
+    mockPrisma.webhookOutbox.updateMany.mockResolvedValue({ count: 1 });
+  });
+
+  it('keeps the outbox row when the business transaction commits but dispatch fails, then retries it', async () => {
+    // Business write + outbox enqueue share one transaction; the transaction
+    // commits, then the async dispatcher fails on its first attempt.
+    await mockPrisma.$transaction(async (tx) => {
+      await tx.stream.update({
+        where: { streamId: BigInt(1) },
+        data: { isActive: false },
+      });
+      await enqueueWebhookEvent(tx as any, {
+        dedupeKey: 'stream_cancelled:1:hash-1',
+        eventType: 'stream.cancelled',
+        payload: { streamId: 1 },
+      });
+    });
+
+    expect(mockPrisma.stream.update).toHaveBeenCalled();
+    expect(mockPrisma.webhookOutbox.create).toHaveBeenCalledTimes(1);
+
+    fetchMock.mockRejectedValueOnce(new Error('webhook endpoint unreachable'));
+    mockPrisma.webhookOutbox.findMany.mockResolvedValueOnce([
+      {
+        id: 'outbox-1',
+        dedupeKey: 'stream_cancelled:1:hash-1',
+        eventType: 'stream.cancelled',
+        payload: { streamId: 1 },
+        attempts: 0,
+        status: 'PENDING',
+      },
+    ]);
+
+    await dispatchOutboxBatch();
+
+    // Row survives the failed delivery and is rescheduled, not deleted.
+    expect(mockPrisma.webhookOutbox.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'outbox-1' },
+        data: expect.objectContaining({
+          attempts: 1,
+          status: 'PENDING',
+        }),
+      }),
+    );
+
+    // Second dispatch attempt succeeds and marks the row delivered.
+    fetchMock.mockResolvedValueOnce({ ok: true, status: 200 } as any);
+    mockPrisma.webhookOutbox.findMany.mockResolvedValueOnce([
+      {
+        id: 'outbox-1',
+        dedupeKey: 'stream_cancelled:1:hash-1',
+        eventType: 'stream.cancelled',
+        payload: { streamId: 1 },
+        attempts: 1,
+        status: 'PENDING',
+      },
+    ]);
+
+    await dispatchOutboxBatch();
+
+    expect(mockPrisma.webhookOutbox.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'outbox-1' },
+        data: expect.objectContaining({ status: 'DELIVERED' }),
+      }),
+    );
+    // Retries never create additional outbox records.
+    expect(mockPrisma.webhookOutbox.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('deduplicates a retried enqueue with the same dedupeKey into a single outbox row', async () => {
+    mockPrisma.webhookOutbox.create.mockImplementation(async ({ data }: any) => ({
+      id: 'outbox-1',
+      attempts: 0,
+      status: 'PENDING',
+      ...data,
+    }));
+
+    const enqueue = () =>
+      mockPrisma.$transaction(async (tx) => {
+        await enqueueWebhookEvent(tx as any, {
+          dedupeKey: 'stream_created:42:hash-dup',
+          eventType: 'stream.created',
+          payload: { streamId: 42 },
+        });
+      });
+
+    await enqueue();
+    await enqueue();
+
+    // Both calls target the same unique dedupeKey; the second is an upsert
+    // no-op rather than a second row.
+    expect(mockPrisma.webhookOutbox.create).toHaveBeenCalledTimes(2);
+    const dedupeKeys = mockPrisma.webhookOutbox.create.mock.calls.map(
+      ([args]: any[]) => args.data.dedupeKey,
+    );
+    expect(new Set(dedupeKeys).size).toBe(1);
+    expect(mockPrisma.webhookOutbox.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ dedupeKey: 'stream_created:42:hash-dup' }),
+      }),
+    );
+  });
+
+  it('marks the outbox row dead after max attempts without duplicate deliveries', async () => {
+    fetchMock.mockRejectedValue(new Error('webhook endpoint unreachable'));
+    mockPrisma.webhookOutbox.findMany.mockResolvedValueOnce([
+      {
+        id: 'outbox-dead',
+        dedupeKey: 'stream_cancelled:7:hash-dead',
+        eventType: 'stream.cancelled',
+        payload: { streamId: 7 },
+        attempts: MAX_DELIVERY_ATTEMPTS - 1,
+        status: 'PENDING',
+      },
+    ]);
+
+    await dispatchOutboxBatch();
+
+    expect(mockPrisma.webhookOutbox.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'outbox-dead' },
+        data: expect.objectContaining({
+          attempts: MAX_DELIVERY_ATTEMPTS,
+          status: 'DEAD',
+        }),
+      }),
+    );
+    // Exactly one delivery attempt per dispatch; no duplicate sends.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.webhookOutbox.create).not.toHaveBeenCalled();
   });
 });

@@ -23,6 +23,7 @@ vi.mock('../src/logger.js', () => ({
 }));
 
 import { ensureIndexerState } from '../src/lib/indexer-state.js';
+import { checkIndexerHealth } from '../src/lib/indexer-state.js';
 
 describe('ensureIndexerState', () => {
   beforeEach(() => {
@@ -96,5 +97,72 @@ describe('ensureIndexerState', () => {
     mocks.mockCreate.mockRejectedValueOnce(genericError);
 
     await expect(ensureIndexerState(0)).rejects.toThrow('connection refused');
+  });
+});
+
+describe('checkIndexerHealth', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reads dead-letter count and lag, then calls the alert service with the right arguments', async () => {
+    const state = {
+      id: 'singleton',
+      lastLedger: 100,
+      lastCursor: 'cur',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    mocks.mockFindUnique.mockResolvedValueOnce(state);
+
+    const health = {
+      deadLetterCount: 7,
+      lagLedgers: 250,
+      rpcFailureCount: 3,
+    };
+    const checkHealth = vi.fn().mockResolvedValue(health);
+    const evaluate = vi.fn().mockResolvedValue(undefined);
+
+    await checkIndexerHealth({
+      currentLedger: 350,
+      getHealth: checkHealth,
+      alertService: { evaluate },
+    });
+
+    expect(checkHealth).toHaveBeenCalledTimes(1);
+    expect(evaluate).toHaveBeenCalledTimes(1);
+    expect(evaluate).toHaveBeenCalledWith({
+      deadLetterCount: 7,
+      lagLedgers: 250,
+      rpcFailureCount: 3,
+    });
+  });
+
+  it('swallows errors from the alert service so the indexer is unaffected', async () => {
+    const state = {
+      id: 'singleton',
+      lastLedger: 100,
+      lastCursor: 'cur',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    mocks.mockFindUnique.mockResolvedValueOnce(state);
+
+    const checkHealth = vi.fn().mockResolvedValue({
+      deadLetterCount: 1,
+      lagLedgers: 10,
+      rpcFailureCount: 0,
+    });
+    const evaluate = vi.fn().mockRejectedValue(new Error('alert backend down'));
+
+    await expect(
+      checkIndexerHealth({
+        currentLedger: 110,
+        getHealth: checkHealth,
+        alertService: { evaluate },
+      }),
+    ).resolves.toBeUndefined();
+
+    expect(evaluate).toHaveBeenCalledTimes(1);
   });
 });
