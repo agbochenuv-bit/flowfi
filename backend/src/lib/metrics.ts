@@ -250,6 +250,26 @@ export const dbPoolWaitingRequests = new Gauge({
   },
 });
 
+export const dbPoolSaturationRatio = new Gauge({
+  name: 'flowfi_db_pool_saturation_ratio',
+  help: 'Ratio of actively leased database connections to maximum pool capacity (0.0 to 1.0)',
+  registers: [registry],
+  collect() {
+    const stats = sampleDbPool();
+    const max = dbPoolMaxConnections.get()?.values?.[0]?.value ?? 10;
+    const active = Math.max(0, stats.total - stats.idle);
+    this.set(max > 0 ? Math.min(1.0, active / max) : 0);
+  },
+});
+
+export const dbPoolAcquireDuration = new Histogram({
+  name: 'flowfi_db_pool_acquire_duration_seconds',
+  help: 'Time spent waiting to acquire a PostgreSQL connection from the pool',
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+  registers: [registry],
+});
+
+
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
 /** Every API request, labelled by low-cardinality route template and status. */
