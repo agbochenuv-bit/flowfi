@@ -55,6 +55,11 @@ model Stream {
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+  // Deterministic cursor pagination (Issue #73): stable ordering across equal
+  // timestamps and concurrent inserts. `id` is the tiebreaker.
+  @@index([createdAt, id])
+  @@index([sender, createdAt, id])
+  @@index([recipient, createdAt, id])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker
@@ -104,6 +109,10 @@ model StreamEvent {
   @@index([transactionHash])
   @@index([createdAt])
   @@index([streamId, timestamp])
+  // Deterministic cursor pagination (Issue #73): stable ordering across equal
+  // timestamps and concurrent inserts. `id` is the tiebreaker.
+  @@index([timestamp, id])
+  @@index([streamId, timestamp, id])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
@@ -176,4 +185,26 @@ model IndexerDeadLetterEvent {
   @@index([createdAt])
   @@index([attempts])
   @@index([eventType])
+}
+
+// IdempotencyRecord model - durable idempotency contract for retryable stream
+// commands that submit on-chain transactions (Issue #74). A key is bound to the
+// wallet, operation, and request hash so a retry with identical input replays the
+// original result, while key reuse with different input is rejected. Records are
+// retained for a bounded window and purged via `expiresAt`.
+model IdempotencyRecord {
+  id             String   @id @default(uuid())
+  wallet         String   // Stellar public key of the caller
+  operation      String   // Command identifier, e.g. "stream.create"
+  idempotencyKey String   // Client-supplied key
+  requestHash    String   // Hash of the canonical request payload
+  status         String   @default("IN_FLIGHT") // "IN_FLIGHT" | "SUCCEEDED" | "FAILED"
+  response       String?  // Serialized result payload (JSON)
+  expiresAt      DateTime // Bounded retention; rows past this are purgeable
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([wallet, operation, idempotencyKey])
+  @@index([expiresAt])
+  @@index([wallet, operation])
 }

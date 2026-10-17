@@ -21,6 +21,11 @@ import {
 } from "../repositories/streamEvent.repository.js";
 import { findStreams } from "../repositories/stream.repository.js";
 import { sendApiError } from "../types/api-error.js";
+import {
+  decodeCursor,
+  encodeCursor,
+  isCursorPaginationEnabled,
+} from "../lib/cursor.js";
 
 const DEFAULT_STREAM_PAGE_SIZE = 20;
 const MAX_STREAM_PAGE_SIZE = 100;
@@ -132,10 +137,12 @@ export const createStream = async (req: Request, res: Response) => {
 
     const chainStream = await getStreamFromChain(parsedStreamId);
     if (!chainStream) {
-      return res.status(409).json({
-        error: "Stream has not been confirmed on-chain",
-        message: "Submit the stream creation transaction and retry after confirmation.",
-      });
+      return sendApiError(
+        res,
+        409,
+        "STREAM_NOT_CONFIRMED",
+        "Submit the stream creation transaction and retry after confirmation.",
+      );
     }
 
     if (
@@ -146,9 +153,12 @@ export const createStream = async (req: Request, res: Response) => {
       chainStream.depositedAmount !== parsedDepositedAmount.toString() ||
       chainStream.startTime !== parsedStartTime
     ) {
-      return res.status(409).json({
-        error: "Stream request does not match on-chain state",
-      });
+      return sendApiError(
+        res,
+        409,
+        "STREAM_STATE_MISMATCH",
+        "Stream request does not match on-chain state",
+      );
     }
 
     const endTime =
@@ -194,7 +204,17 @@ export const createStream = async (req: Request, res: Response) => {
 };
 
 /**
- * List streams by sender, recipient, status, token with sorting and pagination
+ * List streams by sender, recipient, status, token with sorting and pagination.
+ *
+ * Cursor pagination (opt-in via `?pagination=cursor`):
+ * - Ordering is deterministic: the requested sort field followed by the unique
+ *   `streamId` as a tiebreaker, so rows sharing a sort value never reorder
+ *   between pages.
+ * - The `cursor` value is opaque; clients must echo `nextCursor` verbatim.
+ * - Cursors expire after 24h (see `lib/cursor.ts`); an expired or malformed
+ *   cursor yields `400 INVALID_CURSOR`.
+ * - When cursor mode is off (default) the legacy `limit`/`offset` response
+ *   shape is returned unchanged.
  */
 export const listStreams = async (req: Request, res: Response) => {
   try {
@@ -208,6 +228,10 @@ export const listStreams = async (req: Request, res: Response) => {
       limit = "20",
       offset = "0",
     } = req.query;
+
+    const useCursor = isCursorPaginationEnabled(req.query);
+    const rawCursor =
+      typeof req.query["cursor"] === "string" ? req.query["cursor"] : undefined;
 
     // Validate status parameter
     if (typeof status === "string") {
@@ -256,6 +280,35 @@ export const listStreams = async (req: Request, res: Response) => {
     if (typeof token === "string") params.tokenAddress = token;
     if (typeof status === "string") {
       params.status = status as 'active' | 'cancelled' | 'completed' | 'paused';
+    }
+
+    if (useCursor) {
+      if (rawCursor) {
+        const decoded = decodeCursor(rawCursor);
+        if (!decoded) {
+          return sendApiError(res, 400, "INVALID_CURSOR", "cursor is invalid or expired");
+        }
+        params.offset = 0;
+        params.cursor = decoded;
+      }
+      const result = await findStreams(params);
+      const last = result.streams[result.streams.length - 1];
+      const nextCursor =
+        result.hasMore && last
+          ? encodeCursor({
+              sortField,
+              sortOrder: params.sortOrder,
+              sortValue: String((last as Record<string, unknown>)[sortField]),
+              id: String((last as Record<string, unknown>).streamId),
+            })
+          : null;
+      return res.status(200).json({
+        data: result.streams,
+        total: result.total,
+        hasMore: result.hasMore,
+        limit: parsedLimit,
+        nextCursor,
+      });
     }
 
     const result = await findStreams(params);
@@ -324,7 +377,16 @@ export const getStream = async (req: Request, res: Response) => {
 };
 
 /**
- * List events for a stream (paginated)
+ * List events for a stream (paginated).
+ *
+ * Cursor pagination (opt-in via `?pagination=cursor`):
+ * - Ordering is deterministic: `timestamp` followed by the unique event `id`
+ *   as a tiebreaker, so events sharing a ledger timestamp never reorder.
+ * - The `cursor` value is opaque; clients must echo `nextCursor` verbatim.
+ * - Cursors expire after 24h (see `lib/cursor.ts`); an expired or malformed
+ *   cursor yields `400 INVALID_CURSOR`.
+ * - When cursor mode is off (default) the legacy `limit`/`offset`/`page`
+ *   response shape is returned unchanged.
  */
 export const getStreamEvents = async (req: Request, res: Response) => {
   try {
@@ -336,6 +398,7 @@ export const getStreamEvents = async (req: Request, res: Response) => {
       return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
     }
 
+    const useCursor = isCursorPaginationEnabled(req.query);
     const rawLimit = req.query["limit"];
     const rawOffset = req.query["offset"];
     const rawPage = req.query["page"];
@@ -385,6 +448,18 @@ export const getStreamEvents = async (req: Request, res: Response) => {
       whereClause.eventType = eventType;
     }
 
+    // In cursor mode the incoming `cursor` is an opaque token, not a raw id.
+    let decodedCursorId: string | undefined;
+    if (useCursor && cursor) {
+      const decoded = decodeCursor(cursor);
+      if (!decoded) {
+        return sendApiError(res, 400, "INVALID_CURSOR", "cursor is invalid or expired");
+      }
+      decodedCursorId = decoded.id;
+    } else if (!useCursor && cursor) {
+      decodedCursorId = cursor;
+    }
+
     const [events, total] = await Promise.all([
       prisma.streamEvent.findMany({
         where: whereClause,
@@ -394,14 +469,30 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         // therefore cursor pagination) is stable across pages.
         orderBy: [{ timestamp: order }, { id: order }],
         take: limit,
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
+        ...(decodedCursorId
+          ? { cursor: { id: decodedCursorId }, skip: 1 }
+          : { skip: offset }),
       }),
       prisma.streamEvent.count({ where: whereClause }),
     ]);
 
-    const hasMore = cursor
+    const hasMore = decodedCursorId
       ? events.length === limit
       : offset + events.length < total;
+
+    if (useCursor) {
+      const last = events[events.length - 1];
+      const nextCursor =
+        hasMore && last
+          ? encodeCursor({
+              sortField: "timestamp",
+              sortOrder: order,
+              sortValue: String(last.timestamp),
+              id: String(last.id),
+            })
+          : null;
+      return res.status(200).json({ data: events, total, hasMore, nextCursor });
+    }
 
     return res.status(200).json({ data: events, total, hasMore });
   } catch (error) {
@@ -693,7 +784,7 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
     return res
       .status(200)
       .json({ streamId, txHash, depositedAmount: updatedStream!.depositedAmount });
-  } catch (error: any) {
+  } catch (error) {
     logger.error(`[topUp] stream=${streamId} error:`, error);
     return sendApiError(res, 400, "TOP_UP_FAILED", "Failed to top up stream on chain");
   }

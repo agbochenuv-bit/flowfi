@@ -4,6 +4,26 @@
 import type { Request, Response } from "express";
 import * as webhookService from "../services/webhook.service.js";
 import logger from "../logger.js";
+import { ApiError } from "../errors/ApiError.js";
+import { ErrorCode } from "../errors/errorCodes.js";
+import { sendErrorEnvelope } from "../errors/errorEnvelope.js";
+
+function respondWithError(req: Request, res: Response, error: unknown): void {
+  if (error instanceof ApiError) {
+    sendErrorEnvelope(req, res, error);
+    return;
+  }
+  logger.error("[Webhook Controller] Unexpected error:", error);
+  sendErrorEnvelope(
+    req,
+    res,
+    new ApiError(
+      ErrorCode.INTERNAL_ERROR,
+      500,
+      "An unexpected error occurred",
+    ),
+  );
+}
 
 export async function createWebhook(
   req: Request,
@@ -13,9 +33,24 @@ export async function createWebhook(
     const { userAddress, targetUrl, eventTypes } = req.body;
 
     if (!userAddress || !targetUrl || !Array.isArray(eventTypes)) {
-      res.status(400).json({
-        error: "Missing required fields: userAddress, targetUrl, eventTypes",
-      });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "Missing required fields: userAddress, targetUrl, eventTypes",
+          [
+            { field: "userAddress", issue: "required" },
+            { field: "targetUrl", issue: "required" },
+            { field: "eventTypes", issue: "must be an array" },
+          ].filter((detail) => {
+            if (detail.field === "userAddress") return !userAddress;
+            if (detail.field === "targetUrl") return !targetUrl;
+            return !Array.isArray(eventTypes);
+          }),
+        ),
+      );
       return;
     }
 
@@ -34,10 +69,7 @@ export async function createWebhook(
       message: "Store the secret key securely - it will not be shown again",
     });
   } catch (error: any) {
-    logger.error("[Webhook Controller] Create error:", error);
-    res
-      .status(500)
-      .json({ error: error.message || "Failed to create webhook" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -46,7 +78,16 @@ export async function listWebhooks(req: Request, res: Response): Promise<void> {
     const { userAddress } = req.query;
 
     if (!userAddress || typeof userAddress !== "string") {
-      res.status(400).json({ error: "userAddress query parameter required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "userAddress query parameter required",
+          [{ field: "userAddress", issue: "required" }],
+        ),
+      );
       return;
     }
 
@@ -60,8 +101,7 @@ export async function listWebhooks(req: Request, res: Response): Promise<void> {
 
     res.json({ subscriptions: safeSubscriptions });
   } catch (error: any) {
-    logger.error("[Webhook Controller] List error:", error);
-    res.status(500).json({ error: "Failed to list webhooks" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -75,7 +115,21 @@ export async function deleteWebhook(
     const { userAddress } = req.query;
 
     if (!id || !userAddress || typeof userAddress !== "string") {
-      res.status(400).json({ error: "Invalid id or userAddress required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "Invalid id or userAddress required",
+          [
+            { field: "id", issue: "required" },
+            { field: "userAddress", issue: "required" },
+          ].filter((detail) =>
+            detail.field === "id" ? !id : typeof userAddress !== "string",
+          ),
+        ),
+      );
       return;
     }
 
@@ -83,8 +137,7 @@ export async function deleteWebhook(
 
     res.status(204).send();
   } catch (error: any) {
-    logger.error("[Webhook Controller] Delete error:", error);
-    res.status(500).json({ error: "Failed to delete webhook" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -93,13 +146,27 @@ export async function updateWebhook(req: Request, res: Response): Promise<void> 
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { userAddress } = req.query;
     if (!id || typeof userAddress !== "string") {
-      res.status(400).json({ error: "id and userAddress are required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "id and userAddress are required",
+          [
+            { field: "id", issue: "required" },
+            { field: "userAddress", issue: "required" },
+          ].filter((detail) =>
+            detail.field === "id" ? !id : typeof userAddress !== "string",
+          ),
+        ),
+      );
       return;
     }
     const subscription = await webhookService.updateWebhookSubscription(id, userAddress, req.body);
     res.json(subscription);
   } catch (error: any) {
-    res.status(400).json({ error: error.message || "Failed to update webhook" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -108,12 +175,26 @@ export async function listDeliveries(req: Request, res: Response): Promise<void>
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { userAddress, page = "1", limit = "20" } = req.query;
     if (!id || typeof userAddress !== "string") {
-      res.status(400).json({ error: "id and userAddress are required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "id and userAddress are required",
+          [
+            { field: "id", issue: "required" },
+            { field: "userAddress", issue: "required" },
+          ].filter((detail) =>
+            detail.field === "id" ? !id : typeof userAddress !== "string",
+          ),
+        ),
+      );
       return;
     }
     res.json(await webhookService.listWebhookDeliveries(id, userAddress, Number(page), Number(limit)));
   } catch (error: any) {
-    res.status(400).json({ error: error.message || "Failed to list webhook deliveries" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -122,12 +203,26 @@ export async function regenerateSecret(req: Request, res: Response): Promise<voi
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     const { userAddress } = req.body;
     if (!id || !userAddress) {
-      res.status(400).json({ error: "id and userAddress are required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "id and userAddress are required",
+          [
+            { field: "id", issue: "required" },
+            { field: "userAddress", issue: "required" },
+          ].filter((detail) =>
+            detail.field === "id" ? !id : !userAddress,
+          ),
+        ),
+      );
       return;
     }
     res.json({ secretKey: await webhookService.regenerateWebhookSecret(id, userAddress) });
   } catch (error: any) {
-    res.status(400).json({ error: error.message || "Failed to regenerate webhook secret" });
+    respondWithError(req, res, error);
   }
 }
 
@@ -138,7 +233,21 @@ export async function testWebhook(req: Request, res: Response): Promise<void> {
     const { userAddress } = req.body;
 
     if (!id || !userAddress) {
-      res.status(400).json({ error: "id and userAddress required" });
+      sendErrorEnvelope(
+        req,
+        res,
+        new ApiError(
+          ErrorCode.VALIDATION_FAILED,
+          400,
+          "id and userAddress required",
+          [
+            { field: "id", issue: "required" },
+            { field: "userAddress", issue: "required" },
+          ].filter((detail) =>
+            detail.field === "id" ? !id : !userAddress,
+          ),
+        ),
+      );
       return;
     }
 
@@ -149,9 +258,6 @@ export async function testWebhook(req: Request, res: Response): Promise<void> {
       result,
     });
   } catch (error: any) {
-    logger.error("[Webhook Controller] Test error:", error);
-    res
-      .status(500)
-      .json({ error: error.message || "Failed to send test webhook" });
+    respondWithError(req, res, error);
   }
 }

@@ -15,8 +15,32 @@ import { simulateStreamHandler } from '../../controllers/stream/simulate.js';
 import { withdrawHandler } from './streams/withdraw.js';
 import { requireAuth } from '../../middleware/auth.js';
 import { streamCreationRateLimiter } from '../../middleware/stream-rate-limiter.middleware.js';
+import { idempotency } from '../../middleware/idempotency.middleware.js';
 
 const router = Router();
+
+/**
+ * Idempotency contract for retryable stream commands.
+ *
+ * Routes that submit on-chain transactions (create, simulate, withdraw,
+ * cancel) accept an optional `Idempotency-Key` request header. When present:
+ *
+ *  - The key is bound to the authenticated wallet, the operation name and a
+ *    hash of the request body. Replaying the same key with the same input
+ *    returns the original stored response (same status code and body) without
+ *    re-submitting a transaction.
+ *  - Reusing a key with a *different* wallet, operation or request body is
+ *    rejected with HTTP 409 `IDEMPOTENCY_KEY_REUSED`.
+ *  - Concurrent duplicate submissions with the same key are serialized: at
+ *    most one transaction is submitted; the others wait for and receive the
+ *    original result (or 409 `IDEMPOTENCY_IN_PROGRESS` if the wait times out).
+ *
+ * Keys are retained for a bounded window (24h by default, configurable via
+ * `IDEMPOTENCY_TTL_SECONDS`). After expiry the key may be reused and the
+ * request is treated as new. Requests without the header behave exactly as
+ * before (no deduplication).
+ */
+const idempotentCommand = idempotency();
 
 /**
  * @openapi
@@ -102,7 +126,7 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/', requireAuth, streamCreationRateLimiter, createStream);
+router.post('/', requireAuth, streamCreationRateLimiter, idempotentCommand, createStream);
 
 /**
  * @openapi
@@ -217,7 +241,7 @@ router.post('/', requireAuth, streamCreationRateLimiter, createStream);
  *       503:
  *         description: Stream contract is not configured
  */
-router.post('/simulate', simulateStreamHandler);
+router.post('/simulate', idempotentCommand, simulateStreamHandler);
 
 /**
  * @openapi
@@ -274,7 +298,29 @@ router.post('/simulate', simulateStreamHandler);
  *           type: integer
  *           default: 0
  *           minimum: 0
- *         description: Number of results to skip
+ *         description: Number of results to skip. Ignored when `cursor` is set.
+ *       - in: query
+ *         name: cursor
+ *         schema:
+ *           type: string
+ *         description: |
+ *           Opaque cursor for stable keyset pagination. When set, `offset` is
+ *           ignored and results are ordered deterministically by
+ *           `(sortField, id)` so rows are neither skipped nor duplicated across
+ *           page boundaries, even with equal timestamps or concurrent inserts.
+ *           Pass the `nextCursor` from the previous response to fetch the next
+ *           page. Cursors are opaque and expire after 24h; an expired or
+ *           malformed cursor returns HTTP 400 `INVALID_CURSOR`.
+ *       - in: query
+ *         name: version
+ *         schema:
+ *           type: string
+ *           enum: [1, 2]
+ *           default: '1'
+ *         description: |
+ *           Response contract version. `1` (default) preserves the existing
+ *           offset-based response shape. `2` enables cursor pagination and
+ *           adds `nextCursor`/`hasMore` to the response envelope.
  *     responses:
  *       200:
  *         description: Paginated list of streams
@@ -283,7 +329,7 @@ router.post('/simulate', simulateStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/StreamListResponse'
  *       400:
- *         description: Invalid status or pagination parameters
+ *         description: Invalid status or pagination parameters, or an expired/malformed cursor
  *         content:
  *           application/json:
  *             schema:
@@ -423,7 +469,23 @@ router.get('/:streamId', getStream);
  *         name: cursor
  *         schema:
  *           type: string
- *         description: Event id cursor for stable pagination (hasMore-aware). Ignored when `offset` is set.
+ *         description: |
+ *           Opaque cursor for stable keyset pagination (hasMore-aware). When set,
+ *           `offset` and `page` are ignored. Ordering is deterministic by
+ *           `(timestamp, id)` so events are neither skipped nor duplicated across
+ *           page boundaries, even with equal timestamps or concurrent inserts.
+ *           Cursors are opaque and expire after 24h; an expired or malformed
+ *           cursor returns HTTP 400 `INVALID_CURSOR`.
+ *       - in: query
+ *         name: version
+ *         schema:
+ *           type: string
+ *           enum: [1, 2]
+ *           default: '1'
+ *         description: |
+ *           Response contract version. `1` (default) preserves the existing
+ *           offset-based response shape. `2` enables cursor pagination and adds
+ *           `nextCursor`/`hasMore` to the response envelope.
  *       - in: query
  *         name: order
  *         schema:
@@ -439,7 +501,7 @@ router.get('/:streamId', getStream);
  *             schema:
  *               $ref: '#/components/schemas/StreamEventListResponse'
  *       400:
- *         description: Invalid request parameters
+ *         description: Invalid request parameters, or an expired/malformed cursor
  *         content:
  *           application/json:
  *             schema:
@@ -695,7 +757,7 @@ router.post('/:streamId/resume', requireAuth, resumeStream);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/withdraw', requireAuth, withdrawHandler as any);
+router.post('/:streamId/withdraw', requireAuth, idempotentCommand, withdrawHandler as any);
 
 /**
  * @openapi
@@ -834,6 +896,6 @@ router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/cancel', requireAuth, cancelStreamHandler as any);
+router.post('/:streamId/cancel', requireAuth, idempotentCommand, cancelStreamHandler as any);
 
 export default router;

@@ -4,6 +4,8 @@ import {
   parseEventTypeFilter,
   resolveEventsOffset,
   resolveEventsPageSize,
+  encodeEventsCursor,
+  decodeEventsCursor,
   DEFAULT_EVENTS_PAGE_SIZE,
   MAX_EVENTS_PAGE_SIZE,
 } from '../src/repositories/streamEvent.repository.js';
@@ -187,6 +189,240 @@ describe('streamEvent.repository', () => {
       const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 15 });
 
       expect(result.hasMore).toBe(false);
+    });
+  });
+
+  describe('encodeEventsCursor / decodeEventsCursor', () => {
+    const TS = new Date('2024-05-01T12:00:00.000Z');
+
+    it('round-trips a timestamp and id', () => {
+      const cursor = encodeEventsCursor({ timestamp: TS, id: 'evt_1' });
+      expect(typeof cursor).toBe('string');
+      expect(decodeEventsCursor(cursor)).toEqual({ timestamp: TS, id: 'evt_1' });
+    });
+
+    it('produces an opaque, URL-safe token', () => {
+      const cursor = encodeEventsCursor({ timestamp: TS, id: 'evt_1' });
+      expect(cursor).not.toContain('evt_1');
+      expect(cursor).toMatch(/^[A-Za-z0-9_-]+$/);
+    });
+
+    it('produces distinct cursors for equal timestamps with different ids', () => {
+      const a = encodeEventsCursor({ timestamp: TS, id: 'evt_1' });
+      const b = encodeEventsCursor({ timestamp: TS, id: 'evt_2' });
+      expect(a).not.toBe(b);
+    });
+
+    it('returns null for malformed cursors', () => {
+      expect(decodeEventsCursor('not-a-cursor')).toBeNull();
+      expect(decodeEventsCursor('')).toBeNull();
+      expect(decodeEventsCursor('%%%')).toBeNull();
+    });
+
+    it('returns null for a cursor with an invalid timestamp', () => {
+      const bad = Buffer.from(JSON.stringify({ t: 'nope', id: 'evt_1' })).toString(
+        'base64url',
+      );
+      expect(decodeEventsCursor(bad)).toBeNull();
+    });
+
+    it('returns null for a cursor missing the id', () => {
+      const bad = Buffer.from(JSON.stringify({ t: TS.toISOString() })).toString(
+        'base64url',
+      );
+      expect(decodeEventsCursor(bad)).toBeNull();
+    });
+  });
+
+  describe('listEventsForWallet with cursor pagination', () => {
+    const ADDR = 'GADDR123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA';
+    const TS = new Date('2024-05-01T12:00:00.000Z');
+
+    it('uses a deterministic (timestamp, id) ordering', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      await listEventsForWallet({ address: ADDR, limit: 10, cursor: null });
+
+      expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [{ timestamp: 'desc' }, { id: 'desc' }],
+        }),
+      );
+    });
+
+    it('does not use skip when a cursor is supplied', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      const cursor = encodeEventsCursor({ timestamp: TS, id: 'evt_5' });
+      await listEventsForWallet({ address: ADDR, limit: 10, cursor });
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.skip).toBeUndefined();
+      expect(callArgs.take).toBe(11);
+    });
+
+    it('applies a keyset where-clause for the cursor position', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      const cursor = encodeEventsCursor({ timestamp: TS, id: 'evt_5' });
+      await listEventsForWallet({ address: ADDR, limit: 10, cursor });
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.where.AND).toEqual([
+        {
+          OR: [
+            { timestamp: { lt: TS } },
+            { timestamp: TS, id: { lt: 'evt_5' } },
+          ],
+        },
+      ]);
+    });
+
+    it('returns a nextCursor when more rows exist', async () => {
+      const rows = Array.from({ length: 11 }, (_, i) => ({
+        id: `evt_${i}`,
+        timestamp: new Date(TS.getTime() - i * 1000),
+      }));
+      (prisma.streamEvent.findMany as any).mockResolvedValue(rows);
+      (prisma.streamEvent.count as any).mockResolvedValue(50);
+
+      const result = await listEventsForWallet({ address: ADDR, limit: 10, cursor: null });
+
+      expect(result.items).toHaveLength(10);
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBe(
+        encodeEventsCursor({ timestamp: rows[9].timestamp, id: rows[9].id }),
+      );
+    });
+
+    it('returns nextCursor null on the last page', async () => {
+      const rows = Array.from({ length: 3 }, (_, i) => ({
+        id: `evt_${i}`,
+        timestamp: new Date(TS.getTime() - i * 1000),
+      }));
+      (prisma.streamEvent.findMany as any).mockResolvedValue(rows);
+      (prisma.streamEvent.count as any).mockResolvedValue(3);
+
+      const result = await listEventsForWallet({ address: ADDR, limit: 10, cursor: null });
+
+      expect(result.items).toHaveLength(3);
+      expect(result.hasMore).toBe(false);
+      expect(result.nextCursor).toBeNull();
+    });
+
+    it('returns an empty page with nextCursor null when no rows match', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      const result = await listEventsForWallet({ address: ADDR, limit: 10, cursor: null });
+
+      expect(result.items).toEqual([]);
+      expect(result.hasMore).toBe(false);
+      expect(result.nextCursor).toBeNull();
+    });
+
+    it('treats a malformed cursor as the start of the list', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      const result = await listEventsForWallet({
+        address: ADDR,
+        limit: 10,
+        cursor: 'not-a-cursor',
+      });
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.where.AND).toBeUndefined();
+      expect(result.nextCursor).toBeNull();
+    });
+
+    it('treats an expired cursor as the start of the list', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+      (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+      const expired = encodeEventsCursor({
+        timestamp: TS,
+        id: 'evt_5',
+        expiresAt: new Date(Date.now() - 1000),
+      });
+      const result = await listEventsForWallet({ address: ADDR, limit: 10, cursor: expired });
+
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+      expect(callArgs.where.AND).toBeUndefined();
+      expect(result.nextCursor).toBeNull();
+    });
+
+    it('does not skip or duplicate rows across page boundaries with equal timestamps', async () => {
+      // Three events share the same timestamp; ordering must fall back to id.
+      const all = [
+        { id: 'evt_c', timestamp: TS },
+        { id: 'evt_b', timestamp: TS },
+        { id: 'evt_a', timestamp: TS },
+        { id: 'evt_z', timestamp: new Date(TS.getTime() - 1000) },
+      ];
+
+      const page = (cursor: string | null) => {
+        const decoded = cursor ? decodeEventsCursor(cursor) : null;
+        let filtered = all;
+        if (decoded) {
+          filtered = all.filter(
+            (r) =>
+              r.timestamp < decoded.timestamp ||
+              (r.timestamp.getTime() === decoded.timestamp.getTime() &&
+                r.id < decoded.id),
+          );
+        }
+        return filtered.slice(0, 2);
+      };
+
+      (prisma.streamEvent.count as any).mockResolvedValue(all.length);
+
+      const seen: string[] = [];
+      let cursor: string | null = null;
+      for (let i = 0; i < 10; i += 1) {
+        const rows = page(cursor);
+        (prisma.streamEvent.findMany as any).mockResolvedValueOnce(rows);
+        const result = await listEventsForWallet({ address: ADDR, limit: 2, cursor });
+        seen.push(...result.items.map((r: any) => r.id));
+        cursor = result.nextCursor;
+        if (!cursor) break;
+      }
+
+      expect(seen).toEqual(['evt_c', 'evt_b', 'evt_a', 'evt_z']);
+      expect(new Set(seen).size).toBe(seen.length);
+    });
+
+    it('remains stable when new rows are inserted between pages', async () => {
+      const older = [
+        { id: 'evt_3', timestamp: new Date(TS.getTime() - 3000) },
+        { id: 'evt_2', timestamp: new Date(TS.getTime() - 2000) },
+      ];
+      const firstPage = [
+        { id: 'evt_5', timestamp: new Date(TS.getTime() - 1000) },
+        { id: 'evt_4', timestamp: new Date(TS.getTime() - 1500) },
+      ];
+
+      (prisma.streamEvent.count as any).mockResolvedValue(4);
+      (prisma.streamEvent.findMany as any).mockResolvedValueOnce(firstPage);
+
+      const page1 = await listEventsForWallet({ address: ADDR, limit: 2, cursor: null });
+      expect(page1.items.map((r: any) => r.id)).toEqual(['evt_5', 'evt_4']);
+
+      // A concurrent insert lands at the head of the list; keyset pagination
+      // must ignore it because it sorts before the cursor position.
+      (prisma.streamEvent.findMany as any).mockResolvedValueOnce(older);
+      const page2 = await listEventsForWallet({
+        address: ADDR,
+        limit: 2,
+        cursor: page1.nextCursor,
+      });
+
+      expect(page2.items.map((r: any) => r.id)).toEqual(['evt_3', 'evt_2']);
+      const callArgs = (prisma.streamEvent.findMany as any).mock.calls[1][0];
+      expect(callArgs.where.AND).toBeDefined();
     });
   });
 });

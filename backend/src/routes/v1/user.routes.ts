@@ -8,8 +8,42 @@ import {
 } from "../../controllers/user.controller.js";
 import { getUserStreamSummary } from "../../controllers/stream.controller.js";
 import { requireAuth } from "../../middleware/auth.js";
+import { principalRateLimit } from "../../middleware/rateLimit.js";
 
 const router = Router();
+
+/**
+ * Principal-aware budgets for user routes.
+ *
+ * Authenticated callers are keyed by their account identity (falling back to
+ * the client IP only when no principal can be resolved), so a single account
+ * cannot multiply its budget by rotating IPs or spoofing forwarding headers.
+ * Anonymous callers are keyed by the trusted client IP resolved through the
+ * configured proxy trust settings.
+ *
+ * Budgets (per window):
+ *   - account: 120 requests / 60s
+ *   - export:  10 requests / 60s (expensive, CSV/JSON generation)
+ *
+ * When the shared Redis store is unavailable the limiter degrades to an
+ * in-process counter (per instance) rather than failing closed, so requests
+ * are still served but multi-instance totals may exceed the budget.
+ *
+ * Exceeding a budget returns HTTP 429 with the standard envelope:
+ *   { "error": { "code": "RATE_LIMITED", "message": "...", "retryAfter": <seconds> } }
+ * and a `Retry-After` header.
+ */
+const accountLimiter = principalRateLimit({
+  bucket: "user:account",
+  limit: 120,
+  windowSeconds: 60,
+});
+
+const exportLimiter = principalRateLimit({
+  bucket: "user:export",
+  limit: 10,
+  windowSeconds: 60,
+});
 
 /**
  * @openapi
@@ -119,8 +153,8 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post("/", registerUser);
-router.get("/me", requireAuth, getCurrentUser);
+router.post("/", accountLimiter, registerUser);
+router.get("/me", accountLimiter, requireAuth, getCurrentUser);
 /**
  * @openapi
  * /v1/users/{address}/summary:
@@ -161,8 +195,8 @@ router.get("/me", requireAuth, getCurrentUser);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:address/summary", getUserStreamSummary);
-router.get("/:publicKey", getUser);
+router.get("/:address/summary", accountLimiter, getUserStreamSummary);
+router.get("/:publicKey", accountLimiter, getUser);
 
 /**
  * @openapi
@@ -218,7 +252,7 @@ router.get("/:publicKey", getUser);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:publicKey/events", getUserEvents);
+router.get("/:publicKey/events", accountLimiter, getUserEvents);
 
 export default router;
 
@@ -291,6 +325,20 @@ export default router;
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: |
+ *           Rate limit exceeded for the export budget (10 requests / 60s per
+ *           principal). The response includes a `Retry-After` header and the
+ *           standard rate-limit error envelope.
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds to wait before retrying
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Internal server error
  *         content:
@@ -298,4 +346,4 @@ export default router;
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.get("/:address/export", exportTransactions);
+router.get("/:address/export", exportLimiter, exportTransactions);

@@ -8,6 +8,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import express from "express";
+import request from "supertest";
 
 const queryMock = vi.fn();
 
@@ -33,6 +35,15 @@ import {
   getProtocolTvl,
   resetTimescaleCacheForTests,
 } from "../src/services/analytics.service.js";
+import {
+  createPrincipalRateLimiter,
+  type RateLimitStore,
+} from "../src/middleware/rateLimit.js";
+import {
+  errorEnvelope,
+  requestIdMiddleware,
+  type ApiErrorCode,
+} from "../src/middleware/errorEnvelope.js";
 
 describe("analytics service (#1480)", () => {
   beforeEach(() => {
@@ -149,5 +160,181 @@ describe("analytics service (#1480)", () => {
     expect(series.points[0]?.avgTvlStroops).toBe("123");
     expect(series.points[0]?.peakStreams).toBe(9);
     expect(queryMock.mock.calls.at(-1)![0]).toContain("daily_protocol_metrics");
+  });
+});
+
+/**
+ * In-memory stand-in for the Redis-backed counter store. Mirrors the
+ * multi-instance semantics: every "instance" shares the same store, so a
+ * caller's budget is consumed globally rather than per process.
+ */
+function createMemoryStore(): RateLimitStore & { hits: Map<string, number> } {
+  const hits = new Map<string, number>();
+  return {
+    hits,
+    async increment(key: string, windowSeconds: number) {
+      const current = hits.get(key) ?? 0;
+      const next = current + 1;
+      hits.set(key, next);
+      return { count: next, resetAt: Date.now() + windowSeconds * 1000 };
+    },
+  };
+}
+
+function buildAnalyticsApp(store: RateLimitStore) {
+  const app = express();
+  app.set("trust proxy", 1);
+  app.use(requestIdMiddleware());
+  app.use(
+    "/api/analytics",
+    createPrincipalRateLimiter({
+      store,
+      windowSeconds: 60,
+      anonymousLimit: 2,
+      authenticatedLimit: 5,
+      route: "analytics",
+    }),
+  );
+  app.get("/api/analytics/tvl", (_req, res) => {
+    res.json({ ok: true });
+  });
+  app.get("/api/analytics/history", (_req, res) => {
+    res.json({ ok: true });
+  });
+  app.use(
+    (
+      err: unknown,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      const code: ApiErrorCode = "INTERNAL_ERROR";
+      res.status(500).json(errorEnvelope(code, res.locals.requestId));
+    },
+  );
+  return app;
+}
+
+describe("analytics route family: principal-aware rate limits (#72)", () => {
+  it("applies the anonymous budget keyed by client IP", async () => {
+    const store = createMemoryStore();
+    const app = buildAnalyticsApp(store);
+
+    await request(app).get("/api/analytics/tvl").expect(200);
+    await request(app).get("/api/analytics/tvl").expect(200);
+    const limited = await request(app).get("/api/analytics/tvl").expect(429);
+
+    expect(limited.body.error.code).toBe("RATE_LIMITED");
+    expect(limited.body.error.requestId).toBeTruthy();
+    expect(limited.headers["retry-after"]).toBeDefined();
+    // Anonymous callers are bucketed by IP, not by a shared global key.
+    expect([...store.hits.keys()].some((k) => k.includes("ip:"))).toBe(true);
+  });
+
+  it("gives authenticated principals a larger budget than anonymous callers", async () => {
+    const store = createMemoryStore();
+    const app = buildAnalyticsApp(store);
+
+    const auth = { Authorization: "Bearer principal-abc" };
+    for (let i = 0; i < 5; i += 1) {
+      await request(app).get("/api/analytics/tvl").set(auth).expect(200);
+    }
+    await request(app).get("/api/analytics/tvl").set(auth).expect(429);
+    // The anonymous bucket for the same IP is untouched by the principal.
+    await request(app).get("/api/analytics/tvl").expect(200);
+  });
+
+  it("ignores spoofed X-Forwarded-For beyond the trusted proxy hop", async () => {
+    const store = createMemoryStore();
+    const app = buildAnalyticsApp(store);
+
+    // With trust proxy = 1, the leftmost entry is attacker-controlled; the
+    // limiter must key on the rightmost (proxy-appended) address.
+    await request(app)
+      .get("/api/analytics/tvl")
+      .set("X-Forwarded-For", "1.1.1.1, 203.0.113.9")
+      .expect(200);
+    await request(app)
+      .get("/api/analytics/tvl")
+      .set("X-Forwarded-For", "2.2.2.2, 203.0.113.9")
+      .expect(200);
+    await request(app)
+      .get("/api/analytics/tvl")
+      .set("X-Forwarded-For", "3.3.3.3, 203.0.113.9")
+      .expect(429);
+  });
+
+  it("shares counters across instances via the backing store", async () => {
+    const store = createMemoryStore();
+    const instanceA = buildAnalyticsApp(store);
+    const instanceB = buildAnalyticsApp(store);
+
+    await request(instanceA).get("/api/analytics/tvl").expect(200);
+    await request(instanceB).get("/api/analytics/tvl").expect(200);
+    // Third hit lands on a different instance but the shared counter trips.
+    await request(instanceA).get("/api/analytics/tvl").expect(429);
+  });
+
+  it("fails open with a documented fallback when the store is unavailable", async () => {
+    const store: RateLimitStore = {
+      async increment() {
+        throw new Error("redis down: 10.0.0.5:6379 ECONNREFUSED");
+      },
+    };
+    const app = buildAnalyticsApp(store);
+
+    for (let i = 0; i < 4; i += 1) {
+      await request(app).get("/api/analytics/tvl").expect(200);
+    }
+  });
+});
+
+describe("analytics route family: stable error envelope (#70)", () => {
+  it("returns a versioned envelope with a stable code and request id", async () => {
+    const app = express();
+    app.use(requestIdMiddleware());
+    app.get("/api/analytics/history", (_req, res) => {
+      res.status(400).json(errorEnvelope("VALIDATION_FAILED", res.locals.requestId, [
+        { field: "period", message: "must be one of 7d, 30d, 90d" },
+      ]));
+    });
+
+    const res = await request(app)
+      .get("/api/analytics/history")
+      .set("X-Request-Id", "req-analytics-1")
+      .expect(400);
+
+    expect(res.body.error).toMatchObject({
+      code: "VALIDATION_FAILED",
+      requestId: "req-analytics-1",
+      version: expect.any(String),
+    });
+    expect(res.body.error.details).toEqual([
+      { field: "period", message: "must be one of 7d, 30d, 90d" },
+    ]);
+  });
+
+  it("never leaks internal exception text to clients", async () => {
+    const app = express();
+    app.use(requestIdMiddleware());
+    app.get("/api/analytics/tvl", () => {
+      throw new Error("pg: password authentication failed for user flowfi");
+    });
+    app.use(
+      (
+        _err: unknown,
+        _req: express.Request,
+        res: express.Response,
+        _next: express.NextFunction,
+      ) => {
+        res.status(500).json(errorEnvelope("INTERNAL_ERROR", res.locals.requestId));
+      },
+    );
+
+    const res = await request(app).get("/api/analytics/tvl").expect(500);
+    const serialized = JSON.stringify(res.body);
+    expect(res.body.error.code).toBe("INTERNAL_ERROR");
+    expect(serialized).not.toContain("password");
+    expect(serialized).not.toContain("flowfi");
   });
 });

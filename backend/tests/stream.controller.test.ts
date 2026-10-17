@@ -3,6 +3,7 @@ import { createStream, listStreams, getStream, getStreamEvents, getStreamClaimab
 import { prisma } from '../src/lib/prisma.js';
 import { claimableAmountService } from '../src/services/claimable.service.js';
 import * as sorobanService from '../src/services/sorobanService.js';
+import { encodeCursor, decodeCursor } from '../src/lib/cursor.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -18,6 +19,12 @@ vi.mock('../src/lib/prisma.js', () => ({
       create: vi.fn(),
       findMany: vi.fn(),
       count: vi.fn(),
+    },
+    idempotencyKey: {
+      findUnique: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      deleteMany: vi.fn(),
     },
   },
 }));
@@ -237,6 +244,50 @@ describe("Stream Controller", () => {
         expect.objectContaining({ total: 0 }),
       );
     });
+
+    it("returns a stable cursor envelope when cursor pagination is requested (Issue #73)", async () => {
+      req.query = {
+        address: "GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ",
+        limit: "2",
+        cursor: encodeCursor({ createdAt: 1700000000000, id: 42 }),
+      };
+      (prisma.stream.findMany as any).mockResolvedValue([
+        { streamId: 41, createdAt: new Date(1700000000000), updatedAt: new Date() },
+        { streamId: 40, createdAt: new Date(1700000000000), updatedAt: new Date() },
+      ]);
+      (prisma.stream.count as any).mockResolvedValue(2);
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      const body = (res.json as any).mock.calls[0][0];
+      expect(body).toEqual(
+        expect.objectContaining({
+          data: expect.any(Array),
+          nextCursor: expect.any(String),
+          hasMore: expect.any(Boolean),
+        }),
+      );
+      // Deterministic tie-break ordering on (createdAt, id).
+      expect(prisma.stream.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: [{ createdAt: 'desc' }, { streamId: 'desc' }],
+        }),
+      );
+    });
+
+    it("rejects a malformed cursor with 400 (Issue #73)", async () => {
+      req.query = {
+        address: "GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ",
+        limit: "10",
+        cursor: "not-a-valid-cursor",
+      };
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.stream.findMany).not.toHaveBeenCalled();
+    });
   });
 
   describe("getStream", () => {
@@ -288,6 +339,47 @@ describe("Stream Controller", () => {
           skip: 0,
         }),
       );
+    });
+
+    it('returns a nextCursor and applies the keyset predicate on the next page (Issue #73)', async () => {
+      req.params = { streamId: '123' };
+      const cursor = encodeCursor({ timestamp: 1700000000000, id: 7 });
+      req.query = { limit: '2', cursor };
+      (prisma.streamEvent.findMany as any).mockResolvedValue([
+        { id: 6, timestamp: new Date(1700000000000) },
+        { id: 5, timestamp: new Date(1700000000000) },
+      ]);
+      (prisma.streamEvent.count as any).mockResolvedValue(2);
+
+      await getStreamEvents(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      const body = (res.json as any).mock.calls[0][0];
+      expect(body.nextCursor).toEqual(expect.any(String));
+      expect(decodeCursor(body.nextCursor)).toEqual({ timestamp: 1700000000000, id: 5 });
+      expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({
+            streamId: 123n,
+            OR: [
+              { timestamp: { lt: new Date(1700000000000) } },
+              { timestamp: new Date(1700000000000), id: { lt: 7 } },
+            ],
+          }),
+          orderBy: [{ timestamp: 'desc' }, { id: 'desc' }],
+          take: 2,
+        }),
+      );
+    });
+
+    it('rejects a malformed cursor with 400 (Issue #73)', async () => {
+      req.params = { streamId: '123' };
+      req.query = { limit: '10', cursor: 'garbage' };
+
+      await getStreamEvents(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
     });
   });
 
@@ -448,6 +540,91 @@ describe("Stream Controller", () => {
       await pauseStream(req as Request, res as Response);
 
       expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    it("replays the original result when the same idempotency key is retried (Issue #74)", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+      (req as any).headers = { "idempotency-key": "idem-key-1" };
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        streamId: 123,
+        sender: "GUSER1",
+        isPaused: false,
+        isActive: true,
+      });
+      (sorobanService.pauseStream as any).mockResolvedValue({ txHash: "tx123" });
+      (prisma.stream.update as any).mockResolvedValue({ streamId: 123, isPaused: true });
+      (prisma.idempotencyKey.findUnique as any).mockResolvedValue({
+        key: "idem-key-1",
+        wallet: "GUSER1",
+        operation: "pauseStream",
+        requestHash: expect.any(String),
+        responseStatus: 200,
+        responseBody: { streamId: 123, isPaused: true, txHash: "tx123" },
+      });
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(res.json).toHaveBeenCalledWith(
+        expect.objectContaining({ txHash: "tx123" }),
+      );
+      // The on-chain command must not be re-submitted on replay.
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+    });
+
+    it("rejects reuse of an idempotency key with a different request body (Issue #74)", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+      (req as any).headers = { "idempotency-key": "idem-key-1" };
+      (prisma.idempotencyKey.findUnique as any).mockResolvedValue({
+        key: "idem-key-1",
+        wallet: "GUSER1",
+        operation: "pauseStream",
+        requestHash: "different-hash",
+        responseStatus: 200,
+        responseBody: { streamId: 123 },
+      });
+
+      await pauseStream(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(sorobanService.pauseStream).not.toHaveBeenCalled();
+    });
+
+    it("submits at most one transaction under concurrent duplicate requests (Issue #74)", async () => {
+      req.params = { streamId: "123" };
+      req.body = { secret: "S123" };
+      (req as any).user = { publicKey: "GUSER1" };
+      (req as any).headers = { "idempotency-key": "idem-key-1" };
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        streamId: 123,
+        sender: "GUSER1",
+        isPaused: false,
+        isActive: true,
+      });
+      (sorobanService.pauseStream as any).mockResolvedValue({ txHash: "tx123" });
+      (prisma.stream.update as any).mockResolvedValue({ streamId: 123, isPaused: true });
+      // First lookup misses; the unique insert wins for one caller and the
+      // other observes a unique-constraint violation.
+      (prisma.idempotencyKey.findUnique as any).mockResolvedValue(null);
+      (prisma.idempotencyKey.create as any)
+        .mockResolvedValueOnce({ key: "idem-key-1" })
+        .mockRejectedValueOnce(Object.assign(new Error("unique"), { code: "P2002" }));
+
+      const res2: Partial<Response> = {
+        status: vi.fn().mockReturnThis(),
+        json: vi.fn().mockReturnThis(),
+      };
+
+      await Promise.all([
+        pauseStream(req as Request, res as Response),
+        pauseStream(req as Request, res2 as Response),
+      ]);
+
+      expect(sorobanService.pauseStream).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -311,7 +311,33 @@ async function simulateContractCall(method: string, args: xdr.ScVal[]): Promise<
   return simSuccess.result!.retval;
 }
 
-export async function submitContractCall(method: string, args: xdr.ScVal[], senderSecret: string): Promise<string> {
+/**
+ * Options controlling a single on-chain submission.
+ *
+ * `idempotencyKey` is advisory metadata only: the Soroban service never
+ * deduplicates on it. Deduplication (binding the key to wallet + operation +
+ * request hash, bounded retention, and collapsing concurrent duplicates into a
+ * single in-flight submission) is owned by the idempotency middleware, which
+ * wraps {@link submitContractCallOnce}. Keeping the key here lets the service
+ * tag logs/traces without changing the public submission signatures.
+ */
+export interface SubmitContractCallOptions {
+  idempotencyKey?: string | undefined;
+}
+
+/**
+ * Single-shot submission path: builds, simulates, signs, sends and awaits
+ * finality for exactly one transaction. It performs no retry or deduplication
+ * of its own, so callers that need at-most-once semantics per idempotency key
+ * must invoke it inside the idempotency middleware's lock. `submitContractCall`
+ * is a thin wrapper over this function, so existing callers are unaffected.
+ */
+export async function submitContractCallOnce(
+  method: string,
+  args: xdr.ScVal[],
+  senderSecret: string,
+  options: SubmitContractCallOptions = {},
+): Promise<string> {
   const contractId = getContractId();
   if (!contractId) throw new Error('CONTRACT_ID not set');
 
@@ -344,6 +370,12 @@ export async function submitContractCall(method: string, args: xdr.ScVal[], send
   const assembledTx = rpc.assembleTransaction(tx, simulation).build();
   assembledTx.sign(keypair);
 
+  if (options.idempotencyKey) {
+    logger.debug(
+      `[SorobanService] submitting ${method} under idempotency key ${options.idempotencyKey}`,
+    );
+  }
+
   const response = await withRpcTimeout('sendTransaction', () => executeRpc('sendTransaction', (server) => server.sendTransaction(assembledTx)));
 
   if (response.status === 'ERROR') {
@@ -353,6 +385,17 @@ export async function submitContractCall(method: string, args: xdr.ScVal[], send
   await pollTransactionStatus(response.hash);
 
   return response.hash;
+}
+
+/**
+ * Submit a contract call and await on-chain finality.
+ *
+ * Public signature is unchanged; the submission is delegated to
+ * {@link submitContractCallOnce} so the idempotency middleware can wrap the
+ * same code path without duplicating transaction-building logic.
+ */
+export async function submitContractCall(method: string, args: xdr.ScVal[], senderSecret: string): Promise<string> {
+  return submitContractCallOnce(method, args, senderSecret);
 }
 
 /**

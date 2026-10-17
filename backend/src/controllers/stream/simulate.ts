@@ -3,6 +3,11 @@ import { z } from 'zod';
 import { ApiError } from '../../lib/api-error.js';
 import logger from '../../logger.js';
 import { simulateStreamAction, type StreamAction } from '../../services/sorobanService.js';
+import {
+  getIdempotencyKey,
+  runIdempotent,
+  type IdempotencyScope,
+} from '../../lib/idempotency.js';
 
 /**
  * Request schema for POST /api/v1/streams/simulate.
@@ -59,8 +64,21 @@ const simulateBodySchema = z.object({
  *         description: Simulation succeeded
  *       400:
  *         description: Invalid parameters or a reverted simulation
+ *       409:
+ *         description: Idempotency key reused with a different request payload
  *       503:
  *         description: Stream contract is not configured
+ *     parameters:
+ *       - in: header
+ *         name: Idempotency-Key
+ *         required: false
+ *         schema:
+ *           type: string
+ *         description: |
+ *           Optional client-generated key. Retries carrying the same key and an
+ *           identical body replay the original response instead of re-running
+ *           the simulation. Reusing a key with a different body is rejected
+ *           with 409 `idempotency_key_reuse`.
  */
 export const simulateStreamHandler = async (req: Request, res: Response) => {
   const parsed = simulateBodySchema.safeParse(req.body);
@@ -74,22 +92,50 @@ export const simulateStreamHandler = async (req: Request, res: Response) => {
 
   const { action, senderPublicKey, params } = parsed.data;
 
-  try {
+  const execute = async () => {
     const data = await simulateStreamAction(action as StreamAction, senderPublicKey, params);
-    return res.status(200).json({ success: true, data });
-  } catch (err) {
-    if (err instanceof ApiError) {
-      return res.status(err.status).json({
-        error: err.message,
-        code: err.code,
-        ...(err.details ? { details: err.details } : {}),
-      });
-    }
+    return { status: 200, body: { success: true, data } };
+  };
 
-    logger.error(`[simulate] Unexpected failure for action ${action}:`, err);
-    return res.status(500).json({
-      error: 'Simulation failed',
-      code: 'simulation_error',
-    });
+  const idempotencyKey = getIdempotencyKey(req);
+  if (!idempotencyKey) {
+    try {
+      const { status, body } = await execute();
+      return res.status(status).json(body);
+    } catch (err) {
+      return respondWithError(res, err, action);
+    }
+  }
+
+  const scope: IdempotencyScope = {
+    wallet: senderPublicKey,
+    operation: `streams.simulate.${action}`,
+    request: parsed.data,
+  };
+
+  try {
+    const outcome = await runIdempotent(idempotencyKey, scope, execute);
+    if (outcome.replayed) {
+      res.setHeader('Idempotent-Replayed', 'true');
+    }
+    return res.status(outcome.status).json(outcome.body);
+  } catch (err) {
+    return respondWithError(res, err, action);
   }
 };
+
+function respondWithError(res: Response, err: unknown, action: string) {
+  if (err instanceof ApiError) {
+    return res.status(err.status).json({
+      error: err.message,
+      code: err.code,
+      ...(err.details ? { details: err.details } : {}),
+    });
+  }
+
+  logger.error(`[simulate] Unexpected failure for action ${action}:`, err);
+  return res.status(500).json({
+    error: 'Simulation failed',
+    code: 'simulation_error',
+  });
+}

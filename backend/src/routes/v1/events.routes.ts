@@ -7,12 +7,28 @@ import type { AuthenticatedRequest } from '../../types/auth.types.js';
 import logger from '../../logger.js';
 import {
   listEventsForWallet,
+  listEventsForWalletByCursor,
   parseEventTypeFilter,
   resolveEventsOffset,
   resolveEventsPageSize,
 } from '../../repositories/streamEvent.repository.js';
+import { decodeEventCursor, encodeEventCursor } from '../../repositories/eventCursor.js';
 
 const router = Router();
+
+/**
+ * Resolves whether the caller opted into cursor pagination.
+ *
+ * Cursor pagination is opt-in via `?pagination=cursor` (or `?cursor=...`).
+ * When it is not requested the legacy limit/offset behavior is preserved
+ * verbatim so existing clients keep their response shape.
+ */
+function wantsCursorPagination(req: Request): boolean {
+  const mode = typeof req.query.pagination === 'string' ? req.query.pagination.trim().toLowerCase() : '';
+  if (mode === 'cursor') return true;
+  if (mode === 'offset') return false;
+  return typeof req.query.cursor === 'string' && req.query.cursor.trim().length > 0;
+}
 
 /**
  * @openapi
@@ -56,6 +72,23 @@ const router = Router();
  *         required: false
  *         schema: { type: boolean, default: false }
  *         description: When true, each event includes its related `stream`.
+ *       - in: query
+ *         name: pagination
+ *         required: false
+ *         schema: { type: string, enum: [offset, cursor], default: offset }
+ *         description: |
+ *           Pagination mode. `offset` (default) preserves the legacy
+ *           limit/offset/page behavior. `cursor` enables opaque cursor
+ *           pagination with deterministic ordering across equal timestamps
+ *           and concurrent inserts. Cursor mode ignores `offset`/`page`.
+ *       - in: query
+ *         name: cursor
+ *         required: false
+ *         schema: { type: string }
+ *         description: |
+ *           Opaque cursor returned as `nextCursor` by a previous cursor-mode
+ *           request. Implies `pagination=cursor`. Cursors expire after a
+ *           bounded window; an expired or malformed cursor yields 400.
  *     responses:
  *       200:
  *         description: Paginated event list
@@ -110,12 +143,46 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
     }
 
     const limit = resolveEventsPageSize(req.query.limit);
+    const includeStream = req.query.includeStream === 'true';
+
+    if (wantsCursorPagination(req)) {
+      const rawCursor = typeof req.query.cursor === 'string' ? req.query.cursor.trim() : '';
+      let after: ReturnType<typeof decodeEventCursor> = null;
+      if (rawCursor) {
+        after = decodeEventCursor(rawCursor);
+        if (!after) {
+          res.status(400).json({ error: 'Invalid or expired cursor' });
+          return;
+        }
+      }
+
+      const cursorResult = await listEventsForWalletByCursor({
+        address,
+        types,
+        limit,
+        after,
+        includeStream,
+      });
+
+      const nextCursor = cursorResult.hasMore && cursorResult.events.length > 0
+        ? encodeEventCursor(cursorResult.events[cursorResult.events.length - 1])
+        : null;
+
+      res.json({
+        events: cursorResult.events,
+        limit: cursorResult.limit,
+        hasMore: cursorResult.hasMore,
+        nextCursor,
+        pagination: 'cursor',
+      });
+      return;
+    }
+
     const offset = resolveEventsOffset({
       rawOffset: req.query.offset,
       rawPage: req.query.page,
       limit,
     });
-    const includeStream = req.query.includeStream === 'true';
 
     const result = await listEventsForWallet({
       address,

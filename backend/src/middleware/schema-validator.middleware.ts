@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from "express";
 import { z } from "zod";
+import { ApiError, ErrorCode } from "../errors/api-error";
 
 /**
  * Zod-backed request validation that mirrors the OpenAPI contract.
@@ -43,6 +44,18 @@ function toInvalidParams(error: z.ZodError): InvalidParam[] {
   }));
 }
 
+/**
+ * Maps a Zod error onto the stable, machine-readable validation detail shape.
+ * Only the field path and a safe message are surfaced; no validator internals
+ * (issue codes, expected types, stack frames) leak to clients.
+ */
+function toValidationDetails(error: z.ZodError): { path: string; message: string }[] {
+  return error.issues.map((issue) => ({
+    path: issue.path.length ? issue.path.join(".") : "(root)",
+    message: issue.message,
+  }));
+}
+
 export function invalidParametersProblem(invalidParams: InvalidParam[]): ProblemDetails {
   const first = invalidParams[0];
   return {
@@ -52,6 +65,18 @@ export function invalidParametersProblem(invalidParams: InvalidParam[]): Problem
     detail: first ? `Invalid parameter '${first.name}': ${first.reason}` : "Invalid request",
     invalidParams,
   };
+}
+
+/**
+ * Builds the stable validation error envelope directly. Exposed so callers
+ * that validate outside the middleware (e.g. background jobs) can reuse the
+ * exact same code and detail shape.
+ */
+export function validationFailedError(error: z.ZodError): ApiError {
+  return new ApiError(ErrorCode.VALIDATION_FAILED, "Invalid request parameters", {
+    status: 400,
+    details: toValidationDetails(error),
+  });
 }
 
 export function validateRequest(schemas: RequestSchemas) {
@@ -71,7 +96,13 @@ export function validateRequest(schemas: RequestSchemas) {
     }
 
     if (invalidParams.length > 0) {
-      res.status(400).type("application/problem+json").json(invalidParametersProblem(invalidParams));
+      const details = invalidParams.map((p) => ({ path: p.name, message: p.reason }));
+      next(
+        new ApiError(ErrorCode.VALIDATION_FAILED, "Invalid request parameters", {
+          status: 400,
+          details,
+        }),
+      );
       return;
     }
 

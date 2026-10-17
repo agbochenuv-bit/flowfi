@@ -7,6 +7,7 @@ const {
   mockResumeStream,
   mockWithdraw,
   mockPrisma,
+  mockIdempotencyStore,
 } = vi.hoisted(() => ({
   mockPauseStream: vi.fn(),
   mockResumeStream: vi.fn(),
@@ -29,6 +30,16 @@ const {
     $transaction: vi.fn(async (fn: any) => fn(mockPrisma)),
     $disconnect: vi.fn(),
   },
+  mockIdempotencyStore: {
+    find: vi.fn(),
+    insert: vi.fn(),
+    complete: vi.fn(),
+    fail: vi.fn(),
+  },
+}));
+
+vi.mock('../../src/services/idempotencyStore.js', () => ({
+  idempotencyStore: mockIdempotencyStore,
 }));
 
 vi.mock('../../src/lib/prisma.js', () => ({
@@ -92,6 +103,10 @@ describe('stream action routes', () => {
     mockPrisma.stream.count.mockResolvedValue(0);
     mockPrisma.streamEvent.findMany.mockResolvedValue([]);
     mockPrisma.streamEvent.count.mockResolvedValue(0);
+    mockIdempotencyStore.find.mockResolvedValue(null);
+    mockIdempotencyStore.insert.mockResolvedValue({ inserted: true });
+    mockIdempotencyStore.complete.mockResolvedValue(undefined);
+    mockIdempotencyStore.fail.mockResolvedValue(undefined);
   });
 
   it('POST /v1/streams/:streamId/pause pauses an active sender-owned stream', async () => {
@@ -226,5 +241,145 @@ describe('stream action routes', () => {
         }),
       }),
     );
+  });
+
+  describe('idempotency', () => {
+    const IDEMPOTENCY_KEY = 'retry-key-0001';
+
+    function mockPausableStream(sender: StellarSdk.Keypair) {
+      mockPrisma.stream.findUnique.mockResolvedValue({
+        streamId: 7,
+        sender: sender.publicKey(),
+        recipient: makeKeypair().publicKey(),
+        isActive: true,
+        isPaused: false,
+        pausedAt: null,
+        totalPausedDuration: 0,
+      });
+      mockPrisma.stream.update.mockResolvedValue({
+        streamId: 7,
+        isActive: true,
+        isPaused: true,
+        pausedAt: 1700000000,
+        totalPausedDuration: 0,
+      });
+    }
+
+    it('returns the original result when retried with the same key and input', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockPausableStream(sender);
+      mockPauseStream.mockResolvedValue({ txHash: 'pause-tx-hash' });
+
+      const first = await request(app)
+        .post('/v1/streams/7/pause')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', IDEMPOTENCY_KEY);
+
+      expect(first.status).toBe(200);
+      expect(first.body).toMatchObject({
+        success: true,
+        streamId: 7,
+        txHash: 'pause-tx-hash',
+      });
+      expect(mockPauseStream).toHaveBeenCalledTimes(1);
+
+      // Simulate the stored record from the first request being replayed.
+      mockIdempotencyStore.find.mockResolvedValue({
+        key: IDEMPOTENCY_KEY,
+        wallet: sender.publicKey(),
+        operation: 'pause',
+        requestHash: first.headers['idempotency-request-hash'],
+        status: 'COMPLETED',
+        responseStatus: 200,
+        responseBody: first.body,
+      });
+
+      const retry = await request(app)
+        .post('/v1/streams/7/pause')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', IDEMPOTENCY_KEY);
+
+      expect(retry.status).toBe(200);
+      expect(retry.body).toEqual(first.body);
+      expect(mockPauseStream).toHaveBeenCalledTimes(1);
+    });
+
+    it('rejects key reuse with changed input with IDEMPOTENCY_CONFLICT', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockPausableStream(sender);
+      mockPauseStream.mockResolvedValue({ txHash: 'pause-tx-hash' });
+
+      mockIdempotencyStore.find.mockResolvedValue({
+        key: IDEMPOTENCY_KEY,
+        wallet: sender.publicKey(),
+        operation: 'pause',
+        requestHash: 'hash-of-original-request',
+        status: 'COMPLETED',
+        responseStatus: 200,
+        responseBody: { success: true, streamId: 7, txHash: 'pause-tx-hash' },
+      });
+
+      const response = await request(app)
+        .post('/v1/streams/7/pause')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', IDEMPOTENCY_KEY)
+        .send({ reason: 'different input' });
+
+      expect(response.status).toBe(409);
+      expect(response.body).toMatchObject({
+        error: 'IDEMPOTENCY_CONFLICT',
+      });
+      expect(mockPauseStream).not.toHaveBeenCalled();
+    });
+
+    it('triggers at most one transaction for concurrent duplicate submissions', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockPausableStream(sender);
+
+      let resolvePause: (value: { txHash: string }) => void = () => {};
+      mockPauseStream.mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolvePause = resolve;
+          }),
+      );
+
+      // First caller wins the insert; the second observes an in-flight record.
+      mockIdempotencyStore.insert
+        .mockResolvedValueOnce({ inserted: true })
+        .mockResolvedValueOnce({ inserted: false });
+
+      const first = request(app)
+        .post('/v1/streams/7/pause')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', IDEMPOTENCY_KEY);
+
+      const second = request(app)
+        .post('/v1/streams/7/pause')
+        .set('Authorization', `Bearer ${token}`)
+        .set('Idempotency-Key', IDEMPOTENCY_KEY);
+
+      // Let the in-flight duplicate observe the pending record.
+      mockIdempotencyStore.find.mockResolvedValue({
+        key: IDEMPOTENCY_KEY,
+        wallet: sender.publicKey(),
+        operation: 'pause',
+        requestHash: 'pending-request-hash',
+        status: 'IN_PROGRESS',
+        responseStatus: null,
+        responseBody: null,
+      });
+
+      resolvePause({ txHash: 'pause-tx-hash' });
+
+      const [firstRes, secondRes] = await Promise.all([first, second]);
+
+      expect(mockPauseStream).toHaveBeenCalledTimes(1);
+      expect([firstRes.status, secondRes.status]).toContain(200);
+      expect([firstRes.status, secondRes.status]).toContain(409);
+    });
   });
 });

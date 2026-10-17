@@ -18,6 +18,11 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
   const header = req.headers['x-request-id'];
   const requestId = typeof header === 'string' && isValidRequestId(header) ? header : randomUUID();
 
+  // Expose the correlation ID on the request so downstream consumers (e.g. the
+  // error envelope) can include it in responses. This is the canonical
+  // machine-readable correlation identifier for the request lifecycle.
+  (req as Request & { id?: string }).id = requestId;
+
   res.setHeader('X-Request-ID', requestId);
 
   const startMs = Date.now();

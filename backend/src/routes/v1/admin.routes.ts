@@ -2,6 +2,7 @@ import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { requireAdmin } from '../../middleware/auth.js';
 import { adminRateLimiter } from '../../middleware/admin-rate-limiter.middleware.js';
+import { principalRateLimiter } from '../../middleware/principal-rate-limiter.middleware.js';
 import {
   getIndexerStatus,
   resetIndexer,
@@ -29,6 +30,45 @@ const router = Router();
 // All admin routes require admin JWT
 router.use(requireAdmin);
 router.use(adminRateLimiter);
+
+// Principal-aware budgets for expensive admin operations (issue #72).
+//
+// Admin callers are keyed by their authenticated principal (admin key id /
+// JWT subject) rather than by IP, so a shared NAT or a spoofed
+// `X-Forwarded-For` header cannot be used to multiply an operator's budget.
+// Anonymous callers never reach these routes (requireAdmin answers 401/403
+// first), but the limiter still applies a conservative IP-keyed fallback so a
+// misconfigured deployment cannot bypass the budget entirely.
+//
+// Budgets are intentionally tighter than the global admin limiter because
+// these endpoints mutate indexer state or fan out over the dead-letter table.
+// When Redis is unavailable the limiter degrades to an in-process counter
+// (per instance) instead of failing open; see
+// `principal-rate-limiter.middleware.ts` for the fallback semantics.
+//
+// Exceeding a budget returns HTTP 429 with the standard envelope:
+//   { "error": "Too Many Requests", "code": "RATE_LIMITED",
+//     "retryAfter": <seconds>, "scope": "<route budget>" }
+// and a `Retry-After` header carrying the same number of seconds.
+const adminExpensiveLimiter = principalRateLimiter({
+  scope: 'admin:expensive',
+  // Authenticated admins get a per-principal budget; anonymous fallback is
+  // keyed by IP and is deliberately smaller.
+  authenticated: { windowMs: 60_000, max: 30 },
+  anonymous: { windowMs: 60_000, max: 5 },
+});
+
+const adminReplayLimiter = principalRateLimiter({
+  scope: 'admin:replay',
+  authenticated: { windowMs: 60_000, max: 5 },
+  anonymous: { windowMs: 60_000, max: 1 },
+});
+
+const adminDeadLetterLimiter = principalRateLimiter({
+  scope: 'admin:dead-letter',
+  authenticated: { windowMs: 60_000, max: 20 },
+  anonymous: { windowMs: 60_000, max: 2 },
+});
 
 /**
  * @openapi
@@ -399,6 +439,15 @@ router.get('/indexer/status', async (req: Request, res: Response) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: |
+ *           Per-principal rate limit exceeded. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Internal server error
  *         content:
@@ -406,7 +455,7 @@ router.get('/indexer/status', async (req: Request, res: Response) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/indexer/reset', async (req: Request, res: Response) => {
+router.post('/indexer/reset', adminExpensiveLimiter, async (req: Request, res: Response) => {
   const ledger = Number(req.body?.ledger);
   if (!Number.isInteger(ledger) || ledger < 0) {
     res.status(400).json({ error: 'ledger must be a non-negative integer' });
@@ -478,6 +527,15 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: |
+ *           Per-principal replay budget exhausted. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Internal server error
  *         content:
@@ -485,7 +543,7 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/indexer/replay', async (req: Request, res: Response) => {
+router.post('/indexer/replay', adminReplayLimiter, async (req: Request, res: Response) => {
   const fromLedger = Number(req.query.from_ledger);
   if (!Number.isInteger(fromLedger) || fromLedger < 0) {
     res.status(400).json({ error: 'from_ledger must be a non-negative integer' });
@@ -556,6 +614,11 @@ router.post('/indexer/replay', async (req: Request, res: Response) => {
  *         description: Unauthorized
  *       403:
  *         description: Forbidden - admin access required
+ *       429:
+ *         description: |
+ *           Per-principal dead-letter budget exhausted. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
  */
 router.get('/indexer/dead-letter', listDeadLetterHandler);
 
@@ -572,8 +635,17 @@ router.get('/indexer/dead-letter', listDeadLetterHandler);
  *     responses:
  *       200:
  *         description: Per-record replay outcomes plus an aggregate summary
+ *       429:
+ *         description: |
+ *           Per-principal dead-letter budget exhausted. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
  */
-router.post('/indexer/dead-letter/replay-all', replayAllDeadLetterHandler);
+router.post(
+  '/indexer/dead-letter/replay-all',
+  adminDeadLetterLimiter,
+  replayAllDeadLetterHandler,
+);
 
 /**
  * @openapi
@@ -603,8 +675,17 @@ router.post('/indexer/dead-letter/replay-all', replayAllDeadLetterHandler);
  *         description: Dead-letter event not found
  *       422:
  *         description: Replay ran but failed, or the payload is undecodable
+ *       429:
+ *         description: |
+ *           Per-principal dead-letter budget exhausted. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
  */
-router.post('/indexer/dead-letter/:id/replay', replayDeadLetterHandler);
+router.post(
+  '/indexer/dead-letter/:id/replay',
+  adminDeadLetterLimiter,
+  replayDeadLetterHandler,
+);
 
 /**
  * @openapi
@@ -631,7 +712,16 @@ router.post('/indexer/dead-letter/:id/replay', replayDeadLetterHandler);
  *         description: Forbidden - admin access required
  *       404:
  *         description: Dead-letter event not found
+ *       429:
+ *         description: |
+ *           Per-principal dead-letter budget exhausted. The response carries a
+ *           `Retry-After` header and a JSON envelope
+ *           `{ error, code: "RATE_LIMITED", retryAfter, scope }`.
  */
-router.delete('/indexer/dead-letter/:id', discardDeadLetterHandler);
+router.delete(
+  '/indexer/dead-letter/:id',
+  adminDeadLetterLimiter,
+  discardDeadLetterHandler,
+);
 
 export default router;

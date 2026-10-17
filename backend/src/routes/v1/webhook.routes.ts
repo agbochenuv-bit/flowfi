@@ -3,8 +3,31 @@
  */
 import { Router } from "express";
 import * as webhookController from "../../controllers/webhook.controller.js";
+import { principalRateLimit } from "../../middleware/principalRateLimit.js";
 
 const router = Router();
+
+/**
+ * Principal-aware budget for webhook management.
+ *
+ * Authenticated callers are keyed by their account (Stellar public key) and get
+ * a larger budget; anonymous callers are keyed by client IP. Forwarded headers
+ * (`X-Forwarded-For`, `Forwarded`) are only honoured when the immediate peer is
+ * a trusted proxy, so spoofed headers cannot mint fresh budgets. Counters are
+ * shared across instances via Redis; when Redis is unavailable the limiter
+ * falls back to a conservative in-process budget instead of failing open.
+ *
+ * Exceeding the budget returns HTTP 429 with the standard envelope:
+ * `{ "error": { "code": "RATE_LIMITED", "message": "...", "retryAfter": <seconds> } }`
+ * and a `Retry-After` header.
+ */
+const webhookLimiter = principalRateLimit({
+  name: "webhooks",
+  authenticated: { limit: 120, windowMs: 60_000 },
+  anonymous: { limit: 20, windowMs: 60_000 },
+});
+
+router.use(webhookLimiter);
 
 /**
  * @openapi
@@ -56,6 +79,17 @@ const router = Router();
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Rate limit exceeded for this principal
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds until the budget resets
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Internal server error
  *         content:
@@ -95,6 +129,17 @@ router.post("/", webhookController.createWebhook);
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Rate limit exceeded for this principal
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds until the budget resets
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       500:
  *         description: Internal server error
  *         content:
@@ -126,6 +171,17 @@ router.get("/", webhookController.listWebhooks);
  *         description: Webhook deleted successfully
  *       400:
  *         description: Invalid id or missing userAddress
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Rate limit exceeded for this principal
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds until the budget resets
  *         content:
  *           application/json:
  *             schema:
@@ -182,6 +238,17 @@ router.get("/:id/deliveries", webhookController.listDeliveries);
  *                   additionalProperties: true
  *       400:
  *         description: Missing id or userAddress
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       429:
+ *         description: Rate limit exceeded for this principal
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds until the budget resets
  *         content:
  *           application/json:
  *             schema:

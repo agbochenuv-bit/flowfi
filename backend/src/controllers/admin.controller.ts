@@ -10,6 +10,7 @@ import {
   replayDeadLetterEvent,
 } from '../services/indexerService.js';
 import logger from '../logger.js';
+import { ApiError, sendApiError } from '../errors/index.js';
 
 /** Parse an optional positive-integer query param. */
 function parseOptionalInt(raw: unknown): number | undefined {
@@ -54,7 +55,13 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
     'startDate',
   );
   if (startDate.error) {
-    return res.status(400).json({ error: startDate.error });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', startDate.error, {
+        details: [{ field: 'startDate', message: startDate.error }],
+      }),
+    );
   }
 
   const endDate = parseOptionalDate(
@@ -62,11 +69,28 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
     'endDate',
   );
   if (endDate.error) {
-    return res.status(400).json({ error: endDate.error });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', endDate.error, {
+        details: [{ field: 'endDate', message: endDate.error }],
+      }),
+    );
   }
 
   if (startDate.value && endDate.value && startDate.value > endDate.value) {
-    return res.status(400).json({ error: 'startDate must be before endDate' });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', 'startDate must be before endDate', {
+        details: [
+          {
+            field: 'startDate',
+            message: 'startDate must be before endDate',
+          },
+        ],
+      }),
+    );
   }
 
   try {
@@ -87,7 +111,7 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
     return res.status(200).json(result);
   } catch (err) {
     logger.error('[AdminController] Failed to list dead-letter events:', err);
-    return res.status(500).json({ error: 'Failed to list dead-letter events' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
 };
 
@@ -102,33 +126,45 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
   const rawId = req.params.id;
   const id = Array.isArray(rawId) ? rawId[0] : rawId;
   if (!id) {
-    return res.status(400).json({ error: 'id is required' });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', 'id is required', {
+        details: [{ field: 'id', message: 'id is required' }],
+      }),
+    );
   }
 
   try {
     const result = await replayDeadLetterEvent(id);
 
     if (result.outcome === 'not_found') {
-      return res.status(404).json({ error: 'Dead-letter event not found' });
+      return sendApiError(req, res, new ApiError('NOT_FOUND'));
     }
 
     if (result.outcome === 'undecodable') {
-      return res.status(422).json({
-        error: 'Dead-letter payload could not be decoded',
-        code: 'undecodable_payload',
-        id,
-        errorMessage: result.errorMessage,
-      });
+      return sendApiError(
+        req,
+        res,
+        new ApiError('UNPROCESSABLE_ENTITY', undefined, {
+          details: [{ field: 'id', message: 'payload could not be decoded' }],
+        }),
+      );
     }
 
     if (result.outcome === 'failed') {
-      return res.status(422).json({
-        error: 'Replay failed; the event remains quarantined',
-        code: 'replay_failed',
-        id,
-        attempts: result.attempts,
-        errorMessage: result.errorMessage,
-      });
+      return sendApiError(
+        req,
+        res,
+        new ApiError('UNPROCESSABLE_ENTITY', undefined, {
+          details: [
+            {
+              field: 'id',
+              message: 'replay failed; the event remains quarantined',
+            },
+          ],
+        }),
+      );
     }
 
     return res.status(200).json({
@@ -139,7 +175,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
     });
   } catch (err) {
     logger.error(`[AdminController] Replay of dead-letter ${id} threw:`, err);
-    return res.status(500).json({ error: 'Replay failed' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
 };
 
@@ -148,13 +184,13 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
  *
  * Replays every pending record sequentially, oldest ledger first.
  */
-export const replayAllDeadLetterHandler = async (_req: Request, res: Response) => {
+export const replayAllDeadLetterHandler = async (req: Request, res: Response) => {
   try {
     const summary = await replayAllDeadLetterEvents();
     return res.status(200).json({ ok: true, ...summary });
   } catch (err) {
     logger.error('[AdminController] Dead-letter replay-all threw:', err);
-    return res.status(500).json({ error: 'Replay-all failed' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
 };
 
@@ -168,7 +204,13 @@ export const discardDeadLetterHandler = async (req: Request, res: Response) => {
   const rawId = req.params.id;
   const id = Array.isArray(rawId) ? rawId[0] : rawId;
   if (!id) {
-    return res.status(400).json({ error: 'id is required' });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', 'id is required', {
+        details: [{ field: 'id', message: 'id is required' }],
+      }),
+    );
   }
 
   const discardedBy = (req as AuthenticatedRequest).user?.publicKey ?? 'unknown';
@@ -178,9 +220,9 @@ export const discardDeadLetterHandler = async (req: Request, res: Response) => {
     return res.status(200).json({ ok: true, discarded });
   } catch (err) {
     if (err instanceof DeadLetterNotFoundError) {
-      return res.status(404).json({ error: 'Dead-letter event not found' });
+      return sendApiError(req, res, new ApiError('NOT_FOUND'));
     }
     logger.error(`[AdminController] Discard of dead-letter ${id} threw:`, err);
-    return res.status(500).json({ error: 'Discard failed' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
 };

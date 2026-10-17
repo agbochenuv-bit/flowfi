@@ -369,6 +369,137 @@ describe('Stream Creation Rate Limiter Middleware', () => {
     });
   });
 
+  describe('Principal-Aware Budgets', () => {
+    it('should key authenticated callers by wallet, not by IP', async () => {
+      const limiter = createStreamRateLimiter({ windowMs: 10000, max: 1 });
+
+      app.post(
+        '/streams',
+        mockAuthMiddleware('GPRINCIPAL1'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+
+      // Same IP, different wallets must not share a budget
+      const res1 = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '203.0.113.10');
+      expect(res1.status).toBe(201);
+
+      const res2 = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '203.0.113.10');
+      expect(res2.status).toBe(429);
+    });
+
+    it('should give each authenticated principal an independent budget', async () => {
+      const limiter = createStreamRateLimiter({ windowMs: 10000, max: 1 });
+
+      app.post(
+        '/streams-a',
+        mockAuthMiddleware('GPRINCIPAL_A'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+      app.post(
+        '/streams-b',
+        mockAuthMiddleware('GPRINCIPAL_B'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+
+      const a1 = await request(app).post('/streams-a').set('Content-Type', 'application/json');
+      expect(a1.status).toBe(201);
+      const a2 = await request(app).post('/streams-a').set('Content-Type', 'application/json');
+      expect(a2.status).toBe(429);
+
+      // Principal B is unaffected by principal A's exhaustion
+      const b1 = await request(app).post('/streams-b').set('Content-Type', 'application/json');
+      expect(b1.status).toBe(201);
+    });
+
+    it('should not let spoofed forwarding headers reset an authenticated budget', async () => {
+      const limiter = createStreamRateLimiter({ windowMs: 10000, max: 1 });
+
+      app.post(
+        '/streams',
+        mockAuthMiddleware('GSPOOFGUARD'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+
+      const first = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '198.51.100.1');
+      expect(first.status).toBe(201);
+
+      // Rotating the forwarding header must not grant a fresh budget
+      const second = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '198.51.100.2');
+      expect(second.status).toBe(429);
+
+      const third = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json')
+        .set('X-Forwarded-For', '198.51.100.3');
+      expect(third.status).toBe(429);
+    });
+
+    it('should enforce the boundary exactly at the configured budget', async () => {
+      const limiter = createStreamRateLimiter({ windowMs: 10000, max: 3 });
+
+      app.post(
+        '/streams',
+        mockAuthMiddleware('GBOUNDARY'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+
+      for (let i = 0; i < 3; i++) {
+        const res = await request(app)
+          .post('/streams')
+          .set('Content-Type', 'application/json');
+        expect(res.status).toBe(201);
+        expect(res.headers['ratelimit-remaining']).toBe(String(2 - i));
+      }
+
+      const over = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json');
+      expect(over.status).toBe(429);
+      expect(over.headers['ratelimit-remaining']).toBe('0');
+    });
+  });
+
+  describe('429 Envelope for Expensive Operations', () => {
+    it('should return a documented 429 envelope with retry guidance', async () => {
+      const limiter = createStreamRateLimiter({ windowMs: 10000, max: 1 });
+
+      app.post(
+        '/streams',
+        mockAuthMiddleware('GENVELOPE'),
+        limiter,
+        (req: Request, res: Response) => res.status(201).json({ success: true })
+      );
+
+      await request(app).post('/streams').set('Content-Type', 'application/json');
+      const res = await request(app)
+        .post('/streams')
+        .set('Content-Type', 'application/json');
+
+      expect(res.status).toBe(429);
+      expect(res.body).toHaveProperty('error');
+      expect(res.body).toHaveProperty('message');
+      expect(res.headers).toHaveProperty('ratelimit-limit');
+      expect(res.headers).toHaveProperty('ratelimit-reset');
+    });
+  });
+
   describe('Time Window Reset', () => {
     it('should reset rate limit after time window expires', async () => {
       const windowMs = 100; // Very short window for testing

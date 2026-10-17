@@ -1,6 +1,17 @@
 /**
  * Transaction Export Service for Tax & Accounting (Issue #1191)
  * Generates CSV/JSON exports for bookkeeping and tax filings
+ *
+ * Rate limiting (Issue #72):
+ * - Exports are expensive operations and are gated by the principal-aware
+ *   limiter at the route layer (see routes/export.routes.ts). Budgets are
+ *   keyed by authenticated principal when available, otherwise by trusted
+ *   client IP (forwarding headers are only honored behind a trusted proxy).
+ * - When the limiter rejects a request it responds with the shared 429
+ *   envelope before this service is invoked, so no partial export is written.
+ * - If Redis is unavailable the limiter falls back to a conservative
+ *   in-process budget; multi-instance counters are not shared in that mode.
+ * - The export output format is unchanged by rate limiting.
  */
 import type { Response } from "express";
 import { prisma } from "../lib/prisma.js";
