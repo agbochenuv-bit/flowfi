@@ -107,28 +107,40 @@ model StreamEvent {
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
+// Lifecycle (Issue #59): endpoints are soft-deleted via deletedAt so delivery
+// history and replay audit records survive deletion. Disabling is recorded with
+// disabledAt/disabledReason and is distinct from deletion.
 model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id             String    @id @default(uuid())
+  userAddress    String    // Stellar public key of the owner
+  targetUrl      String    // Destination webhook URL (must be HTTPS)
+  secretKey      String    // Secret used for HMAC-SHA256 signature
+  eventTypes     String[]  // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
+  isActive       Boolean   @default(true)
+  disabledAt     DateTime? // When the endpoint was disabled (null when enabled)
+  disabledReason String?   // Operator/user supplied reason for disabling
+  deletedAt      DateTime? // Soft-delete marker; non-null endpoints are treated as gone
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
 
   deliveries  WebhookDelivery[]
+  replays     WebhookDeliveryReplay[]
 
   @@index([userAddress])
   @@index([isActive])
+  @@index([deletedAt])
+  @@index([userAddress, deletedAt])
 }
 
 // WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
+// status (Issue #59) lets scoped replay select only FAILED deliveries, so
+// successful deliveries are never resent.
 model WebhookDelivery {
   id             String   @id @default(uuid())
   subscriptionId String
   eventType      String
   payload        String   // JSON
+  status         String   @default("PENDING") // "PENDING" | "SUCCESS" | "FAILED"
   responseStatus Int?
   attempts       Int      @default(0)
   deliveredAt    DateTime?
@@ -139,6 +151,33 @@ model WebhookDelivery {
 
   @@index([subscriptionId])
   @@index([createdAt])
+  @@index([subscriptionId, createdAt])
+  @@index([status])
+  @@index([subscriptionId, status, createdAt])
+}
+
+// WebhookDeliveryReplay model - Audit record for scoped replay requests (Issue #59)
+// One row per replay request; deliveryIds is the bounded set of failed
+// deliveries that were re-enqueued. outcome is "SUCCEEDED", "PARTIAL", or
+// "FAILED" and is updated as the replay progresses.
+model WebhookDeliveryReplay {
+  id             String   @id @default(uuid())
+  replayId       String   @unique // Client/operator supplied idempotency key for the replay
+  subscriptionId String
+  deliveryIds    String[] // Bounded set of delivery ids selected for replay
+  requestedBy    String   // Stellar public key of the requester (ownership checked)
+  requestedAt    DateTime @default(now())
+  outcome        String   @default("PENDING") // "PENDING" | "SUCCEEDED" | "PARTIAL" | "FAILED"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+  @@index([subscriptionId, requestedAt])
+  @@index([requestedBy])
+  @@index([outcome])
+  @@index([requestedAt])
 }
 
 // AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)

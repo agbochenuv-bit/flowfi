@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryCache, cache } from '../src/lib/redis.js';
+import {
+  ANALYTICS_CACHE_TTL_SECONDS,
+  analyticsCacheKey,
+  invalidateAnalyticsCache,
+} from '../src/lib/analytics-cache.js';
 
 describe('MemoryCache', () => {
   afterEach(() => {
@@ -73,6 +78,95 @@ describe('MemoryCache', () => {
       createdAt: new Date(3000).toISOString(),
       expiresAt: new Date(13000).toISOString(),
     });
+  });
+});
+
+describe('analytics cache layer', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.MEMORY_CACHE_MAX_ITEMS;
+  });
+
+  it('builds distinct cache keys per network and per filter set', () => {
+    const base = { network: 'testnet', from: 100, to: 200, filters: { asset: 'XLM' } };
+    const otherNetwork = { ...base, network: 'mainnet' };
+    const otherFilters = { ...base, filters: { asset: 'USDC' } };
+    const otherRange = { ...base, to: 300 };
+
+    const keys = new Set([
+      analyticsCacheKey(base),
+      analyticsCacheKey(otherNetwork),
+      analyticsCacheKey(otherFilters),
+      analyticsCacheKey(otherRange),
+    ]);
+
+    expect(keys.size).toBe(4);
+    // Key construction is deterministic for identical inputs.
+    expect(analyticsCacheKey({ ...base })).toBe(analyticsCacheKey(base));
+  });
+
+  it('does not serve one network\'s cached aggregate to another network', () => {
+    const store = new MemoryCache({ maxItems: 10 });
+    const testnetKey = analyticsCacheKey({ network: 'testnet', from: 0, to: 10, filters: {} });
+    const mainnetKey = analyticsCacheKey({ network: 'mainnet', from: 0, to: 10, filters: {} });
+
+    store.set(testnetKey, { total: 1 }, 60);
+
+    expect(store.get(testnetKey)).toEqual({ total: 1 });
+    expect(store.get(mainnetKey)).toBeNull();
+  });
+
+  it('expires cached aggregates after the documented staleness window', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+
+    const store = new MemoryCache({ maxItems: 10 });
+    const key = analyticsCacheKey({ network: 'testnet', from: 0, to: 10, filters: {} });
+
+    store.set(key, { total: 5 }, ANALYTICS_CACHE_TTL_SECONDS);
+    expect(store.get(key)).toEqual({ total: 5 });
+
+    // Just before the window closes the value is still served.
+    vi.advanceTimersByTime(ANALYTICS_CACHE_TTL_SECONDS * 1000 - 1);
+    expect(store.get(key)).toEqual({ total: 5 });
+
+    // At/after the window the entry is stale and must not be served.
+    vi.advanceTimersByTime(1);
+    expect(store.get(key)).toBeNull();
+  });
+
+  it('invalidation clears only entries for the targeted network', () => {
+    const store = new MemoryCache({ maxItems: 10 });
+    const testnetKey = analyticsCacheKey({ network: 'testnet', from: 0, to: 10, filters: {} });
+    const testnetOther = analyticsCacheKey({ network: 'testnet', from: 10, to: 20, filters: {} });
+    const mainnetKey = analyticsCacheKey({ network: 'mainnet', from: 0, to: 10, filters: {} });
+
+    store.set(testnetKey, { total: 1 }, 60);
+    store.set(testnetOther, { total: 2 }, 60);
+    store.set(mainnetKey, { total: 3 }, 60);
+
+    invalidateAnalyticsCache(store, 'testnet');
+
+    expect(store.get(testnetKey)).toBeNull();
+    expect(store.get(testnetOther)).toBeNull();
+    expect(store.get(mainnetKey)).toEqual({ total: 3 });
+  });
+
+  it('stays bounded under sustained key churn across networks and ranges', () => {
+    const store = new MemoryCache({ maxItems: 50 });
+
+    for (let i = 0; i < 500; i += 1) {
+      const key = analyticsCacheKey({
+        network: i % 2 === 0 ? 'testnet' : 'mainnet',
+        from: i,
+        to: i + 10,
+        filters: { asset: `asset-${i}` },
+      });
+      store.set(key, { total: i }, 60);
+      expect(store.getStats().itemCount).toBeLessThanOrEqual(50);
+    }
+
+    expect(store.getStats().itemCount).toBeLessThanOrEqual(50);
   });
 });
 
