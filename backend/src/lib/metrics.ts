@@ -63,6 +63,56 @@ export const indexerEventsProcessedTotal = new Counter({
 });
 
 /**
+ * Distribution of the number of events carried by each persistence batch.
+ * Bounded by the worker's configured batch size, so cardinality stays low.
+ * A sustained value at the top bucket means the batch cap is the throughput
+ * limiter; a value of 1 means batching is effectively disabled.
+ */
+export const indexerEventBatchSize = new Histogram({
+  name: 'flowfi_indexer_event_batch_size',
+  help: 'Number of events persisted per indexer batch',
+  buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500],
+  registers: [registry],
+});
+
+/**
+ * Wall-clock duration of a single batched persistence transaction, including
+ * any retries. Compare against `flowfi_db_query_duration_seconds` to see how
+ * much of the batch cost is transaction overhead versus statement time.
+ */
+export const indexerEventBatchDuration = new Histogram({
+  name: 'flowfi_indexer_event_batch_duration_seconds',
+  help: 'Duration of a batched indexer event persistence transaction',
+  labelNames: ['outcome'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/**
+ * Batched persistence attempts by outcome. `retry` counts attempts that failed
+ * transiently and were re-issued; `duplicate` counts events skipped because an
+ * idempotent write found them already present. The invariant to alert on is
+ * `retry` growing without `success` growing alongside it.
+ */
+export const indexerEventBatchAttemptsTotal = new Counter({
+  name: 'flowfi_indexer_event_batch_attempts_total',
+  help: 'Batched indexer event persistence attempts by outcome',
+  labelNames: ['outcome'] as const,
+  registers: [registry],
+});
+
+/**
+ * Events skipped by the idempotency guard because they were already persisted.
+ * Non-zero is normal after a crash/restart replay; a sustained rate indicates
+ * the cursor is not advancing as far as the events it has written.
+ */
+export const indexerEventBatchDuplicatesTotal = new Counter({
+  name: 'flowfi_indexer_event_batch_duplicates_total',
+  help: 'Indexer events skipped as already persisted (idempotent replay)',
+  registers: [registry],
+});
+
+/**
  * Ledger reorg / fork recoveries. Incremented once per recovery so a sustained
  * non-zero rate (or a single spike) can page an operator: on Stellar a reorg
  * means either an RPC node served us a stale fork or the indexer is desynced,
@@ -311,6 +361,30 @@ export function setSseConnectionCounts(countsByTopic: Map<string, number>, total
 export function recordRpcRequest(method: string, seconds: number, outcome: string): void {
   rpcRequestDuration.observe({ method }, seconds);
   rpcRequestsTotal.inc({ method, outcome });
+}
+
+/**
+ * Record one batched persistence attempt. `outcome` is success | retry | error.
+ * `eventCount` is the number of events the batch carried (0 for an attempt that
+ * failed before any event was read) and `seconds` its wall-clock duration.
+ */
+export function recordIndexerEventBatch(
+  eventCount: number,
+  seconds: number,
+  outcome: string,
+): void {
+  indexerEventBatchAttemptsTotal.inc({ outcome });
+  indexerEventBatchDuration.observe({ outcome }, seconds);
+  if (eventCount > 0) {
+    indexerEventBatchSize.observe(eventCount);
+  }
+}
+
+/** Record events skipped by the idempotency guard during a batch write. */
+export function recordIndexerEventBatchDuplicates(count: number): void {
+  if (count > 0) {
+    indexerEventBatchDuplicatesTotal.inc(count);
+  }
 }
 
 export function getMetricsRegistry(): Registry {

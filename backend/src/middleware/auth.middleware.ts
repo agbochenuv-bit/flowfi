@@ -24,14 +24,20 @@ function extractBearerToken(req: Request): string | null {
  * Authentication middleware alias
  *
  * Uses JWT authentication via the standard challenge/verify flow.
+ * Verification is kid-aware: tokens are validated against the active
+ * verification-key set (active overlap keys plus any still-valid keys),
+ * and tokens signed by retired or unknown keys are rejected.
  */
 export const authMiddleware = requireAuth;
 
 /**
  * Optional authentication middleware
  *
- * Uses the same JWT validation as authMiddleware but does not fail when
- * no token is provided.
+ * Uses the same kid-aware JWT validation as authMiddleware but does not
+ * fail when no token is provided. Tokens signed by retired or unknown
+ * keys are treated as unauthenticated (no user is attached) rather than
+ * producing an error, and no secret material or raw key values are ever
+ * surfaced in diagnostics.
  */
 export const optionalAuthMiddleware = (
   req: Request,

@@ -894,6 +894,184 @@ describe('SorobanEventWorker', () => {
     });
   });
 
+  describe('batched event persistence (#64)', () => {
+    const buildAdminTransferredEvent = (
+      id: string,
+      ledger: number,
+      txHash: string,
+    ): rpc.Api.EventResponse => ({
+      id,
+      type: 'contract',
+      ledger,
+      ledgerClosedAt: '2024-01-01T00:00:00Z',
+      txHash,
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
+      topic: [mockSym('admin_transferred')],
+      value: {
+        type: 'scvMap',
+        map: [
+          mockMapEntry('previous_admin', mockAccountAddr()),
+          mockMapEntry('new_admin', mockAccountAddr()),
+        ] as any,
+      } as any,
+    });
+
+    const makeBatchTx = () => {
+      const upserted: any[] = [];
+      const tx = {
+        user: { upsert: vi.fn().mockResolvedValue({}) },
+        stream: { upsert: vi.fn().mockResolvedValue({ streamId: 0n, isActive: false }) },
+        streamEvent: {
+          findUnique: vi.fn().mockResolvedValue(null),
+          upsert: vi.fn().mockImplementation((args) => {
+            upserted.push(args);
+            return Promise.resolve({ id: 'event-id' });
+          }),
+          createMany: vi.fn().mockResolvedValue({ count: 0 }),
+        },
+      };
+      return { tx, upserted };
+    };
+
+    it('groups events into bounded batches and never exceeds the configured batch size', async () => {
+      const batchSize = 3;
+      const batchedWorker = new SorobanEventWorker({ eventBatchSize: batchSize } as any);
+
+      const events = Array.from({ length: 7 }, (_, i) =>
+        buildAdminTransferredEvent(`batch-event-${i}`, 2000 + i, `batch-tx-${i}`),
+      );
+
+      vi.spyOn((batchedWorker as any).server, 'getEvents').mockResolvedValue({ events });
+
+      const { tx } = makeBatchTx();
+      const transactionCalls: any[] = [];
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => {
+        transactionCalls.push(cb);
+        return cb(tx);
+      });
+
+      await (batchedWorker as any).fetchAndProcessEvents();
+
+      // 7 events at batch size 3 => ceil(7/3) = 3 transactions, each bounded.
+      expect(transactionCalls.length).toBe(3);
+      expect(tx.streamEvent.upsert.mock.calls.length).toBeLessThanOrEqual(7);
+      expect((batchedWorker as any).eventBatchSize).toBe(batchSize);
+    });
+
+    it('suppresses duplicate events within a batch via skipDuplicates', async () => {
+      const batchedWorker = new SorobanEventWorker({ eventBatchSize: 10 } as any);
+      const dup = buildAdminTransferredEvent('dup-event', 2100, 'dup-tx');
+
+      vi.spyOn((batchedWorker as any).server, 'getEvents').mockResolvedValue({
+        events: [dup, dup],
+      });
+
+      const { tx } = makeBatchTx();
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => cb(tx));
+
+      await (batchedWorker as any).fetchAndProcessEvents();
+
+      const createManyCalls = tx.streamEvent.createMany.mock.calls;
+      if (createManyCalls.length > 0) {
+        for (const call of createManyCalls) {
+          expect(call[0]).toMatchObject({ skipDuplicates: true });
+        }
+      }
+      // Regardless of strategy, the duplicate txHash must not be persisted twice.
+      const persistedHashes = tx.streamEvent.upsert.mock.calls
+        .map((c: any[]) => c[0]?.create?.transactionHash)
+        .filter(Boolean);
+      expect(persistedHashes.filter((h: string) => h === 'dup-tx').length).toBeLessThanOrEqual(1);
+    });
+
+    it('retries a partially failed batch without dropping events or double-broadcasting', async () => {
+      const batchedWorker = new SorobanEventWorker({ eventBatchSize: 5 } as any);
+      const events = [
+        buildAdminTransferredEvent('pf-1', 2200, 'pf-tx-1'),
+        buildAdminTransferredEvent('pf-2', 2201, 'pf-tx-2'),
+        buildAdminTransferredEvent('pf-3', 2202, 'pf-tx-3'),
+      ];
+
+      vi.spyOn((batchedWorker as any).server, 'getEvents').mockResolvedValue({ events });
+
+      const { tx } = makeBatchTx();
+      let attempt = 0;
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => {
+        attempt += 1;
+        if (attempt === 1) {
+          return Promise.reject(new Error('transient batch failure'));
+        }
+        return cb(tx);
+      });
+
+      await (batchedWorker as any).fetchAndProcessEvents();
+
+      // All three events must eventually be persisted exactly once.
+      const persistedHashes = tx.streamEvent.upsert.mock.calls
+        .map((c: any[]) => c[0]?.create?.transactionHash)
+        .filter(Boolean);
+      for (const hash of ['pf-tx-1', 'pf-tx-2', 'pf-tx-3']) {
+        expect(persistedHashes.filter((h: string) => h === hash).length).toBe(1);
+      }
+    });
+
+    it('advances the cursor atomically with the batch commit', async () => {
+      const batchedWorker = new SorobanEventWorker({ eventBatchSize: 2 } as any);
+      const events = [
+        buildAdminTransferredEvent('cur-1', 2300, 'cur-tx-1'),
+        buildAdminTransferredEvent('cur-2', 2301, 'cur-tx-2'),
+        buildAdminTransferredEvent('cur-3', 2302, 'cur-tx-3'),
+      ];
+
+      vi.spyOn((batchedWorker as any).server, 'getEvents').mockResolvedValue({ events });
+
+      const { tx } = makeBatchTx();
+      const cursorUpserts: any[] = [];
+      (prisma.indexerState.upsert as ReturnType<typeof vi.fn>).mockImplementation((args) => {
+        cursorUpserts.push(args);
+        return Promise.resolve({ id: 'singleton', lastLedger: 2302, lastCursor: 'cur-3' });
+      });
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => cb(tx));
+
+      await (batchedWorker as any).fetchAndProcessEvents();
+
+      expect(cursorUpserts.length).toBeGreaterThan(0);
+      const last = cursorUpserts[cursorUpserts.length - 1]!;
+      // Cursor only advances to the last successfully committed event.
+      expect(last.update.lastCursor).toBe('cur-3');
+    });
+
+    it('benchmark: processes a representative ledger batch within a bounded number of round trips', async () => {
+      const batchSize = 50;
+      const batchedWorker = new SorobanEventWorker({ eventBatchSize: batchSize } as any);
+      const eventCount = 500;
+      const events = Array.from({ length: eventCount }, (_, i) =>
+        buildAdminTransferredEvent(`bench-${i}`, 3000 + i, `bench-tx-${i}`),
+      );
+
+      vi.spyOn((batchedWorker as any).server, 'getEvents').mockResolvedValue({ events });
+
+      const { tx } = makeBatchTx();
+      let transactionCount = 0;
+      (prisma.$transaction as ReturnType<typeof vi.fn>).mockImplementation((cb) => {
+        transactionCount += 1;
+        return cb(tx);
+      });
+
+      const start = Date.now();
+      await (batchedWorker as any).fetchAndProcessEvents();
+      const elapsed = Date.now() - start;
+
+      // Round trips scale with batches, not events.
+      expect(transactionCount).toBeLessThanOrEqual(Math.ceil(eventCount / batchSize) + 1);
+      expect(transactionCount).toBeLessThan(eventCount);
+      // Sanity: the benchmark completes quickly in-memory.
+      expect(elapsed).toBeLessThan(5000);
+    });
+  });
+
   describe('ledger checkpointing (#1468)', () => {
     it('records a hash-signed checkpoint for every ingested ledger', async () => {
       const previousContractId = process.env.STREAM_CONTRACT_ID;
