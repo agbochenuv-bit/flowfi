@@ -3,6 +3,7 @@ import type { BackendStream } from "./api-types";
 import { getStreamsEndpointCandidates, toTokenAmount } from "./api/_shared";
 import { TOKEN_ADDRESSES } from "./soroban";
 import { logger } from "./logger";
+import { authenticatedFetch } from "./auth";
 
 export interface ActivityItem {
   id: string;
@@ -92,28 +93,45 @@ function mapStreamStatus(s: BackendStream): Stream["status"] {
 async function fetchStreams(
   publicKey: string,
   role: "sender" | "recipient",
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  authToken?: string | null,
 ): Promise<BackendStream[]> {
   const endpoints = getStreamsEndpointCandidates();
-  const params = new URLSearchParams({ [role]: publicKey });
   let lastError: Error | null = null;
 
   for (const endpoint of endpoints) {
     try {
-      const response = await fetch(`${endpoint}?${params.toString()}`, { signal });
-      if (response.ok) {
+      const allStreams: BackendStream[] = [];
+      let cursor: string | null = null;
+      while (true) {
+        const params = new URLSearchParams({
+          [role]: publicKey,
+          limit: "100",
+          sort: "startTime",
+          order: "desc",
+        });
+        if (cursor) params.set("cursor", cursor);
+        const response = await authenticatedFetch(
+          `${endpoint}?${params.toString()}`,
+          { signal },
+          authToken,
+        );
+        if (response.status === 404) {
+          lastError = new Error(`Endpoint not found: ${endpoint}`);
+          break;
+        }
+        if (!response.ok) {
+          throw new Error(`Failed to fetch streams (${response.status}) from ${endpoint}`);
+        }
+
         const payload = (await response.json()) as
           | BackendStream[]
-          | { data?: BackendStream[] };
-        return Array.isArray(payload) ? payload : payload.data ?? [];
+          | { data?: BackendStream[]; hasMore?: boolean; nextCursor?: string | null };
+        if (Array.isArray(payload)) return payload;
+        allStreams.push(...(payload.data ?? []));
+        if (!payload.hasMore || !payload.nextCursor) return allStreams;
+        cursor = payload.nextCursor;
       }
-
-      if (response.status === 404) {
-        lastError = new Error(`Endpoint not found: ${endpoint}`);
-        continue;
-      }
-
-      lastError = new Error(`Failed to fetch streams (${response.status}) from ${endpoint}`);
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") {
         throw err;
@@ -151,11 +169,15 @@ export function mapBackendStreamToFrontend(s: BackendStream, counterparty: strin
 /**
  * Fetches dashboard data for a given public key by querying both outgoing and incoming streams.
  */
-export async function fetchDashboardData(publicKey: string, signal?: AbortSignal): Promise<DashboardSnapshot> {
+export async function fetchDashboardData(
+  publicKey: string,
+  signal?: AbortSignal,
+  authToken?: string | null,
+): Promise<DashboardSnapshot> {
   try {
     const [outgoing, incoming] = await Promise.all([
-      fetchStreams(publicKey, "sender", signal),
-      fetchStreams(publicKey, "recipient", signal),
+      fetchStreams(publicKey, "sender", signal, authToken),
+      fetchStreams(publicKey, "recipient", signal, authToken),
     ]);
 
     const outgoingStreams = outgoing.map((stream) =>
@@ -336,10 +358,10 @@ export function dashboardQueryKey(publicKey: string) {
   return ["dashboard", publicKey] as const;
 }
 
-export function useDashboard(publicKey: string) {
+export function useDashboard(publicKey: string, authToken?: string | null) {
   return useQuery({
     queryKey: dashboardQueryKey(publicKey),
-    queryFn: ({ signal }) => fetchDashboardData(publicKey, signal),
+    queryFn: ({ signal }) => fetchDashboardData(publicKey, signal, authToken),
     enabled: Boolean(publicKey),
   });
 }

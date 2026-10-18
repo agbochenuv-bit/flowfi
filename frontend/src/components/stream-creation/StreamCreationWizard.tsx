@@ -17,13 +17,17 @@ import {
   type StreamFormData,
 } from "@/hooks/useStreamForm";
 import { validateAmount } from "@/lib/stream-validation";
+import type { TransactionStageCallback } from "@/lib/soroban";
 
 // Re-export StreamFormData so existing imports keep working
 export type { StreamFormData };
 
 interface StreamCreationWizardProps {
   onClose: () => void;
-  onSubmit: (data: StreamFormData) => Promise<{ txHash: string }>;
+  onSubmit: (data: StreamFormData, onStage?: TransactionStageCallback) => Promise<{ txHash: string }>;
+  onStage?: TransactionStageCallback;
+  onIndexed?: (streamId: string) => void;
+  onIndexingTimeout?: () => void;
   walletPublicKey?: string;
 }
 
@@ -32,6 +36,9 @@ const STEPS = ["Template", "Recipient", "Token", "Amount", "Schedule"];
 export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
   onClose,
   onSubmit,
+  onStage,
+  onIndexed,
+  onIndexingTimeout,
   walletPublicKey,
 }) => {
   const [currentStep, setCurrentStep] = useState(1);
@@ -152,6 +159,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
           // Found!
           const newStream = streams[0]; // Simplification
           transactionSuccessToast("Stream indexed and confirmed!");
+          onIndexed?.(String(newStream.streamId));
           router.push(`/streams/${newStream.streamId}`); // Updated path to match new structure
           return;
         }
@@ -163,6 +171,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
 
     // Timeout
     setTimeoutError(true);
+    onIndexingTimeout?.();
   };
 
   const handleSubmit = async () => {
@@ -179,7 +188,9 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
       setIsSubmitting(true);
       try {
         // Step 1: Submit transaction
-        const result = await onSubmit(formData);
+        const result = onStage
+          ? await onSubmit(formData, onStage)
+          : await onSubmit(formData);
         setTxHash(result.txHash);
         
         // Step 2: Start Polling for Indexer

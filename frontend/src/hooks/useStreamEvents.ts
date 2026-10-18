@@ -32,6 +32,7 @@ export function useStreamEvents(
 ): UseStreamEventsReturn {
   const {
     streamIds: rawStreamIds = [],
+    userPublicKeys = [],
     subscribeToAll = false,
     autoReconnect = true,
     maxRetryDelay = 30000,
@@ -51,8 +52,9 @@ export function useStreamEvents(
 
   const subscriptionKey = useMemo(() => {
     const streams = [...rawStreamIds].sort().join(',');
-    return `${subscribeToAll ? 'all' : streams}|${jwtToken || ''}`;
-  }, [rawStreamIds, subscribeToAll, jwtToken]);
+    const users = [...userPublicKeys].sort().join(',');
+    return `${subscribeToAll ? 'all' : streams}|${users}|${jwtToken || ''}`;
+  }, [rawStreamIds, userPublicKeys, subscribeToAll, jwtToken]);
 
   const buildUrl = useCallback(() => {
     const params = new URLSearchParams();
@@ -62,6 +64,7 @@ export function useStreamEvents(
     } else {
       rawStreamIds.forEach(id => params.append('streams', id));
     }
+    userPublicKeys.forEach(key => params.append('users', key));
 
     if (jwtToken) {
       params.append('token', jwtToken);
@@ -167,6 +170,9 @@ export function useStreamEvents(
   }, [connect]);
 
   useEffect(() => {
+    setEvents([]);
+    setConnected(false);
+    setError(null);
     connect();
 
     return () => {

@@ -71,6 +71,7 @@ function mapBackendStream(stream: BackendStream): IncomingStreamRecord {
 export async function fetchIncomingStreams(
   recipientPublicKey: string,
   timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
 ): Promise<IncomingStreamRecord[]> {
   const endpoints = getStreamsEndpointCandidates();
   const params = new URLSearchParams({
@@ -82,7 +83,11 @@ export async function fetchIncomingStreams(
   let lastError: Error | null = null;
 
   for (const endpoint of endpoints) {
-    const response = await fetchWithTimeout(`${endpoint}?${params.toString()}`, {}, timeoutMs);
+    const response = await fetchWithTimeout(
+      `${endpoint}?${params.toString()}`,
+      { headers: authToken ? { Authorization: `Bearer ${authToken}` } : {} },
+      timeoutMs,
+    );
 
     if (response.ok) {
       const payload = (await response.json()) as BackendStream[] | StreamListResponse;

@@ -11,6 +11,10 @@ vi.mock("@/lib/transaction-feedback", () => ({
   transactionSuccessToast: vi.fn(),
 }));
 
+vi.mock("@/context/wallet-context", () => ({
+  useWallet: () => ({ authToken: null }),
+}));
+
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import TransactionTracker, { renderChanges, checkConfirmation } from "./TransactionTracker";

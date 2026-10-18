@@ -88,6 +88,11 @@ describe('GET /v1/events', () => {
     expect(res.status).toBe(401);
   });
 
+  it('rejects invalid JWT query tokens for SSE subscriptions', async () => {
+    const res = await request(app).get('/v1/events/subscribe?token=expired-or-invalid');
+    expect(res.status).toBe(401);
+  });
+
   it('rejects requests missing the `address` query parameter', async () => {
     const res = await request(app)
       .get('/v1/events')
@@ -133,7 +138,7 @@ describe('GET /v1/events', () => {
       skip: number;
     };
     expect(callArgs.where.stream.OR).toEqual([{ sender: ADDR }, { recipient: ADDR }]);
-    expect(callArgs.orderBy).toEqual({ timestamp: 'desc' });
+    expect(callArgs.orderBy).toEqual([{ timestamp: 'desc' }, { id: 'desc' }]);
     expect(callArgs.take).toBe(2);
     expect(callArgs.skip).toBe(0);
   });

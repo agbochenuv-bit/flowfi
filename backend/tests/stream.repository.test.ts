@@ -61,7 +61,7 @@ describe('Stream Repository', () => {
       await findStreams(baseParams);
 
       expect(prisma.stream.findMany).toHaveBeenCalledWith(expect.objectContaining({
-        orderBy: { startTime: 'desc' },
+        orderBy: [{ startTime: 'desc' }, { streamId: 'desc' }],
         take: 10,
         skip: 0,
       }));
@@ -169,6 +169,25 @@ describe('Stream Repository', () => {
       expect(result.hasMore).toBe(false);
       expect(result.total).toBe(5);
       expect(result.streams).toHaveLength(5);
+    });
+
+    it('should use a stream cursor and return the last visible stream as nextCursor', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue([
+        { streamId: 2n },
+        { streamId: 3n },
+      ]);
+      (prisma.stream.count as any).mockResolvedValue(3);
+
+      const result = await findStreams({ limit: 1, offset: 0, cursor: '1' });
+
+      expect(prisma.stream.findMany).toHaveBeenCalledWith(expect.objectContaining({
+        cursor: { streamId: 1n },
+        skip: 1,
+        take: 2,
+      }));
+      expect(result.streams).toEqual([{ streamId: 2n }]);
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBe('2');
     });
   });
 });

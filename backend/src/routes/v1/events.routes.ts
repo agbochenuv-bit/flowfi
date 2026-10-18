@@ -2,7 +2,7 @@ import { Router } from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { subscribe } from '../../controllers/sse.controller.js';
 import { sseService } from '../../services/sse.service.js';
-import { requireAdmin, requireAuth } from '../../middleware/auth.js';
+import { requireAdmin, requireAuth, verifyJwt } from '../../middleware/auth.js';
 import type { AuthenticatedRequest } from '../../types/auth.types.js';
 import logger from '../../logger.js';
 import {
@@ -13,6 +13,22 @@ import {
 } from '../../repositories/streamEvent.repository.js';
 
 const router = Router();
+
+function requireSseAuth(req: Request, res: Response, next: NextFunction): void {
+  if (req.headers.authorization) {
+    requireAuth(req, res, next);
+    return;
+  }
+
+  const token = typeof req.query.token === 'string' ? req.query.token : '';
+  const payload = token ? verifyJwt(token) : null;
+  if (!payload) {
+    res.status(401).json({ error: 'Unauthorized', message: 'Missing or invalid token' });
+    return;
+  }
+  (req as AuthenticatedRequest).user = { publicKey: payload.publicKey };
+  next();
+}
 
 /**
  * @openapi
@@ -110,6 +126,8 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
     }
 
     const limit = resolveEventsPageSize(req.query.limit);
+    const cursor = typeof req.query.cursor === 'string' ? req.query.cursor : undefined;
+    const order = req.query.order === 'asc' ? 'asc' : 'desc';
     const offset = resolveEventsOffset({
       rawOffset: req.query.offset,
       rawPage: req.query.page,
@@ -122,6 +140,8 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
       types,
       limit,
       offset,
+      ...(cursor ? { cursor } : {}),
+      order,
       includeStream,
     });
 
@@ -131,6 +151,7 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
       limit: result.limit,
       offset: result.offset,
       hasMore: result.hasMore,
+      nextCursor: result.nextCursor,
     });
   } catch (err) {
     logger.error('GET /v1/events failed:', err);
@@ -214,7 +235,7 @@ router.get('/', requireAuth, async (req: Request, res: Response, next: NextFunct
  *       401:
  *         description: Unauthorized - missing or invalid authentication token
  */
-router.get('/subscribe', requireAuth, subscribe);
+router.get('/subscribe', requireSseAuth, subscribe);
 
 /**
  * @openapi

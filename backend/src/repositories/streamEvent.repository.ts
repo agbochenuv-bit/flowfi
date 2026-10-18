@@ -106,6 +106,10 @@ export interface ListEventsForWalletParams {
   limit: number;
   /** Row offset (already resolved by the caller, e.g. via resolveEventsOffset). */
   offset: number;
+  /** Last event ID from the previous cursor page. */
+  cursor?: string;
+  /** Stable event ordering direction. */
+  order?: 'asc' | 'desc';
   /** When true, each event includes its related `stream`. Defaults to false. */
   includeStream?: boolean;
 }
@@ -116,6 +120,7 @@ export interface ListEventsForWalletResult {
   limit: number;
   offset: number;
   hasMore: boolean;
+  nextCursor: string | null;
 }
 
 /**
@@ -125,7 +130,15 @@ export interface ListEventsForWalletResult {
 export async function listEventsForWallet(
   params: ListEventsForWalletParams,
 ): Promise<ListEventsForWalletResult> {
-  const { address, types = [], limit, offset, includeStream = false } = params;
+  const {
+    address,
+    types = [],
+    limit,
+    offset,
+    cursor,
+    order = 'desc',
+    includeStream = false,
+  } = params;
 
   const where: Prisma.StreamEventWhereInput = {
     stream: {
@@ -136,22 +149,29 @@ export async function listEventsForWallet(
     where.eventType = { in: types };
   }
 
-  const [events, total] = await Promise.all([
+  const [queriedEvents, total] = await Promise.all([
     prisma.streamEvent.findMany({
       where,
-      orderBy: { timestamp: "desc" },
-      skip: offset,
-      take: limit,
+      orderBy: [{ timestamp: order }, { id: order }],
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
+      take: cursor ? limit + 1 : limit,
       ...(includeStream ? { include: { stream: true } } : {}),
     }),
     prisma.streamEvent.count({ where }),
   ]);
+
+  const hasMore = cursor
+    ? queriedEvents.length > limit
+    : offset + queriedEvents.length < total;
+  const events = queriedEvents.slice(0, limit);
+  const lastEvent = events.at(-1) as { id?: string } | undefined;
 
   return {
     events,
     total,
     limit,
     offset,
-    hasMore: offset + events.length < total,
+    hasMore,
+    nextCursor: hasMore && typeof lastEvent?.id === 'string' ? lastEvent.id : null,
   };
 }

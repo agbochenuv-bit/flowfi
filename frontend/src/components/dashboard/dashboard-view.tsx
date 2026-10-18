@@ -5,7 +5,6 @@ import Link from "next/link";
 import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
 import toast from "react-hot-toast";
-import { transactionSuccessToast } from "@/lib/transaction-feedback";
 
 /**
  * components/dashboard/dashboard-view.tsx
@@ -53,10 +52,16 @@ import {
 } from "../stream-creation/StreamCreationWizard";
 import { TopUpModal } from "../stream-creation/TopUpModal";
 import { useQueryClient } from "@tanstack/react-query";
+import { useWallet } from "@/context/wallet-context";
 import { CancelConfirmModal } from "../stream-creation/CancelConfirmModal";
 import { StreamDetailsModal } from "./StreamDetailsModal";
 import { Button } from "../ui/Button";
 import { CashflowProjectionChart } from "./CashflowProjectionChart";
+import TransactionTracker, {
+  useTransactionTracker,
+  type TransactionAction,
+  type TransactionExpectedChanges,
+} from "@/components/TransactionTracker";
 
 // @ts-expect-error unused var
 const DashboardOverviewDynamic = dynamic(
@@ -289,6 +294,17 @@ function formatAnalyticsValue(
   }).format(value);
 }
 
+function isWalletRejection(error: unknown): boolean {
+  return error instanceof Error && (
+    ("code" in error && error.code === "WalletRejected") ||
+    /rejected in wallet|user rejected/i.test(error.message)
+  );
+}
+
+function isTransactionTimeout(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "TransactionTimeout";
+}
+
 function formatActivityTime(timestamp: string): string {
   const date = new Date(timestamp);
   if (Number.isNaN(date.getTime())) return timestamp;
@@ -517,6 +533,11 @@ const RecentActivityList = React.memo(function RecentActivityList({
 const VALID_TAB_IDS = new Set(SIDEBAR_ITEMS.map((item) => item.id));
 
 export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
+  const { authToken } = useWallet();
+  const tracker = useTransactionTracker();
+  const [pendingAction, setPendingAction] = React.useState<TransactionAction>("create");
+  const [pendingStreamId, setPendingStreamId] = React.useState<string>();
+  const [expectedChanges, setExpectedChanges] = React.useState<TransactionExpectedChanges>();
   const queryClient = useQueryClient();
   const router = useRouter();
   const searchParams = useSearchParams();
@@ -531,7 +552,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
     isError: isSnapshotError,
     error: snapshotErrorObj,
     refetch: refetchSnapshot,
-  } = useDashboard(session.publicKey);
+  } = useDashboard(session.publicKey, authToken);
 
   const snapshot: DashboardSnapshot | null = snapshotData ?? null;
   const snapshotError = isSnapshotError
@@ -543,7 +564,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
   // ── Stream search & keyboard navigation ───────────────────────────────────
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [showBatchClaim, setShowBatchClaim] = React.useState(false);
-  const [searchQuery, setSearchQuery] = React.useState("");
+  const searchQuery = searchParams.get("q") ?? "";
   const [selectedIndex, setSelectedIndex] = React.useState(0);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
 
@@ -673,6 +694,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
     retryNow,
   } = useStreamEvents({
     userPublicKeys: [session.publicKey],
+    jwtToken: authToken ?? undefined,
     autoReconnect: true,
   });
 
@@ -720,79 +742,29 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
 
   // ── Optimistic helpers ─────────────────────────────────────────────────────
 
-  const removeStreamLocally = (streamId: string) => {
-    queryClient.setQueryData<DashboardSnapshot | undefined>(dashboardQueryKey(session.publicKey), (prev) => {
-      if (!prev) return prev;
-      return {
-        ...prev,
-        outgoingStreams: prev.outgoingStreams.map((s) =>
-          s.id === streamId
-            ? { ...s, status: "Cancelled", isActive: false }
-            : s,
-        ),
-        activeStreamsCount: Math.max(0, prev.activeStreamsCount - 1),
-      };
-    });
-  };
-
-  const topUpStreamLocally = (streamId: string, amount: number) => {
-    queryClient.setQueryData<DashboardSnapshot | undefined>(
-      dashboardQueryKey(session.publicKey),
-      (prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          outgoingStreams: prev.outgoingStreams.map((s) =>
-            s.id === streamId ? { ...s, deposited: s.deposited + amount } : s,
-          ),
-        };
-      },
-    );
-  };
-
-  const addStreamLocally = (data: StreamFormData) => {
-    const newStream: Stream = {
-      id: `stream-${Date.now()}`,
-      date: new Date().toISOString().split("T")[0] ?? "",
-      recipient: shortenPublicKey(data.recipient),
-      amount: parseFloat(data.amount),
-      token: data.token,
-      status: "Active",
-      deposited: parseFloat(data.amount),
-      withdrawn: 0,
-      ratePerSecond: 0,
-      lastUpdateTime: Math.floor(Date.now() / 1000),
-      isActive: true,
-    };
-    queryClient.setQueryData<DashboardSnapshot | undefined>(
-      dashboardQueryKey(session.publicKey),
-      (prev) => {
-        if (!prev) return prev;
-        return {
-          ...prev,
-          outgoingStreams: [newStream, ...prev.outgoingStreams],
-          activeStreamsCount: prev.activeStreamsCount + 1,
-        };
-      },
-    );
-  };
-
   // ── Contract handlers ─────────────────────────────────────────────────────
 
-  const handleCreateStream = async (data: StreamFormData) => {
+  const handleCreateStream = async (data: StreamFormData, onStage?: Parameters<typeof sorobanCreateStream>[2]) => {
     const toastId = toast.loading("Creating stream…");
+    setPendingAction("create");
+    setPendingStreamId(undefined);
+    setExpectedChanges({ isActive: true });
+    tracker.start();
     try {
       const result = await sorobanCreateStream(session, {
         recipient: data.recipient,
         tokenAddress: getTokenAddress(data.token),
         amount: toBaseUnits(data.amount),
         durationSeconds: toDurationSeconds(data.duration, data.durationUnit),
-      });
-      addStreamLocally(data);
+      }, onStage ?? tracker.stage);
+      tracker.confirm();
       // We don't call setShowWizard(false) here anymore, the wizard handles its own flow
-      transactionSuccessToast("Transaction confirmed on-chain!", { id: toastId });
+      toast.dismiss(toastId);
       return result;
     } catch (err) {
+    if (isTransactionTimeout(err)) tracker.timeout();
+    else if (isWalletRejection(err)) tracker.cancel();
+    else tracker.fail(toSorobanErrorMessage(err));
       toast.error(toSorobanErrorMessage(err), { id: toastId });
       throw err;
     }
@@ -800,15 +772,25 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
 
   const handleTopUpConfirm = async (streamId: string, amountStr: string) => {
     const toastId = toast.loading("Topping up stream…");
+    const stream = snapshot?.outgoingStreams.find((item) => item.id === streamId);
+    setPendingAction("topup");
+    setPendingStreamId(streamId);
+    setExpectedChanges(stream ? {
+      depositedAmount: toBaseUnits(String(stream.deposited + parseFloat(amountStr))).toString(),
+    } : undefined);
+    tracker.start();
     try {
       await sorobanTopUp(session, {
         streamId: BigInt(streamId.replace(/\D/g, "") || "0"),
         amount: toBaseUnits(amountStr),
-      });
-      topUpStreamLocally(streamId, parseFloat(amountStr));
+      }, tracker.stage);
+      tracker.confirm();
       setModal(null);
-      transactionSuccessToast("Stream topped up successfully!", { id: toastId });
+      toast.dismiss(toastId);
     } catch (err) {
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(toSorobanErrorMessage(err));
       toast.error(toSorobanErrorMessage(err), { id: toastId });
       throw err;
     }
@@ -816,14 +798,21 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
 
   const handleCancelConfirm = async (streamId: string) => {
     const toastId = toast.loading("Cancelling stream…");
+    setPendingAction("cancel");
+    setPendingStreamId(streamId);
+    setExpectedChanges({ isActive: false });
+    tracker.start();
     try {
       await sorobanCancel(session, {
         streamId: BigInt(streamId.replace(/\D/g, "") || "0"),
-      });
-      removeStreamLocally(streamId);
+      }, tracker.stage);
+      tracker.confirm();
       setModal(null);
-      transactionSuccessToast("Stream cancelled.", { id: toastId });
+      toast.dismiss(toastId);
     } catch (err) {
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(toSorobanErrorMessage(err));
       toast.error(toSorobanErrorMessage(err), { id: toastId });
       throw err;
     }
@@ -832,13 +821,22 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
   const handleIncomingWithdraw = async (stream: Stream) => {
     const toastId = toast.loading("Withdrawing stream funds…");
     setWithdrawingIncomingStreamId(stream.id);
+    setPendingAction("withdraw");
+    setPendingStreamId(stream.id);
+    setExpectedChanges({
+      withdrawnAmountAbove: toBaseUnits(String(stream.withdrawn)).toString(),
+    });
+    tracker.start();
     try {
       await sorobanWithdraw(session, {
         streamId: BigInt(stream.id.replace(/\D/g, "") || "0"),
-      });
-      await refetchSnapshot();
-      transactionSuccessToast("Withdrawal successful!", { id: toastId });
+      }, tracker.stage);
+      tracker.confirm();
+      toast.dismiss(toastId);
     } catch (err) {
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(toSorobanErrorMessage(err));
       toast.error(toSorobanErrorMessage(err), { id: toastId });
       throw err;
     } finally {
@@ -1011,7 +1009,12 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
                 id="stream-search"
                 type="search"
                 value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
+                onChange={(event) => {
+                  const params = new URLSearchParams(searchParams.toString());
+                  if (event.target.value) params.set("q", event.target.value);
+                  else params.delete("q");
+                  router.replace(`?${params.toString()}`, { scroll: false });
+                }}
                 placeholder="Search streams…"
                 aria-label="Search streams"
                 className="w-44 rounded-lg border border-white/10 bg-white/5 px-3 py-2 pr-9 text-sm outline-none transition-colors focus:border-accent md:w-56"
@@ -1079,8 +1082,32 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
         <StreamCreationWizard
           onClose={() => setShowWizard(false)}
           onSubmit={handleCreateStream}
+          onStage={tracker.stage}
+          onIndexed={(streamId) => {
+            setPendingStreamId(streamId);
+            tracker.succeed();
+            void queryClient.invalidateQueries({ queryKey: dashboardQueryKey(session.publicKey) });
+          }}
+          onIndexingTimeout={tracker.timeout}
           walletPublicKey={session.publicKey}
         />
+      )}
+      {tracker.status !== "idle" && (
+        <div className="fixed bottom-4 right-4 z-50 w-[min(28rem,calc(100vw-2rem))]">
+          <TransactionTracker
+            status={tracker.status}
+            action={pendingAction}
+            txHash={tracker.txHash}
+            error={tracker.error}
+            streamId={pendingStreamId}
+            expectedChanges={expectedChanges}
+            onConfirmed={() => {
+              tracker.succeed();
+              void queryClient.invalidateQueries({ queryKey: dashboardQueryKey(session.publicKey) });
+            }}
+            onTimeout={tracker.timeout}
+          />
+        </div>
       )}
       {modal?.type === "topup" && (
         <TopUpModal

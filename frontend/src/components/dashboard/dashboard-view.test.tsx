@@ -16,6 +16,10 @@ vi.mock("next/navigation", () => ({
   useSearchParams: vi.fn(() => new URLSearchParams()),
 }));
 
+vi.mock("@/context/wallet-context", () => ({
+  useWallet: () => ({ session, authToken: "test-token" }),
+}));
+
 vi.mock("@/hooks/useStreamEvents", () => ({
   useStreamEvents: () => ({
     events: [],

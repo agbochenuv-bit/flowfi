@@ -44,6 +44,17 @@ export interface SorobanResult {
   txHash: string;
 }
 
+export type TransactionStage =
+  | "simulating"
+  | "awaiting_approval"
+  | "submitted"
+  | "confirming";
+
+export type TransactionStageCallback = (
+  stage: TransactionStage,
+  txHash?: string,
+) => void;
+
 export class SorobanCallError extends Error {
   constructor(
     message: string,
@@ -57,6 +68,7 @@ export class SorobanCallError extends Error {
       | "InvalidFeeRate"
       | "NotInitialized"
       | "WalletRejected"
+      | "TransactionTimeout"
       | "NetworkError"
       | "ContractNotFound"
       | "Unknown",
@@ -211,6 +223,7 @@ async function freighterCall(
   method: string,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   args: any[],
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sdk: any = await import("@stellar/stellar-sdk");
@@ -233,6 +246,7 @@ async function freighterCall(
     .setTimeout(30)
     .build();
 
+  onStage?.("simulating");
   const simResult = await server.simulateTransaction(tx);
   if (rpc.Api?.isSimulationError?.(simResult) ?? simResult?.error) {
     if (isContractNotFoundError(simResult)) {
@@ -243,6 +257,7 @@ async function freighterCall(
 
   const preparedTx = (rpc.assembleTransaction ?? sdk.assembleTransaction)(tx, simResult).build();
 
+  onStage?.("awaiting_approval");
   const { signedTxXdr, error: signError } = await signTransaction(
     preparedTx.toXDR(),
     { networkPassphrase: config.passphrase },
@@ -267,6 +282,7 @@ async function freighterCall(
   }
 
   const txHash = sendResult.hash;
+  onStage?.("submitted", txHash);
   const SUCCESS = rpc.Api?.GetTransactionStatus?.SUCCESS ?? "SUCCESS";
   const FAILED  = rpc.Api?.GetTransactionStatus?.FAILED  ?? "FAILED";
 
@@ -279,7 +295,7 @@ async function freighterCall(
     }
   }
 
-  throw new SorobanCallError("Transaction confirmation timed out.", "NetworkError");
+  throw new SorobanCallError("Transaction confirmation timed out.", "TransactionTimeout");
 }
 
 export function toSorobanErrorMessage(error: unknown): string {
@@ -298,6 +314,7 @@ export function toSorobanErrorMessage(error: unknown): string {
 export async function createStream(
   session: WalletSession,
   params: CreateStreamParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "create_stream", [
@@ -306,46 +323,50 @@ export async function createStream(
     new Address(params.tokenAddress).toScVal(),
     nativeToScVal(params.amount, { type: "i128" }),
     nativeToScVal(params.durationSeconds, { type: "u64" }),
-  ]);
+  ], onStage);
 }
 
 export async function topUpStream(
   session: WalletSession,
   params: TopUpParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "top_up_stream", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
     nativeToScVal(params.amount, { type: "i128" }),
-  ]);
+  ], onStage);
 }
 
 export async function cancelStream(
   session: WalletSession,
   params: CancelParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "cancel_stream", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
-  ]);
+  ], onStage);
 }
 
 export async function withdrawFromStream(
   session: WalletSession,
   params: WithdrawParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "withdraw", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
-  ]);
+  ], onStage);
 }
 
 export async function batchWithdrawFromStreams(
   session: WalletSession,
   params: BatchWithdrawParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "batch_withdraw", [
@@ -353,27 +374,29 @@ export async function batchWithdrawFromStreams(
     // encodes each entry as the given type. Produces the same ScVal as
     // `xdr.ScVal.scvVec(ids.map(...))`.
     nativeToScVal(params.streamIds, { type: ["u64"] }),
-  ]);
+  ], onStage);
 }
 
 export async function pauseStream(
   session: WalletSession,
   params: PauseParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "pause_stream", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
-  ]);
+  ], onStage);
 }
 
 export async function resumeStream(
   session: WalletSession,
   params: ResumeParams,
+  onStage?: TransactionStageCallback,
 ): Promise<SorobanResult> {
   const { Address, nativeToScVal } = await import("@stellar/stellar-sdk");
   return freighterCall(session.publicKey, "resume_stream", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
-  ]);
+  ], onStage);
 }

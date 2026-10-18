@@ -8,13 +8,15 @@ import { ArrowLeft, Pause, Play, X, Plus, Download, AlertTriangle, FileText } fr
 import { Button } from "@/components/ui/Button";
 import { LiveValue } from "@/components/ui/LiveValue";
 import toast from "react-hot-toast";
-import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import { useTokenPrice, convertToFiat, formatFiatAmount } from "@/hooks/useTokenPrice";
 import { useWallet } from "@/context/wallet-context";
+import { authenticatedFetch } from "@/lib/auth";
 import { useStreamEvents } from "@/hooks/useStreamEvents";
 import { useStreamingAmount } from "@/hooks/useStreamingAmount";
 import TransactionTracker, {
   useTransactionTracker,
+  type TransactionAction,
+  type TransactionExpectedChanges,
 } from "@/components/TransactionTracker";
 import {
   withdrawFromStream,
@@ -55,6 +57,17 @@ interface StreamDetail {
 const API_BASE_URL = `${getApiBaseUrl()}/v1`;
 const EVENTS_PER_PAGE = 10;
 
+function isTransactionTimeout(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "TransactionTimeout";
+}
+
+function isWalletRejection(error: unknown): boolean {
+  return error instanceof Error && (
+    ("code" in error && error.code === "WalletRejected") ||
+    /rejected in wallet|user rejected/i.test(error.message)
+  );
+}
+
 const TOKEN_SYMBOLS: Record<string, string> = {
   "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCN": "XLM",
   "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA": "USDC",
@@ -75,13 +88,16 @@ const EVENT_STYLES: Record<string, { color: string; icon: string; label: string 
 };
 
 export default function StreamDetailsContent({ streamId }: { streamId: string }) {
-  const { session, isHydrated } = useWallet();
+  const { session, authToken, isHydrated } = useWallet();
   const tracker = useTransactionTracker();
+  const [pendingAction, setPendingAction] = useState<TransactionAction>("withdraw");
+  const [expectedChanges, setExpectedChanges] = useState<TransactionExpectedChanges>();
 
   const [stream, setStream] = useState<StreamDetail | null>(null);
   const [events, setEvents] = useState<BackendStreamEvent[]>([]);
-  const [eventsPage, setEventsPage] = useState(1);
-  const [eventsTotal, setEventsTotal] = useState(0);
+  const [eventsCursor, setEventsCursor] = useState<string | null>(null);
+  const [hasMoreEvents, setHasMoreEvents] = useState(false);
+  const [eventsLoading, setEventsLoading] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -127,6 +143,8 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
 
   const { events: streamEvents } = useStreamEvents({
     streamIds: [streamId],
+    userPublicKeys: session ? [session.publicKey] : [],
+    jwtToken: authToken ?? undefined,
     autoReconnect: true,
   });
 
@@ -135,7 +153,9 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
     if (!streamId) return;
     const reqId = ++streamReqId.current;
     try {
-      const response = await fetch(`${API_BASE_URL}/streams/${streamId}`, { signal });
+      const response = await authenticatedFetch(`${API_BASE_URL}/streams/${streamId}`, {
+        signal,
+      }, authToken);
       if (!response.ok) throw new Error("Stream not found");
       const data = await response.json();
       if (reqId === streamReqId.current) {
@@ -147,29 +167,41 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
         setError(err instanceof Error ? err.message : "Failed to fetch stream");
       }
     }
-  }, [streamId]);
+  }, [streamId, authToken]);
 
   const eventsReqId = useRef(0);
-  const fetchEvents = useCallback(async (page: number, signal?: AbortSignal) => {
+  const fetchEvents = useCallback(async (cursor: string | null, append = false, signal?: AbortSignal) => {
     if (!streamId) return;
     const reqId = ++eventsReqId.current;
+    setEventsLoading(true);
     try {
-      const response = await fetch(
-        `${API_BASE_URL}/streams/${streamId}/events?page=${page}&limit=${EVENTS_PER_PAGE}`,
-        { signal }
+      const cursorQuery = cursor ? `&cursor=${encodeURIComponent(cursor)}` : "";
+      const response = await authenticatedFetch(
+        `${API_BASE_URL}/streams/${streamId}/events?limit=${EVENTS_PER_PAGE}${cursorQuery}`,
+        { signal },
+        authToken,
       );
       if (response.ok) {
         const data = await response.json();
         if (reqId === eventsReqId.current) {
-          setEvents(data.events || []);
-          setEventsTotal(data.total || 0);
+          const next: BackendStreamEvent[] = Array.isArray(data.data ?? data.events)
+            ? data.data ?? data.events
+            : [];
+          setEvents((previous) => {
+            const combined = append ? [...previous, ...next] : next;
+            return [...new Map(combined.map((event: BackendStreamEvent) => [event.id, event])).values()];
+          });
+          setEventsCursor(typeof data.nextCursor === "string" ? data.nextCursor : null);
+          setHasMoreEvents(Boolean(data.hasMore));
         }
       }
     } catch (err) {
       if (err instanceof Error && err.name === "AbortError") return;
       logger.error("Failed to fetch events:", err);
+    } finally {
+      if (reqId === eventsReqId.current) setEventsLoading(false);
     }
-  }, [streamId]);
+  }, [streamId, authToken]);
 
   useEffect(() => {
     if (!isHydrated) return;
@@ -178,7 +210,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
 
     const loadData = async () => {
       setLoading(true);
-      await Promise.all([fetchStream(controller.signal), fetchEvents(1, controller.signal)]);
+      await Promise.all([fetchStream(controller.signal), fetchEvents(null, false, controller.signal)]);
       setLoading(false);
     };
 
@@ -192,12 +224,12 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
 
     const refreshStreamData = async () => {
       if (streamEvents.length > 0) {
-        await Promise.all([fetchStream(controller.signal), fetchEvents(eventsPage, controller.signal)]);
+        await fetchStream(controller.signal);
       }
     };
 
     refreshStreamData();    return () => controller.abort();
-  }, [streamEvents, fetchStream, fetchEvents, eventsPage]);
+  }, [streamEvents, fetchStream]);
 
   // #419 — re-anchor the client-side ticking claimable amount against the API
   // every 30s while the stream is ACTIVE, so any drift between the local
@@ -231,12 +263,12 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
   useEffect(() => {
     if (!stream) return;
     const controller = new AbortController();
-    fetch(`${API_BASE_URL}/streams/${streamId}/events?limit=200&order=asc`, {
+    authenticatedFetch(`${API_BASE_URL}/streams/${streamId}/events?limit=200&order=asc`, {
       signal: controller.signal,
-    })
+    }, authToken)
       .then((response) => response.ok ? response.json() : null)
       .then((data) => {
-        const createdEvent = data?.events?.find(
+        const createdEvent = (data?.data ?? data?.events)?.find(
           (event: BackendStreamEvent) => event.eventType === "CREATED"
         );
         if (createdEvent?.transactionHash) setReceiptTxHash(createdEvent.transactionHash);
@@ -247,24 +279,25 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
         }
       });
     return () => controller.abort();
-  }, [stream, streamId]);
+  }, [stream, streamId, authToken]);
 
   const handleWithdraw = async () => {
     if (!session) {
       toast.error("Please connect your wallet");
       return;
     }
+    setPendingAction("withdraw");
+    setExpectedChanges({ withdrawnAmountAbove: stream?.withdrawnAmount ?? "0" });
     tracker.start();
     try {
-      const result = await withdrawFromStream(session, { streamId: BigInt(streamId) });
-      tracker.submit(result.txHash);
+      await withdrawFromStream(session, { streamId: BigInt(streamId) }, tracker.stage);
       tracker.confirm();
-      transactionSuccessToast("Withdrawal successful!");
       await fetchStream();
-      tracker.succeed();
     } catch (err) {
       const message = toSorobanErrorMessage(err);
-      tracker.fail(message);
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(message);
       toast.error(message);
     }
   };
@@ -281,20 +314,23 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       toast.error(amountError);
       return;
     }
+    setPendingAction("topup");
+    setExpectedChanges({
+      depositedAmount: (BigInt(stream?.depositedAmount ?? "0") + toBaseUnits(topUpAmount)).toString(),
+    });
     tracker.start();
     try {
       const amount = toBaseUnits(topUpAmount);
-      const result = await topUpStream(session, { streamId: BigInt(streamId), amount });
-      tracker.submit(result.txHash);
+      await topUpStream(session, { streamId: BigInt(streamId), amount }, tracker.stage);
       tracker.confirm();
-      transactionSuccessToast("Stream topped up successfully!");
       setShowTopUp(false);
       setTopUpAmount("");
       await fetchStream();
-      tracker.succeed();
     } catch (err) {
       const message = toSorobanErrorMessage(err);
-      tracker.fail(message);
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(message);
       toast.error(message);
     }
   };
@@ -304,17 +340,18 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       toast.error("Please connect your wallet");
       return;
     }
+    setPendingAction("pause");
+    setExpectedChanges({ isPaused: true });
     tracker.start();
     try {
-      const result = await pauseStream(session, { streamId: BigInt(streamId) });
-      tracker.submit(result.txHash);
+      await pauseStream(session, { streamId: BigInt(streamId) }, tracker.stage);
       tracker.confirm();
-      transactionSuccessToast("Stream paused");
       await fetchStream();
-      tracker.succeed();
     } catch (err) {
       const message = toSorobanErrorMessage(err);
-      tracker.fail(message);
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(message);
       toast.error(message);
     }
   };
@@ -324,17 +361,18 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       toast.error("Please connect your wallet");
       return;
     }
+    setPendingAction("resume");
+    setExpectedChanges({ isPaused: false });
     tracker.start();
     try {
-      const result = await resumeStream(session, { streamId: BigInt(streamId) });
-      tracker.submit(result.txHash);
+      await resumeStream(session, { streamId: BigInt(streamId) }, tracker.stage);
       tracker.confirm();
-      transactionSuccessToast("Stream resumed");
       await fetchStream();
-      tracker.succeed();
     } catch (err) {
       const message = toSorobanErrorMessage(err);
-      tracker.fail(message);
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(message);
       toast.error(message);
     }
   };
@@ -344,23 +382,22 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       toast.error("Please connect your wallet");
       return;
     }
+    setPendingAction("cancel");
+    setExpectedChanges({ isActive: false });
     tracker.start();
     try {
-      const result = await cancelStream(session, { streamId: BigInt(streamId) });
-      tracker.submit(result.txHash);
+      await cancelStream(session, { streamId: BigInt(streamId) }, tracker.stage);
       tracker.confirm();
-      transactionSuccessToast("Stream cancelled");
       setShowCancelModal(false);
       await fetchStream();
-      tracker.succeed();
     } catch (err) {
       const message = toSorobanErrorMessage(err);
-      tracker.fail(message);
+      if (isTransactionTimeout(err)) tracker.timeout();
+      else if (isWalletRejection(err)) tracker.cancel();
+      else tracker.fail(message);
       toast.error(message);
     }
   };
-
-  const totalPages = Math.ceil(eventsTotal / EVENTS_PER_PAGE);
 
   if (loading) {
     return (
@@ -671,10 +708,13 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
           <div className="glass-card p-6">
             <TransactionTracker
               status={tracker.status}
-              action="withdraw"
+              action={pendingAction}
               txHash={tracker.txHash}
               error={tracker.error}
               streamId={streamId}
+              expectedChanges={expectedChanges}
+              onConfirmed={tracker.succeed}
+              onTimeout={tracker.timeout}
             />
           </div>
         )}
@@ -693,32 +733,16 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                 ))}
               </div>
 
-              {totalPages > 1 && (
+              {hasMoreEvents && (
                 <div className="flex items-center justify-between mt-6 pt-4 border-t border-white/10">
                   <button
                     onClick={() => {
-                      const newPage = eventsPage - 1;
-                      setEventsPage(newPage);
-                      fetchEvents(newPage);
+                      if (eventsCursor) void fetchEvents(eventsCursor, true);
                     }}
-                    disabled={eventsPage === 1}
+                    disabled={eventsLoading || !eventsCursor}
                     className="px-3 py-1 text-sm rounded-lg border border-white/10 disabled:opacity-50 hover:border-accent transition-colors"
                   >
-                    Previous
-                  </button>
-                  <span className="text-sm text-slate-400">
-                    Page {eventsPage} of {totalPages}
-                  </span>
-                  <button
-                    onClick={() => {
-                      const newPage = eventsPage + 1;
-                      setEventsPage(newPage);
-                      fetchEvents(newPage);
-                    }}
-                    disabled={eventsPage === totalPages}
-                    className="px-3 py-1 text-sm rounded-lg border border-white/10 disabled:opacity-50 hover:border-accent transition-colors"
-                  >
-                    Next
+                    {eventsLoading ? "Loading..." : "Load More"}
                   </button>
                 </div>
               )}

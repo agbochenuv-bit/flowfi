@@ -38,10 +38,12 @@ const { mockToast, mockSoroban, mockTracker, mockUseStreamingAmount, mockTransac
     txHash: "",
     error: "",
     start: vi.fn(),
+    stage: vi.fn(),
     submit: vi.fn(),
     confirm: vi.fn(),
     succeed: vi.fn(),
     fail: vi.fn(),
+    timeout: vi.fn(),
   };
   const mockUseStreamingAmount = vi.fn(() => 123456789);
   const mockTransactionSuccessToast = vi.fn();
@@ -350,7 +352,7 @@ describe("StreamDetailsContent handleWithdraw", () => {
     await waitFor(() => {
       expect(mockSoroban.withdrawFromStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Withdrawal successful!");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when withdrawFromStream throws", async () => {
@@ -412,7 +414,7 @@ describe("StreamDetailsContent handleTopUp", () => {
     await waitFor(() => {
       expect(mockSoroban.topUpStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream topped up successfully!");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when topUpStream throws", async () => {
@@ -474,9 +476,10 @@ describe("StreamDetailsContent handlePause", () => {
       expect(mockSoroban.pauseStream).toHaveBeenCalledWith(
         mockSession,
         { streamId: BigInt(STREAM_ID) },
+        expect.any(Function),
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream paused");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when pauseStream throws", async () => {
@@ -516,9 +519,10 @@ describe("StreamDetailsContent handleResume", () => {
       expect(mockSoroban.resumeStream).toHaveBeenCalledWith(
         mockSession,
         { streamId: BigInt(STREAM_ID) },
+        expect.any(Function),
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream resumed");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when resumeStream throws", async () => {

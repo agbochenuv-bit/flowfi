@@ -3,6 +3,7 @@
 import * as React from "react";
 import type { DashboardSnapshot } from "@/lib/dashboard";
 import { fetchDashboardData, dashboardQueryKey } from "@/lib/dashboard";
+import { useWallet } from "@/context/wallet-context";
 import { EmptyState } from "./dashboard-view";
 import { ActivityIcon } from "./dashboard-view";
 import { Button } from "@/components/ui/Button";
@@ -104,15 +105,16 @@ export function DashboardOverview({
   setShowWizard,
   queryClient,
 }: DashboardOverviewProps) {
+  const { authToken } = useWallet();
   React.useEffect(() => {
-    fetchDashboardData(session.publicKey)
+    fetchDashboardData(session.publicKey, undefined, authToken)
       .then((next: DashboardSnapshot) => {
         queryClient.setQueryData(dashboardQueryKey(session.publicKey), next);
       })
       .catch((err) => {
         queryClient.setQueryData(dashboardQueryKey(session.publicKey), null);
       });
-  }, [session.publicKey, queryClient]);
+  }, [session.publicKey, queryClient, authToken]);
 
   return (
     <div className="dashboard-content-stack mt-8">

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useStreamEvents } from "@/hooks/useStreamEvents";
 import { formatAmount } from "@/utils/amount";
 import { Button } from "./ui/Button";
+import { useWallet } from "@/context/wallet-context";
 
 interface NotificationDropdownProps {
     publicKey: string;
@@ -20,14 +21,17 @@ interface NotificationItem {
 }
 
 export const NotificationDropdown: React.FC<NotificationDropdownProps> = ({ publicKey }) => {
+    const { authToken } = useWallet();
     const router = useRouter();
     const [isOpen, setIsOpen] = useState(false);
     const [notifications, setNotifications] = useState<NotificationItem[]>([]);
     const [unreadCount, setUnreadCount] = useState(0);
     const containerRef = useRef<HTMLDivElement>(null);
+    const seenNotificationIds = useRef(new Set<string>());
 
     const { events: streamEvents, connected } = useStreamEvents({
         userPublicKeys: [publicKey],
+        jwtToken: authToken ?? undefined,
         autoReconnect: true,
     });
 
@@ -88,14 +92,24 @@ export const NotificationDropdown: React.FC<NotificationDropdownProps> = ({ publ
     useEffect(() => {
         if (streamEvents.length === 0) return;
 
-        const newNotifications = streamEvents.map((event) => ({
-            id: `sse-${event.type}-${event.timestamp}`,
-            streamId: ((event.data as Record<string, unknown>)?.streamId as number) || 0,
-            type: event.type,
-            message: formatEventMessage(event as { type: string; data?: Record<string, unknown> }),
-            timestamp: event.timestamp,
-            read: isOpen,
-        }));
+        const newNotifications = streamEvents.flatMap((event) => {
+            const data = (event.data ?? {}) as Record<string, unknown>;
+            const streamId = (data.streamId as number) || 0;
+            const stableId = data.eventId ?? data.id ?? data.transactionHash ?? data.txHash;
+            const id = stableId
+                ? `sse-${event.type}-${streamId}-${stableId}`
+                : `sse-${event.type}-${streamId}-${data.ledgerSequence ?? event.timestamp}`;
+            if (seenNotificationIds.current.has(id)) return [];
+            seenNotificationIds.current.add(id);
+            return [{
+                id,
+                streamId,
+                type: event.type,
+                message: formatEventMessage(event as { type: string; data?: Record<string, unknown> }),
+                timestamp: event.timestamp,
+                read: isOpen,
+            }];
+        });
 
         queueMicrotask(() => {
             setNotifications((prev) => {
@@ -106,7 +120,7 @@ export const NotificationDropdown: React.FC<NotificationDropdownProps> = ({ publ
                 return unique.slice(0, 20);
             });
 
-            if (!isOpen) {
+            if (!isOpen && newNotifications.length > 0) {
                 setUnreadCount((prev) => prev + newNotifications.length);
             }
         });

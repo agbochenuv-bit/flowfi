@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { useWallet } from "@/context/wallet-context";
 import { ActivityHistory } from "@/components/dashboard/ActivityHistory";
 import { BackendStreamEvent } from "@/lib/api-types";
@@ -9,6 +10,7 @@ import { Loader2, Download } from "lucide-react";
 import { formatAmount } from "@/utils/amount";
 import { downloadCSV } from "@/utils/csvExport";
 import { getApiBaseUrl } from "@/lib/api/_shared";
+import { authenticatedFetch } from "@/lib/auth";
 import { logger } from "@/lib/logger";
 
 const PAGE_SIZE = 10;
@@ -24,15 +26,19 @@ const TABS = [
 ];
 
 export default function ActivityContent() {
-  const { session, status } = useWallet();
+  const { session, status, authToken } = useWallet();
+  const router = useRouter();
+  const searchParams = useSearchParams();
   const [events, setEvents] = useState<BackendStreamEvent[]>([]);
-  const [activeTab, setActiveTab] = useState("ALL");
+  const requestedType = searchParams.get("type") ?? "ALL";
+  const activeTab = TABS.some((tab) => tab.id === requestedType) ? requestedType : "ALL";
+  const sortOrder = searchParams.get("order") === "asc" ? "asc" : "desc";
   const [loading, setLoading] = useState(false);
-  const [page, setPage] = useState(1);
   const [hasMore, setHasMore] = useState(true);
+  const [cursor, setCursor] = useState<string | null>(null);
 
   const fetchActivity = useCallback(
-    async (pageNum: number, tab: string, append: boolean = false, signal?: AbortSignal) => {
+    async (nextCursor: string | null, tab: string, order: "asc" | "desc", append: boolean = false, signal?: AbortSignal) => {
       if (!session?.publicKey) return;
       setLoading(true);
 
@@ -41,9 +47,11 @@ export default function ActivityContent() {
         const typeQuery = tab === "ALL" ? "" : `&type=${encodeURIComponent(typeFilter)}`;
         const url =
           `${API_BASE_URL}/v1/events?address=${encodeURIComponent(session.publicKey)}` +
-          `&page=${pageNum}&limit=${PAGE_SIZE}${typeQuery}`;
+          `&limit=${PAGE_SIZE}&order=${order}${nextCursor ? `&cursor=${encodeURIComponent(nextCursor)}` : ""}${typeQuery}`;
 
-        const response = await fetch(url, { signal });
+        const response = await authenticatedFetch(url, {
+          signal,
+        }, authToken);
         if (!response.ok) {
           throw new Error(`Failed to fetch activity (${response.status})`);
         }
@@ -53,7 +61,11 @@ export default function ActivityContent() {
           ? data.events
           : [];
 
-        setEvents((prev) => (append ? [...prev, ...next] : next));
+        setEvents((prev) => {
+          const combined = append ? [...prev, ...next] : next;
+          return [...new Map(combined.map((event) => [event.id, event])).values()];
+        });
+        setCursor(typeof data?.nextCursor === "string" ? data.nextCursor : null);
 
         if (typeof data?.hasMore === "boolean") {
           setHasMore(data.hasMore);
@@ -69,23 +81,30 @@ export default function ActivityContent() {
         setLoading(false);
       }
     },
-    [session],
+    [session, authToken],
   );
+
+  const updateView = (type: string, order: "asc" | "desc") => {
+    const params = new URLSearchParams(searchParams.toString());
+    if (type === "ALL") params.delete("type");
+    else params.set("type", type);
+    params.set("order", order);
+    router.replace(`?${params.toString()}`, { scroll: false });
+  };
 
   useEffect(() => {
     if (status !== "connected") return;
     const controller = new AbortController();
     const initLoad = async () => {
-      await fetchActivity(1, activeTab, false, controller.signal);
+      setCursor(null);
+      await fetchActivity(null, activeTab, sortOrder, false, controller.signal);
     };
     void initLoad();
     return () => controller.abort();
-  }, [activeTab, status, fetchActivity]);
+  }, [activeTab, sortOrder, status, fetchActivity]);
 
   const loadMore = () => {
-    const nextPage = page + 1;
-    setPage(nextPage);
-    fetchActivity(nextPage, activeTab, true);
+    if (cursor) fetchActivity(cursor, activeTab, sortOrder, true);
   };
 
   const handleExportCSV = () => {
@@ -138,8 +157,7 @@ export default function ActivityContent() {
           <button
             key={tab.id}
             onClick={() => {
-              setActiveTab(tab.id);
-              setPage(1);
+              updateView(tab.id, sortOrder);
             }}
             className={`px-4 py-2 rounded-full text-sm font-medium transition-all whitespace-nowrap border ${
               activeTab === tab.id
@@ -152,9 +170,21 @@ export default function ActivityContent() {
         ))}
       </div>
 
+      <label className="mb-4 flex items-center justify-end gap-2 text-sm text-slate-400">
+        Sort
+        <select
+          value={sortOrder}
+          onChange={(event) => updateView(activeTab, event.target.value === "asc" ? "asc" : "desc")}
+          className="rounded border border-white/10 bg-slate-900 px-3 py-2 text-white"
+        >
+          <option value="desc">Newest first</option>
+          <option value="asc">Oldest first</option>
+        </select>
+      </label>
+
       <ActivityHistory events={events} isLoading={loading && events.length === 0} />
 
-      {hasMore && (
+      {hasMore && cursor && (
         <div className="mt-12 flex justify-center">
           <Button
             variant="secondary"

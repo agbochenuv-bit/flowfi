@@ -8,6 +8,8 @@ import type { BackendStream } from "@/lib/api-types";
 import { formatAmount } from "@/utils/amount";
 import { getApiBaseUrl } from "@/lib/api/_shared";
 import { logger } from "@/lib/logger";
+import { authenticatedFetch } from "@/lib/auth";
+import { useWallet } from "@/context/wallet-context";
 
 /**
  * TransactionTracker - Shared component for tracking on-chain transaction lifecycle
@@ -24,10 +26,14 @@ import { logger } from "@/lib/logger";
 
 export type TransactionStatus =
   | "idle"
+  | "pending"
+  | "simulating"
+  | "awaiting_approval"
   | "signing"
   | "submitted"
   | "confirming"
   | "confirmed"
+  | "timeout"
   | "failed"
   | "cancelled";
 
@@ -39,6 +45,14 @@ export type TransactionAction =
   | "pause"
   | "resume";
 
+export interface TransactionExpectedChanges {
+  depositedAmount?: string;
+  withdrawnAmount?: string;
+  withdrawnAmountAbove?: string;
+  isActive?: boolean;
+  isPaused?: boolean;
+}
+
 interface TransactionTrackerProps {
   status: TransactionStatus;
   action: TransactionAction;
@@ -49,15 +63,9 @@ interface TransactionTrackerProps {
   onCancel?: () => void;
   /** Called once the indexer reflects the expected changes. */
   onConfirmed?: () => void;
+  onTimeout?: () => void;
   streamId?: string;
-  expectedChanges?: {
-    depositedAmount?: string;
-    withdrawnAmount?: string;
-    /** Confirmed once withdrawnAmount (base units) is strictly greater than this. */
-    withdrawnAmountAbove?: string;
-    isActive?: boolean;
-    isPaused?: boolean;
-  };
+  expectedChanges?: TransactionExpectedChanges;
 }
 
 const STELLAR_EXPERT_BASE = process.env.NEXT_PUBLIC_STELLAR_EXPERT_URL ||
@@ -87,9 +95,11 @@ export default function TransactionTracker({
   onRetry,
   onCancel,
   onConfirmed,
+  onTimeout,
   streamId,
   expectedChanges,
 }: TransactionTrackerProps) {
+  const { authToken } = useWallet();
   const [pollCount, setPollCount] = useState(0);
   const [streamData, setStreamData] = useState<BackendStream | null>(null);
   const [previousStreamData, setPreviousStreamData] = useState<BackendStream | null>(null);
@@ -97,14 +107,14 @@ export default function TransactionTracker({
   // Capture initial stream state when entering confirming state
   useEffect(() => {
     if (status === "confirming" && streamId && !previousStreamData) {
-      fetch(`${API_BASE_URL}/streams/${streamId}`)
+      authenticatedFetch(`${API_BASE_URL}/streams/${streamId}`, {}, authToken)
         .then(res => res.ok ? res.json() : null)
         .then(data => {
           if (data) setPreviousStreamData(data);
         })
         .catch(logger.error);
     }
-  }, [status, streamId, previousStreamData]);
+  }, [status, streamId, previousStreamData, authToken]);
 
   // Poll for confirmation
   useEffect(() => {
@@ -117,6 +127,7 @@ export default function TransactionTracker({
       if (cancelled || attempts >= MAX_POLL_ATTEMPTS) {
         if (attempts >= MAX_POLL_ATTEMPTS && !cancelled) {
           toast.error("Confirmation timeout - please check explorer for status");
+          onTimeout?.();
         }
         return;
       }
@@ -125,7 +136,7 @@ export default function TransactionTracker({
       setPollCount(attempts);
 
       try {
-        const res = await fetch(`${API_BASE_URL}/streams/${streamId}`);
+        const res = await authenticatedFetch(`${API_BASE_URL}/streams/${streamId}`, {}, authToken);
         if (!res.ok) throw new Error("Failed to fetch stream status");
 
         const data: BackendStream = await res.json();
@@ -156,7 +167,7 @@ export default function TransactionTracker({
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- onConfirmed identity must not restart polling
-  }, [status, streamId, action, expectedChanges]);
+  }, [status, streamId, action, expectedChanges, authToken, onTimeout]);
 
   // Reset state when returning to idle
   useEffect(() => {
@@ -180,6 +191,33 @@ export default function TransactionTracker({
     case "idle":
       return null;
 
+    case "pending":
+      return (
+        <div className="rounded-xl border border-white/10 bg-white/5 p-4">
+          <div className="flex items-center gap-3">
+            <Loader2 className="h-5 w-5 animate-spin text-accent" />
+            <div>
+              <p className="font-medium">Transaction Pending</p>
+              <p className="text-sm text-slate-400">Preparing {ACTION_LABELS[action].present.toLowerCase()}...</p>
+            </div>
+          </div>
+        </div>
+      );
+
+    case "simulating":
+      return (
+        <div className="rounded-xl border border-blue-500/20 bg-blue-500/10 p-4">
+          <div className="flex items-center gap-3">
+            <Loader2 className="h-5 w-5 animate-spin text-blue-400" />
+            <div>
+              <p className="font-medium text-blue-400">Simulating Transaction</p>
+              <p className="text-sm text-blue-400/70">Checking the contract call...</p>
+            </div>
+          </div>
+        </div>
+      );
+
+    case "awaiting_approval":
     case "signing":
       return (
         <div className="rounded-xl border border-white/10 bg-white/5 p-4">
@@ -311,6 +349,24 @@ export default function TransactionTracker({
         </div>
       );
 
+    case "timeout":
+      return (
+        <div className="rounded-xl border border-amber-500/20 bg-amber-500/10 p-4 space-y-3">
+          <div className="flex items-center gap-3">
+            <Clock className="h-5 w-5 text-amber-400" />
+            <div>
+              <p className="font-medium text-amber-400">Confirmation Timed Out</p>
+              <p className="text-sm text-amber-400/70">The transaction may still be indexing. Check its status before retrying.</p>
+            </div>
+          </div>
+          {txHash && (
+            <a href={`${STELLAR_EXPERT_BASE}/${txHash}`} target="_blank" rel="noopener noreferrer" className="flex items-center gap-2 text-sm text-amber-300 hover:text-amber-200">
+              <ExternalLink className="h-3 w-3" />Check transaction status
+            </a>
+          )}
+        </div>
+      );
+
     case "failed":
       return (
         <div className="rounded-xl border border-red-500/20 bg-red-500/10 p-4 space-y-3">
@@ -402,6 +458,9 @@ export function checkConfirmation(
   if (expected.isActive !== undefined) {
     if (current.isActive !== expected.isActive) return false;
   }
+  if (expected.isPaused !== undefined) {
+    if (current.isPaused !== expected.isPaused) return false;
+  }
 
   return true;
 }
@@ -450,22 +509,40 @@ export function renderChanges(prev: BackendStream, current: BackendStream) {
 
 // Hook for using transaction tracker in components
 export function useTransactionTracker() {
+  const { session } = useWallet();
+  const identity = session ? `${session.publicKey}:${session.connectedAt}` : null;
   const [status, setStatus] = useState<TransactionStatus>("idle");
   const [txHash, setTxHash] = useState<string>();
   const [error, setError] = useState<string>();
   const [errorCode, setErrorCode] = useState<string>();
+  const [ownerIdentity, setOwnerIdentity] = useState(identity);
+  const stateIsCurrent = ownerIdentity === identity;
 
   const reset = useCallback(() => {
+    setOwnerIdentity(identity);
     setStatus("idle");
     setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
-  }, []);
+  }, [identity]);
+
+  useEffect(() => {
+    if (!stateIsCurrent || !["confirmed", "timeout", "failed", "cancelled"].includes(status)) return;
+    const timer = window.setTimeout(reset, 10_000);
+    return () => window.clearTimeout(timer);
+  }, [status, reset, stateIsCurrent]);
 
   const start = useCallback(() => {
-    setStatus("signing");
+    setOwnerIdentity(identity);
+    setStatus("pending");
+    setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
+  }, [identity]);
+
+  const stage = useCallback((next: "simulating" | "awaiting_approval" | "submitted" | "confirming", hash?: string) => {
+    if (hash) setTxHash(hash);
+    setStatus(next);
   }, []);
 
   const submit = useCallback((hash: string) => {
@@ -491,17 +568,23 @@ export function useTransactionTracker() {
     setStatus("cancelled");
   }, []);
 
+  const timeout = useCallback(() => {
+    setStatus("timeout");
+  }, []);
+
   return {
-    status,
-    txHash,
-    error,
-    errorCode,
+    status: stateIsCurrent ? status : "idle",
+    txHash: stateIsCurrent ? txHash : undefined,
+    error: stateIsCurrent ? error : undefined,
+    errorCode: stateIsCurrent ? errorCode : undefined,
     reset,
     start,
+    stage,
     submit,
     confirm,
     succeed,
     fail,
     cancel,
+    timeout,
   };
 }

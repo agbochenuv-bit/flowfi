@@ -56,7 +56,7 @@ export const Navbar = () => {
 
         <div className="flex items-center gap-4">
           {status === "connected" && session?.publicKey && (
-            <NotificationDropdown publicKey={session.publicKey} />
+            <NotificationDropdown key={`${session.publicKey}:${session.connectedAt}`} publicKey={session.publicKey} />
           )}
           <WalletButton />
           <button

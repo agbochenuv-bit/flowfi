@@ -25,6 +25,8 @@ import {
   getAddress,
   getNetworkDetails,
 } from "@stellar/freighter-api";
+import { getApiBaseUrl } from "@/lib/api/_shared";
+import { getNetworkConfig, type NetworkId } from "@/lib/stellar-config";
 
 export type WalletId = "freighter" | "albedo" | "xbull" | "hana" | "walletconnect";
 
@@ -153,6 +155,78 @@ export async function connectWallet(
   const publicKey = result.publicKey ?? result.address;
   if (!publicKey) throw new Error(`${walletId} did not return a public key.`);
   return buildSession(walletId, publicKey, STELLAR_NETWORK === "MAINNET" ? "Mainnet" : "Testnet");
+}
+
+export async function authenticateWallet(session: WalletSession): Promise<string> {
+  const apiBase = getApiBaseUrl();
+  const challengeResponse = await fetch(`${apiBase}/v1/auth/challenge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ publicKey: session.publicKey }),
+  });
+  if (!challengeResponse.ok) {
+    throw new Error(`Wallet authentication failed (${challengeResponse.status})`);
+  }
+
+  const { nonce } = (await challengeResponse.json()) as { nonce: string };
+  const networkId: NetworkId = session.network.toLowerCase().includes("main")
+    ? "mainnet"
+    : session.network.toLowerCase().includes("future")
+      ? "futurenet"
+      : session.network.toLowerCase().includes("sandbox")
+        ? "sandbox"
+        : "testnet";
+  const network = getNetworkConfig(networkId);
+  const sdk = await import("@stellar/stellar-sdk");
+  const horizon = new sdk.Horizon.Server(network.horizonUrl);
+  const account = await horizon.loadAccount(session.publicKey);
+  const transaction = new sdk.TransactionBuilder(account, {
+    fee: sdk.BASE_FEE,
+    networkPassphrase: network.passphrase,
+  })
+    .addOperation(sdk.Operation.manageData({
+      name: "flowfi-auth",
+      value: Uint8Array.from(nonce.match(/.{2}/g) ?? [], (byte) =>
+        Number.parseInt(byte, 16),
+      ),
+    }))
+    .setTimeout(60)
+    .build();
+
+  const { signTransaction } = await import("@stellar/freighter-api");
+  const signed = await signTransaction(transaction.toXDR(), {
+    networkPassphrase: network.passphrase,
+  });
+  if (signed.error || !signed.signedTxXdr) {
+    throw new Error(
+      typeof signed.error === "string" ? signed.error : "Wallet signature was not returned.",
+    );
+  }
+
+  const verifyResponse = await fetch(`${apiBase}/v1/auth/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      publicKey: session.publicKey,
+      signedTransaction: signed.signedTxXdr,
+    }),
+  });
+  if (!verifyResponse.ok) {
+    throw new Error(`Wallet authentication failed (${verifyResponse.status})`);
+  }
+
+  const { token } = (await verifyResponse.json()) as { token: string };
+  return token;
+}
+
+export async function getConnectedWalletAddress(
+  walletId: WalletId,
+): Promise<string | null> {
+  if (walletId !== "freighter") return null;
+  const connection = await isConnected();
+  if (!connection.isConnected) return "";
+  const { address, error } = await getAddress();
+  return error ? "" : address || "";
 }
 
 // ── Error message mapping ─────────────────────────────────────────────────────

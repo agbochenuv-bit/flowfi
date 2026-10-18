@@ -33,7 +33,7 @@ function LoadingCard() {
 }
 
 export default function IncomingContent() {
-  const { session, status, isHydrated } = useWallet();
+  const { session, status, isHydrated, authToken } = useWallet();
   const tracker = useTransactionTracker();
   // Stream being withdrawn and its withdrawn total (base units) before the
   // withdrawal, so the tracker only confirms once the indexer shows an increase.
@@ -42,22 +42,28 @@ export default function IncomingContent() {
     expectedChanges: { withdrawnAmountAbove: string };
   } | null>(null);
 
-  const incomingStreamsQuery = useIncomingStreams(session?.publicKey);
+  const incomingStreamsQuery = useIncomingStreams(session?.publicKey, { authToken });
   const withdrawMutation = useWithdrawIncomingStream(
     session,
     session?.publicKey,
+    authToken,
     {
       onSuccess: async (result, _stream) => {
-        tracker.submit(result.txHash);
-        toast.success(`Withdrawal submitted for stream #${_stream.streamId}`);
-        // Move to confirming — TransactionTracker polls the indexer from here
         tracker.confirm();
+        toast.success(`Withdrawal submitted for stream #${_stream.streamId}`);
       },
       onError: (error) => {
         const message = toSorobanErrorMessage(error);
-        tracker.fail(message);
+        if (error instanceof Error && "code" in error && error.code === "TransactionTimeout") {
+          tracker.timeout();
+        } else if (error instanceof Error && "code" in error && error.code === "WalletRejected") {
+          tracker.cancel();
+        } else {
+          tracker.fail(message);
+        }
         toast.error(message);
       },
+      onStage: (stage, hash) => tracker.stage(stage, hash),
     },
   );
 
@@ -181,6 +187,7 @@ export default function IncomingContent() {
               streamId={pendingWithdrawal?.streamId}
               expectedChanges={pendingWithdrawal?.expectedChanges}
               onConfirmed={tracker.succeed}
+              onTimeout={tracker.timeout}
             />
           </section>
         )}

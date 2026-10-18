@@ -207,6 +207,7 @@ export const listStreams = async (req: Request, res: Response) => {
       order = "desc",
       limit = "20",
       offset = "0",
+      cursor,
     } = req.query;
 
     // Validate status parameter
@@ -244,6 +245,10 @@ export const listStreams = async (req: Request, res: Response) => {
       MAX_STREAM_PAGE_SIZE,
     );
     const parsedOffset = typeof offset === 'string' ? Math.max(0, Number.parseInt(offset, 10) || 0) : 0;
+    const parsedCursor = typeof cursor === 'string' && /^\d+$/.test(cursor) ? cursor : undefined;
+    if (cursor !== undefined && !parsedCursor) {
+      return sendApiError(res, 400, "INVALID_CURSOR", "cursor must be a numeric stream ID");
+    }
 
     const params: import("../repositories/stream.repository.js").FindStreamsParams = {
       limit: parsedLimit,
@@ -251,6 +256,7 @@ export const listStreams = async (req: Request, res: Response) => {
       sortField,
       sortOrder: order === "asc" ? "asc" : "desc",
     };
+    if (parsedCursor) params.cursor = parsedCursor;
     if (typeof sender === "string") params.sender = sender;
     if (typeof recipient === "string") params.recipient = recipient;
     if (typeof token === "string") params.tokenAddress = token;
@@ -266,6 +272,7 @@ export const listStreams = async (req: Request, res: Response) => {
       hasMore: result.hasMore,
       limit: parsedLimit,
       offset: parsedOffset,
+      nextCursor: result.nextCursor,
     });
   } catch (error) {
     logger.error("Error listing streams:", error);
@@ -385,7 +392,7 @@ export const getStreamEvents = async (req: Request, res: Response) => {
       whereClause.eventType = eventType;
     }
 
-    const [events, total] = await Promise.all([
+    const [queriedEvents, total] = await Promise.all([
       prisma.streamEvent.findMany({
         where: whereClause,
         // `timestamp` is not unique (events in the same block/ledger can
@@ -393,17 +400,25 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         // pagination. Add `id` as a unique tiebreaker so ordering (and
         // therefore cursor pagination) is stable across pages.
         orderBy: [{ timestamp: order }, { id: order }],
-        take: limit,
+        take: cursor ? limit + 1 : limit,
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
       }),
       prisma.streamEvent.count({ where: whereClause }),
     ]);
 
     const hasMore = cursor
-      ? events.length === limit
-      : offset + events.length < total;
+      ? queriedEvents.length > limit
+      : offset + queriedEvents.length < total;
+    const events = queriedEvents.slice(0, limit);
+    const lastEvent = events.at(-1);
 
-    return res.status(200).json({ data: events, total, hasMore });
+    return res.status(200).json({
+      data: events,
+      events,
+      total,
+      hasMore,
+      nextCursor: hasMore ? lastEvent?.id ?? null : null,
+    });
   } catch (error) {
     logger.error("Error fetching stream events:", error);
     return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");

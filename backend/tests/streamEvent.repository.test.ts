@@ -104,7 +104,7 @@ describe('streamEvent.repository', () => {
       expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: { stream: { OR: [{ sender: ADDR }, { recipient: ADDR }] } },
-          orderBy: { timestamp: 'desc' },
+          orderBy: [{ timestamp: 'desc' }, { id: 'desc' }],
           take: 10,
           skip: 0,
         }),
@@ -187,6 +187,31 @@ describe('streamEvent.repository', () => {
       const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 15 });
 
       expect(result.hasMore).toBe(false);
+    });
+
+    it('uses cursor lookahead and returns the last visible event as nextCursor', async () => {
+      (prisma.streamEvent.findMany as any).mockResolvedValue([
+        { id: 'evt-2' },
+        { id: 'evt-3' },
+      ]);
+      (prisma.streamEvent.count as any).mockResolvedValue(3);
+
+      const result = await listEventsForWallet({
+        address: ADDR,
+        limit: 1,
+        offset: 0,
+        cursor: 'evt-1',
+      });
+
+      expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(expect.objectContaining({
+        cursor: { id: 'evt-1' },
+        skip: 1,
+        take: 2,
+        orderBy: [{ timestamp: 'desc' }, { id: 'desc' }],
+      }));
+      expect(result.events).toEqual([{ id: 'evt-2' }]);
+      expect(result.hasMore).toBe(true);
+      expect(result.nextCursor).toBe('evt-2');
     });
   });
 });
