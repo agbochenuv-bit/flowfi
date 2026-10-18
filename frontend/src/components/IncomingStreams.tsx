@@ -2,6 +2,7 @@
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowDown, ArrowUp, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import type { Stream } from '@/lib/dashboard';
 import { useStreamingAmount } from '@/hooks/useStreamingAmount';
 import { useTablePreferences } from '@/hooks/useTablePreferences';
@@ -29,6 +30,8 @@ const COLUMNS = [
 type ColumnId = (typeof COLUMNS)[number]['id'];
 
 const COLUMN_IDS: ColumnId[] = COLUMNS.map((column) => column.id);
+const PAGE_SIZE = 10;
+const FILTERS = ['All', 'Active', 'Completed', 'Paused'] as const;
 
 const STORAGE_KEY = 'flowfi.table.incoming-streams.v1';
 
@@ -136,21 +139,47 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     withdrawingStreamId = null,
     selectedStreamId = null,
 }) => {
-    const [filter, setFilter] = useState<'All' | 'Active' | 'Completed' | 'Paused'>('All');
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const requestedFilter = searchParams.get('incomingStatus');
+    const filter = FILTERS.includes(requestedFilter as (typeof FILTERS)[number])
+        ? requestedFilter as (typeof FILTERS)[number]
+        : 'All';
+    const requestedSort = searchParams.get('incomingSort');
+    const urlSortBy = COLUMN_IDS.includes(requestedSort as ColumnId)
+        ? requestedSort as ColumnId
+        : null;
+    const requestedDirection = searchParams.get('incomingDirection');
+    const urlSortDirection = requestedDirection === 'asc' || requestedDirection === 'desc'
+        ? requestedDirection
+        : null;
+    const requestedPage = Number(searchParams.get('incomingPage') ?? '1');
+    const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
     const [showSettings, setShowSettings] = useState(false);
     const settingsRef = useRef<HTMLDivElement>(null);
 
     const {
-        sortBy,
-        sortDirection,
+        sortBy: _storedSortBy,
+        sortDirection: _storedSortDirection,
         isVisible,
         toggleColumn,
-        setSort,
         resetPreferences,
     } = useTablePreferences<ColumnId>({
         storageKey: STORAGE_KEY,
         defaultColumns: COLUMN_IDS,
     });
+    const sortBy = urlSortBy;
+    const sortDirection = urlSortDirection ?? 'desc';
+
+    const updateView = (changes: Record<string, string | null>, resetPage = false) => {
+        const params = new URLSearchParams(searchParams.toString());
+        for (const [key, value] of Object.entries(changes)) {
+            if (value === null) params.delete(key);
+            else params.set(key, value);
+        }
+        if (resetPage) params.set('incomingPage', '1');
+        router.push(`?${params.toString()}`);
+    };
 
     // Close the settings dropdown on outside click / Escape.
     useEffect(() => {
@@ -188,13 +217,25 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     }, [filteredStreams, sortBy, sortDirection]);
 
     const handleFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        setFilter(e.target.value as 'All' | 'Active' | 'Completed' | 'Paused');
+        updateView({ incomingStatus: e.target.value === 'All' ? null : e.target.value }, true);
+    };
+
+    const handleSort = (columnId: ColumnId) => {
+        const direction = sortBy === columnId
+            ? sortDirection === 'asc' ? 'desc' : 'asc'
+            : 'asc';
+        updateView({ incomingSort: columnId, incomingDirection: direction }, true);
     };
 
     const handleResetLayout = () => {
         resetPreferences();
+        updateView({ incomingSort: null, incomingDirection: null }, true);
         setShowSettings(false);
     };
+
+    const pageCount = Math.max(1, Math.ceil(sortedStreams.length / PAGE_SIZE));
+    const currentPage = Math.min(page, pageCount);
+    const visibleStreams = sortedStreams.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
     const handleWithdraw = async (stream: Stream) => {
         try {
@@ -219,7 +260,8 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                         Filter:
                     </label>
                     <select
-                        id="filter"
+                        id="incoming-status-filter"
+                        aria-label="Filter incoming streams"
                         value={filter}
                         onChange={handleFilterChange}
                         className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-1 text-sm focus:ring-2 focus:ring-accent outline-none"
@@ -284,7 +326,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
             {filteredStreams.length === 0 ? (
                 <FilterEmptyState
                     filter={filter}
-                    onClearFilter={() => setFilter('All')}
+                    onClearFilter={() => updateView({ incomingStatus: null }, true)}
                 />
             ) : (
                 <div className="overflow-x-auto">
@@ -296,7 +338,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                                         <th key={column.id} className={HEADER_CELL_CLASS}>
                                             <button
                                                 type="button"
-                                                onClick={() => setSort(column.id)}
+                                                onClick={() => handleSort(column.id)}
                                                 aria-label={`Sort by ${column.label}`}
                                                 className="inline-flex items-center gap-1 uppercase tracking-wider hover:text-accent"
                                             >
@@ -316,7 +358,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {sortedStreams.map((stream) => {
+                            {visibleStreams.map((stream) => {
                                 const isPaused = stream.status === 'Paused';
                                 const isSelected = selectedStreamId === stream.id;
                                 return (
@@ -383,6 +425,29 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                             })}
                         </tbody>
                     </table>
+                </div>
+            )}
+            {filteredStreams.length > 0 && (
+                <div className="flex items-center justify-between border-t border-gray-200 px-6 py-3 dark:border-gray-700">
+                    <span className="text-sm text-gray-500 dark:text-gray-400">
+                        Page {currentPage} of {pageCount} ({sortedStreams.length} streams)
+                    </span>
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            aria-label="Previous page"
+                            disabled={currentPage <= 1}
+                            onClick={() => updateView({ incomingPage: String(currentPage - 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Previous</button>
+                        <button
+                            type="button"
+                            aria-label="Next page"
+                            disabled={currentPage >= pageCount}
+                            onClick={() => updateView({ incomingPage: String(currentPage + 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Next</button>
+                    </div>
                 </div>
             )}
         </div>

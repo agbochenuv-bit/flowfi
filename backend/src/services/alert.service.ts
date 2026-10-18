@@ -16,6 +16,7 @@
  * endpoint must never throw into (and therefore crash) the indexer loop.
  */
 import logger from '../logger.js';
+import { postToPinnedTarget, resolveSafeWebhookTarget } from './webhook.service.js';
 
 export type AlertWebhookKind = 'slack' | 'discord' | 'generic';
 
@@ -157,16 +158,17 @@ export async function sendDeadLetterAlert(alert: DeadLetterAlert): Promise<boole
 
   try {
     const payload = buildDeadLetterPayload(detectWebhookKind(url), alert);
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(10_000),
-    });
+    const { url: safeUrl, addresses } = await resolveSafeWebhookTarget(url);
+    const status = await postToPinnedTarget(
+      safeUrl,
+      addresses,
+      { 'Content-Type': 'application/json' },
+      JSON.stringify(payload),
+    );
 
-    if (!response.ok) {
+    if (status < 200 || status >= 300) {
       logger.warn(
-        `[Alert] Dead-letter webhook returned HTTP ${response.status} for event ${alert.eventId}`,
+        `[Alert] Dead-letter webhook returned HTTP ${status} for event ${alert.eventId}`,
       );
       return false;
     }

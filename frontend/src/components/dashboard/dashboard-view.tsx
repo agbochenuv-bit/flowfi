@@ -521,6 +521,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const tabParam = searchParams.get("tab");
+  const searchQuery = searchParams.get("q") ?? "";
   const activeTab = VALID_TAB_IDS.has(tabParam ?? "") ? (tabParam as string) : "overview";
   const [showWizard, setShowWizard] = React.useState(false);
   const [modal, setModal] = React.useState<ModalState>(null);
@@ -543,8 +544,8 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
   // ── Stream search & keyboard navigation ───────────────────────────────────
   const [showShortcuts, setShowShortcuts] = React.useState(false);
   const [showBatchClaim, setShowBatchClaim] = React.useState(false);
-  const [searchQuery, setSearchQuery] = React.useState("");
   const [selectedIndex, setSelectedIndex] = React.useState(0);
+  const searchEditStarted = React.useRef(false);
   const searchInputRef = React.useRef<HTMLInputElement>(null);
 
   const matchesSearch = React.useCallback(
@@ -1011,7 +1012,22 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
                 id="stream-search"
                 type="search"
                 value={searchQuery}
-                onChange={(event) => setSearchQuery(event.target.value)}
+                onChange={(event) => {
+                  const params = new URLSearchParams(searchParams.toString());
+                  const value = event.target.value;
+                  if (value) params.set("q", value);
+                  else params.delete("q");
+                  params.set("incomingPage", "1");
+                  const href = `?${params.toString()}`;
+                  if (searchEditStarted.current) router.replace(href);
+                  else {
+                    searchEditStarted.current = true;
+                    router.push(href);
+                  }
+                }}
+                onBlur={() => {
+                  searchEditStarted.current = false;
+                }}
                 placeholder="Search streams…"
                 aria-label="Search streams"
                 className="w-44 rounded-lg border border-white/10 bg-white/5 px-3 py-2 pr-9 text-sm outline-none transition-colors focus:border-accent md:w-56"

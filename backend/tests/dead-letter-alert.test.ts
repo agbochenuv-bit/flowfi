@@ -1,8 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+const webhookMocks = vi.hoisted(() => ({
+  resolveSafeWebhookTarget: vi.fn(),
+  postToPinnedTarget: vi.fn(),
+}));
+
 vi.mock('../src/logger.js', () => ({
   default: { error: vi.fn(), info: vi.fn(), warn: vi.fn(), debug: vi.fn() },
 }));
+vi.mock('../src/services/webhook.service.js', () => webhookMocks);
 
 import {
   buildDeadLetterPayload,
@@ -12,6 +18,7 @@ import {
   sendDeadLetterAlert,
   type DeadLetterAlert,
 } from '../src/services/alert.service.js';
+import { postToPinnedTarget, resolveSafeWebhookTarget } from '../src/services/webhook.service.js';
 
 const ALERT: DeadLetterAlert = {
   eventId: 'event-0001',
@@ -115,6 +122,11 @@ describe('sendDeadLetterAlert', () => {
 
   beforeEach(() => {
     saved['ALERT_WEBHOOK_URL'] = process.env.ALERT_WEBHOOK_URL;
+    webhookMocks.resolveSafeWebhookTarget.mockResolvedValue({
+      url: new URL('https://hooks.slack.com/services/x'),
+      addresses: [{ address: '8.8.8.8', family: 4 }],
+    });
+    webhookMocks.postToPinnedTarget.mockResolvedValue(200);
   });
 
   afterEach(() => {
@@ -125,39 +137,36 @@ describe('sendDeadLetterAlert', () => {
 
   it('is a no-op when alerting is not configured', async () => {
     delete process.env.ALERT_WEBHOOK_URL;
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
 
     await expect(sendDeadLetterAlert(ALERT)).resolves.toBe(false);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(resolveSafeWebhookTarget).not.toHaveBeenCalled();
+    expect(postToPinnedTarget).not.toHaveBeenCalled();
   });
 
   it('POSTs the formatted payload to the configured webhook', async () => {
     process.env.ALERT_WEBHOOK_URL = 'https://hooks.slack.com/services/x';
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
-    vi.stubGlobal('fetch', fetchMock);
 
     await expect(sendDeadLetterAlert(ALERT)).resolves.toBe(true);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(resolveSafeWebhookTarget).toHaveBeenCalledWith('https://hooks.slack.com/services/x');
+    expect(postToPinnedTarget).toHaveBeenCalledTimes(1);
 
-    const [url, init] = fetchMock.mock.calls[0]!;
-    expect(url).toBe('https://hooks.slack.com/services/x');
-    expect(init.method).toBe('POST');
-    expect(init.headers['Content-Type']).toBe('application/json');
-    const body = JSON.parse(init.body);
+    const [, addresses, headers, serializedBody] = vi.mocked(postToPinnedTarget).mock.calls[0]!;
+    expect(addresses).toEqual([{ address: '8.8.8.8', family: 4 }]);
+    expect(headers['Content-Type']).toBe('application/json');
+    const body = JSON.parse(serializedBody);
     expect(body.blocks).toBeDefined();
   });
 
   it('returns false on a non-2xx response without throwing', async () => {
     process.env.ALERT_WEBHOOK_URL = 'https://discord.com/api/webhooks/1/abc';
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false, status: 500 }));
+    webhookMocks.postToPinnedTarget.mockResolvedValue(500);
 
     await expect(sendDeadLetterAlert(ALERT)).resolves.toBe(false);
   });
 
   it('swallows network errors so the indexer loop is never crashed', async () => {
     process.env.ALERT_WEBHOOK_URL = 'https://alerts.example.com/hook';
-    vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')));
+    webhookMocks.resolveSafeWebhookTarget.mockRejectedValue(new Error('ECONNREFUSED'));
 
     await expect(sendDeadLetterAlert(ALERT)).resolves.toBe(false);
   });
