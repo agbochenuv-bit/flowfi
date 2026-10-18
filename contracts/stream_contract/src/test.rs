@@ -18,8 +18,8 @@ use events::{
     StreamPausedEvent, StreamResumedEvent, StreamToppedUpEvent, TokensWithdrawnEvent,
 };
 use types::{
-    DataKey, DisputeStatus, LegacyProtocolConfig, LegacyStream, ProtocolConfig, Stream,
-    StreamStatus, VestingSchedule, VestingStep, MAX_BATCH_WITHDRAW, MAX_VESTING_STEPS,
+    BatchStreamInput, DataKey, DisputeStatus, LegacyProtocolConfig, LegacyStream, ProtocolConfig,
+    Stream, StreamStatus, VestingSchedule, VestingStep, MAX_BATCH_WITHDRAW, MAX_VESTING_STEPS,
 };
 
 /// Minimal fee-token double that reads the stream from inside the treasury
@@ -6179,6 +6179,104 @@ fn test_coverage_conditional_stream_price_target_lifecycle() {
     assert_eq!(withdrawn, 1_000);
     assert!(client.is_stream_completed(&id));
 }
+// ─── TimestampOverflow guards ─────────────────────────────────────────────────
+//
+// The arithmetic-bounds audit (#26) replaced bare `start_time + cliff_duration`
+// additions with `checked_add`, and changed `project_end_time` to use
+// `checked_add` as well.  Each path below triggers the guard by setting the
+// ledger clock near `u64::MAX` so the addition wraps — Soroban must return
+// `TimestampOverflow` (or `ArithmeticOverflow` for `project_end_time`) rather
+// than silently producing a wrong timestamp.
+
+#[test]
+fn test_create_stream_with_cliff_timestamp_overflow() {
+    // Set start_time so close to u64::MAX that adding any cliff_duration wraps.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = u64::MAX - 1);
+
+    let (token, _admin) = create_token(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    mint(&env, &token, &sender, 1_000_000);
+
+    let client = create_contract(&env);
+    client.initialize(&Address::generate(&env), &token, &0);
+
+    // cliff_duration=10 would produce start_time + 10 which wraps past u64::MAX.
+    // The duration must be >= cliff_duration to pass the InvalidDuration guard first.
+    assert_stream_error!(
+        client.try_create_stream_with_cliff(&sender, &recipient, &token, &1_000, &10, &10),
+        StreamError::TimestampOverflow,
+        "create_stream_with_cliff must reject a cliff that overflows u64"
+    );
+}
+
+#[test]
+fn test_batch_create_stream_cliff_timestamp_overflow() {
+    // The batch path (create_stream with cliff via BatchStreamInput) has the
+    // same `checked_add` guard.  Pin the ledger near u64::MAX to trigger it.
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().with_mut(|l| l.timestamp = u64::MAX - 1);
+
+    let (token, _admin) = create_token(&env);
+    let sender = Address::generate(&env);
+    mint(&env, &token, &sender, 1_000_000);
+
+    let client = create_contract(&env);
+    client.initialize(&Address::generate(&env), &token, &0);
+
+    let mut inputs = SorobanVec::new(&env);
+    inputs.push_back(BatchStreamInput {
+        recipient: Address::generate(&env),
+        token_address: token.clone(),
+        amount: 1_000,
+        duration: 10,
+        cliff_duration: Some(10), // start_time + 10 overflows
+    });
+
+    assert_stream_error!(
+        client.try_batch_create_streams(&sender, &inputs),
+        StreamError::TimestampOverflow,
+        "batch_create_streams must reject a cliff that overflows u64"
+    );
+}
+
+#[test]
+fn test_project_end_time_timestamp_overflow() {
+    // `project_end_time` is exercised through `top_up_stream`: after top-up the
+    // projected new end time is `now + remaining / rate`.  Set now near u64::MAX
+    // so the addition overflows and `ArithmeticOverflow` is returned instead of
+    // wrapping silently.
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (token, _admin) = create_token(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    // Fund sender with enough to create the stream and to top it up.
+    mint(&env, &token, &sender, i128::MAX);
+
+    let client = create_contract(&env);
+    client.initialize(&Address::generate(&env), &token, &0);
+
+    // Create a stream at a normal timestamp so we don't hit cliff overflow.
+    let id = client.create_stream(&sender, &recipient, &token, &100, &100);
+
+    // Advance the clock to just below u64::MAX so that `now + seconds_remaining`
+    // overflows on the next top-up.  The remaining tokens (massive top-up amount
+    // divided by rate=1) will be > u64::MAX seconds, triggering the guard.
+    env.ledger().with_mut(|l| l.timestamp = u64::MAX - 10);
+
+    // Top-up with an amount whose remaining/rate projects well past u64::MAX.
+    assert_stream_error!(
+        client.try_top_up_stream(&sender, &id, &(i128::MAX / 2)),
+        StreamError::ArithmeticOverflow,
+        "project_end_time must reject a projected end time that overflows u64"
+    );
+}
+
 // ─── Emission helper wire format ─────────────────────────────────────────────
 //
 // `events.rs` owns the (topic, payload) wire format via its `emit_*` helpers.

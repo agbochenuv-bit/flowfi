@@ -356,6 +356,17 @@ impl StreamContract {
     ///
     /// Returns the new stream ID (starts at 1, increments monotonically).
     ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// The gross token transfer from `sender` to the contract happens before
+    /// the stream record is persisted. If the transfer fails (insufficient
+    /// balance, revoked allowance, or a malicious token that panics), the
+    /// Soroban host aborts the entire transaction and rolls back all state
+    /// changes — no stream record is written and no fee is collected. The
+    /// fee transfer to the treasury is deferred until *after* the stream is
+    /// persisted, so a fee-transfer failure also rolls back cleanly without
+    /// leaving a partially-funded stream behind.
+    ///
     /// # Errors
     /// - `ProtocolPaused`     — the circuit breaker is engaged.
     /// - `InvalidAmount`      — `amount` ≤ 0.
@@ -536,7 +547,14 @@ impl StreamContract {
             if rate_per_second == 0 {
                 return Err(StreamError::InvalidRate);
             }
-            let cliff_time = input.cliff_duration.map(|duration| start_time + duration);
+            let cliff_time = input
+                .cliff_duration
+                .map(|duration| {
+                    start_time
+                        .checked_add(duration)
+                        .ok_or(StreamError::TimestampOverflow)
+                })
+                .transpose()?;
 
             save_stream(
                 &env,
@@ -643,7 +661,11 @@ impl StreamContract {
                 withdrawn_amount: 0,
                 start_time,
                 last_update_time: start_time,
-                cliff_time: Some(start_time + cliff_duration),
+                cliff_time: Some(
+                    start_time
+                        .checked_add(cliff_duration)
+                        .ok_or(StreamError::TimestampOverflow)?,
+                ),
                 is_active: true,
                 paused: false,
                 paused_at: None,
@@ -997,7 +1019,9 @@ impl StreamContract {
                 }
             }
             previous_unlock_time = Some(step.unlock_time);
-            total = total.saturating_add(step.unlock_amount);
+            total = total
+                .checked_add(step.unlock_amount)
+                .ok_or(StreamError::ArithmeticOverflow)?;
         }
 
         if total != net_amount {
@@ -1037,7 +1061,9 @@ impl StreamContract {
                     return Err(StreamError::InvalidMilestone);
                 }
             }
-            total = total.saturating_add(m.amount);
+            total = total
+                .checked_add(m.amount)
+                .ok_or(StreamError::ArithmeticOverflow)?;
         }
         if total != net_amount {
             return Err(StreamError::VestingStepTotalMismatch);
@@ -1313,6 +1339,38 @@ impl StreamContract {
     /// either be stranded as unclaimable residue or silently deferred to the
     /// final milestone. Both would misstate when the recipient gets their money.
     ///
+    /// # Schedule Semantics (#27)
+    ///
+    /// Top-ups **preserve the existing `rate_per_second`** — the rate is never
+    /// recalculated. The net top-up amount is added to `deposited_amount`,
+    /// which extends the stream's drain time at the same rate. Already-accrued
+    /// but unwithdrawn tokens are not affected: `last_update_time` is
+    /// intentionally left untouched so that prior accrual survives the top-up.
+    /// The emitted `stream_topped_up` event reports the new total deposit and
+    /// the projected end time so the backend indexer stays aligned.
+    ///
+    /// # Eligible Stream States (#28)
+    ///
+    /// All eligibility checks run **before** any token transfer, so a rejected
+    /// top-up never moves funds:
+    /// - **Active** — top-up succeeds.
+    /// - **Paused** — top-up succeeds; the deposit increases but accrual stays
+    ///   frozen until `resume_stream` is called.
+    /// - **Cancelled** — rejected with `StreamInactive`.
+    /// - **Completed** — rejected with `StreamInactive`.
+    /// - **Expired** (past the natural end but still `is_active`) — top-up
+    ///   succeeds, extending the stream further.
+    ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// The token transfer from `sender` to the contract happens after all
+    /// eligibility checks pass but before the stream record is persisted. If
+    /// the transfer fails, Soroban rolls back the entire transaction — no
+    /// stream state is changed and no fee is collected. The fee transfer to
+    /// the treasury is deferred until after the stream is persisted, so a
+    /// fee-transfer failure also rolls back without leaving a partially-funded
+    /// top-up behind.
+    ///
     /// # Errors
     /// - `ProtocolPaused`    — the circuit breaker is engaged.
     /// - `InvalidAmount`     — `amount` ≤ 0.
@@ -1320,6 +1378,8 @@ impl StreamContract {
     /// - `Unauthorized`      — caller is not the stream's sender.
     /// - `StreamInactive`    — stream has been cancelled or fully withdrawn.
     /// - `TopUpUnsupported`  — the stream uses a step-tranche schedule.
+    /// - `ArithmeticOverflow` — the new deposited total overflows `i128`.
+    /// - `TimestampOverflow`  — the projected end time overflows `u64`.
     pub fn top_up_stream(
         env: Env,
         sender: Address,
@@ -1632,6 +1692,14 @@ impl StreamContract {
     /// based on elapsed time and the stream's rate. The stream is automatically marked
     /// inactive once fully drained.
     ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// State is persisted before the token transfer (CEI). If the transfer
+    /// fails — e.g. the token contract panics or the contract has insufficient
+    /// balance — Soroban rolls back the entire transaction: `withdrawn_amount`
+    /// is not incremented, `last_update_time` is not advanced, and the stream
+    /// remains in its pre-call state. No partial withdrawal is ever observable.
+    ///
     /// # Errors
     /// - `StreamNotFound`  — no stream exists with `stream_id`.
     /// - `Unauthorized`    — caller is not the stream's recipient.
@@ -1702,6 +1770,15 @@ impl StreamContract {
     /// never be resumed, even if `paused` is `true`. This invariant must be
     /// preserved across all contract changes to prevent state-invariant bugs.
     /// See Testing #94 for test coverage.
+    ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// All state mutations — `withdrawn_amount`, `is_active`, `status`,
+    /// `last_update_time` — are persisted to storage before either the
+    /// recipient payout or the sender refund transfer fires (CEI). If either
+    /// token transfer fails, Soroban rolls back the entire transaction: the
+    /// stream is not marked as cancelled, no tokens move, and the stream
+    /// remains in its pre-call active state.
     ///
     /// # Errors
     /// - `StreamNotFound`  — no stream exists with `stream_id`.
@@ -1926,8 +2003,14 @@ impl StreamContract {
 
         let new_end_time = match stream.schedule {
             // A linear stream is guaranteed rate >= 1 by create_stream's
-            // InvalidRate guard, so the division is safe here.
-            VestingSchedule::Linear => now + (remaining / stream.rate_per_second) as u64,
+            // InvalidRate guard, so the division is safe here. The addition
+            // uses checked_add so a projection past u64::MAX returns
+            // ArithmeticOverflow instead of silently wrapping.
+            VestingSchedule::Linear => {
+                let seconds = (remaining / stream.rate_per_second) as u64;
+                now.checked_add(seconds)
+                    .ok_or(StreamError::ArithmeticOverflow)?
+            }
             // Step and hybrid schedules are anchored to absolute timestamps;
             // ask the schedule-aware projection instead of dividing.
             _ => {
