@@ -194,6 +194,132 @@ describe('stream action routes', () => {
     expect(mockResumeStream).toHaveBeenCalledWith(sender.publicKey(), 9n);
   });
 
+  it('rejects pause from a wallet that does not own the stream', async () => {
+    const sender = makeKeypair();
+    const attacker = makeKeypair();
+    const token = await getValidJwt(attacker);
+
+    mockPrisma.stream.findUnique.mockResolvedValue({
+      streamId: 7,
+      sender: sender.publicKey(),
+      recipient: makeKeypair().publicKey(),
+      isActive: true,
+      isPaused: false,
+      pausedAt: null,
+      totalPausedDuration: 0,
+    });
+
+    const response = await request(app)
+      .post('/v1/streams/7/pause')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(403);
+    expect(mockPauseStream).not.toHaveBeenCalled();
+    expect(mockPrisma.stream.update).not.toHaveBeenCalled();
+  });
+
+  it('ignores a client-supplied sender address when pausing', async () => {
+    const sender = makeKeypair();
+    const attacker = makeKeypair();
+    const token = await getValidJwt(attacker);
+
+    mockPrisma.stream.findUnique.mockResolvedValue({
+      streamId: 7,
+      sender: sender.publicKey(),
+      recipient: makeKeypair().publicKey(),
+      isActive: true,
+      isPaused: false,
+      pausedAt: null,
+      totalPausedDuration: 0,
+    });
+
+    const response = await request(app)
+      .post('/v1/streams/7/pause')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ sender: sender.publicKey() });
+
+    expect(response.status).toBe(403);
+    expect(mockPauseStream).not.toHaveBeenCalled();
+  });
+
+  it('rejects resume from a wallet that does not own the stream', async () => {
+    const sender = makeKeypair();
+    const attacker = makeKeypair();
+    const token = await getValidJwt(attacker);
+
+    mockPrisma.stream.findUnique.mockResolvedValue({
+      streamId: 9,
+      sender: sender.publicKey(),
+      recipient: makeKeypair().publicKey(),
+      isActive: true,
+      isPaused: true,
+      pausedAt: Math.floor(Date.now() / 1000) - 30,
+      totalPausedDuration: 10,
+    });
+
+    const response = await request(app)
+      .post('/v1/streams/9/resume')
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(response.status).toBe(403);
+    expect(mockResumeStream).not.toHaveBeenCalled();
+    expect(mockPrisma.stream.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects withdraw from a wallet that is not the recipient', async () => {
+    const recipient = makeKeypair();
+    const attacker = makeKeypair();
+    const token = await getValidJwt(attacker);
+
+    mockPrisma.stream.findUnique.mockResolvedValue({
+      streamId: 11,
+      sender: makeKeypair().publicKey(),
+      recipient: recipient.publicKey(),
+      ratePerSecond: '10',
+      depositedAmount: '1000',
+      withdrawnAmount: '100',
+      startTime: Math.floor(Date.now() / 1000) - 50,
+      lastUpdateTime: Math.floor(Date.now() / 1000) - 10,
+      isActive: true,
+      isPaused: false,
+      pausedAt: null,
+      totalPausedDuration: 0,
+      updatedAt: new Date(),
+    });
+
+    const response = await request(app)
+      .post('/v1/streams/11/withdraw')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ recipient: recipient.publicKey() });
+
+    expect(response.status).toBe(403);
+    expect(mockWithdraw).not.toHaveBeenCalled();
+    expect(mockPrisma.stream.update).not.toHaveBeenCalled();
+  });
+
+  it('rejects top-up from a wallet that is not the sender', async () => {
+    const sender = makeKeypair();
+    const attacker = makeKeypair();
+    const token = await getValidJwt(attacker);
+
+    mockPrisma.stream.findUnique.mockResolvedValue({
+      streamId: 13,
+      sender: sender.publicKey(),
+      recipient: makeKeypair().publicKey(),
+      depositedAmount: '1000',
+      isActive: true,
+      isPaused: false,
+    });
+
+    const response = await request(app)
+      .post('/v1/streams/13/top-up')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ amount: '100', sender: sender.publicKey() });
+
+    expect(response.status).toBe(403);
+    expect(mockPrisma.stream.update).not.toHaveBeenCalled();
+  });
+
   it('POST /v1/streams/:streamId/withdraw withdraws the claimable amount for the recipient', async () => {
     const recipient = makeKeypair();
     const token = await getValidJwt(recipient);

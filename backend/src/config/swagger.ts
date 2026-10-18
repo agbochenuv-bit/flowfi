@@ -1,5 +1,61 @@
 import swaggerJsdoc from 'swagger-jsdoc';
 
+/**
+ * Recursively sorts object keys so the generated spec is byte-for-byte
+ * reproducible across runs (and therefore safe to diff in CI parity checks).
+ * Arrays keep their declared order because ordering is meaningful there
+ * (e.g. `required`, `enum`, `tags`, `servers`).
+ */
+function sortKeysDeep<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortKeysDeep(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted as T;
+  }
+  return value;
+}
+
+/**
+ * Canonical error responses shared by every versioned endpoint. Route-level
+ * `@openapi` annotations reference these via `$ref` so status codes and
+ * payload shapes cannot drift between routes.
+ */
+const errorResponses = {
+  BadRequest: {
+    description: 'Malformed request (invalid JSON, query or path parameters)',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Unauthorized: {
+    description: 'Missing, malformed or expired bearer token',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Forbidden: {
+    description: 'Authenticated but not permitted to perform this action',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  NotFound: {
+    description: 'Requested resource does not exist',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Conflict: {
+    description: 'Request conflicts with the current state of the resource',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  TooManyRequests: {
+    description: 'Rate limit exceeded',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  InternalServerError: {
+    description: 'Unexpected server error',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+} as const;
+
 const options: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.1.0',
@@ -98,72 +154,7 @@ consumers are unaffected. Unknown codes should be treated as generic failures.`,
       },
     ],
     components: {
-      responses: {
-        BadRequest: {
-          description: 'Request failed validation. `error.details` lists field-level issues.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        Unauthorized: {
-          description: 'Missing or invalid credentials.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        Forbidden: {
-          description: 'Authenticated but not permitted to perform the action.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        NotFound: {
-          description: 'The requested resource does not exist.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        Conflict: {
-          description: 'The request conflicts with the current state of the resource.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        RateLimited: {
-          description: 'Too many requests. Retry after the interval in `Retry-After`.',
-          headers: {
-            'Retry-After': { schema: { type: 'integer' }, description: 'Seconds to wait before retrying' },
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-        InternalError: {
-          description: 'Unexpected server failure. Internal exception text is never exposed; use `error.requestId` to correlate with server logs.',
-          headers: {
-            'X-Request-Id': { schema: { type: 'string' }, description: 'Correlation id echoed in the error envelope' },
-          },
-          content: {
-            'application/json': { schema: { $ref: '#/components/schemas/ErrorEnvelope' } },
-          },
-        },
-      },
+      responses: errorResponses,
       securitySchemes: {
         BearerAuth: {
           type: 'http',
@@ -654,4 +645,9 @@ rely on \`error.requestId\` for correlation and \`error.details\` for structured
   apis: ['./src/**/*.ts'], // Path to the API routes
 };
 
-export const swaggerSpec = swaggerJsdoc(options);
+/**
+ * Deterministic OpenAPI document. Keys are sorted recursively so the artifact
+ * written by `npm run openapi:export` is reproducible and CI can fail on any
+ * undocumented route, schema, status-code or auth change.
+ */
+export const swaggerSpec = sortKeysDeep(swaggerJsdoc(options));

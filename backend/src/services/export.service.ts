@@ -25,6 +25,126 @@ export interface ExportOptions {
   tokenAddress?: string | null;
 }
 
+/**
+ * Snapshot upper bound captured at export start. Every batch query is
+ * constrained to events at or before this point so that events arriving
+ * mid-export are excluded and results are deterministic.
+ */
+interface ExportSnapshot {
+  maxCreatedAt: bigint;
+  maxId: string;
+}
+
+const DEFAULT_BATCH_SIZE = 100;
+const MAX_BATCH_SIZE = 1000;
+
+/**
+ * Resolve the batch size from the environment, clamped to a safe range so
+ * memory use stays bounded regardless of configuration.
+ */
+function resolveBatchSize(): number {
+  const raw = Number(process.env.EXPORT_BATCH_SIZE);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_BATCH_SIZE;
+  return Math.min(Math.floor(raw), MAX_BATCH_SIZE);
+}
+
+/**
+ * Validate export options, throwing a descriptive error on invalid input.
+ */
+function validateExportOptions(options: ExportOptions): void {
+  const { direction, startDate, endDate, tokenAddress } = options;
+
+  if (!["incoming", "outgoing", "all"].includes(direction)) {
+    throw new Error(`Invalid direction: ${String(direction)}`);
+  }
+
+  if (startDate && Number.isNaN(startDate.getTime())) {
+    throw new Error("Invalid startDate");
+  }
+  if (endDate && Number.isNaN(endDate.getTime())) {
+    throw new Error("Invalid endDate");
+  }
+  if (startDate && endDate && startDate.getTime() > endDate.getTime()) {
+    throw new Error("startDate must be before or equal to endDate");
+  }
+
+  if (tokenAddress !== undefined && tokenAddress !== null) {
+    if (typeof tokenAddress !== "string" || tokenAddress.trim() === "") {
+      throw new Error("Invalid tokenAddress");
+    }
+  }
+}
+
+/**
+ * Capture the snapshot upper bound for the export. Uses the maximum
+ * (createdAt, id) currently present so pagination is stable.
+ */
+async function captureSnapshot(): Promise<ExportSnapshot> {
+  const latest = await prisma.streamEvent.findFirst({
+    orderBy: [{ createdAt: "desc" }, { id: "desc" }],
+    select: { createdAt: true, id: true },
+  });
+
+  if (!latest) {
+    return { maxCreatedAt: 0n, maxId: "" };
+  }
+
+  return { maxCreatedAt: latest.createdAt, maxId: latest.id };
+}
+
+/**
+ * Build the base where clause shared by both export formats.
+ */
+function buildWhereClause(
+  userAddress: string,
+  options: ExportOptions,
+): any {
+  const { direction, startDate, endDate, tokenAddress } = options;
+
+  const where: any = { OR: [] };
+
+  if (direction === "outgoing" || direction === "all") {
+    where.OR.push({ sender: userAddress });
+  }
+  if (direction === "incoming" || direction === "all") {
+    where.OR.push({ recipient: userAddress });
+  }
+
+  if (tokenAddress) {
+    where.tokenAddress = tokenAddress;
+  }
+
+  return where;
+}
+
+/**
+ * Build the event-level where clause, including the snapshot upper bound
+ * and any date range filters.
+ */
+function buildEventWhere(
+  options: ExportOptions,
+  snapshot: ExportSnapshot,
+): any {
+  const { startDate, endDate } = options;
+
+  const timestamp: any = {};
+  if (startDate) timestamp.gte = BigInt(Math.floor(startDate.getTime() / 1000));
+  if (endDate) timestamp.lte = BigInt(Math.floor(endDate.getTime() / 1000));
+
+  const eventWhere: any = {
+    OR: [
+      { createdAt: { lt: snapshot.maxCreatedAt } },
+      { createdAt: snapshot.maxCreatedAt, id: { lte: snapshot.maxId } },
+    ],
+  };
+
+  if (Object.keys(timestamp).length > 0) {
+    eventWhere.timestamp = timestamp;
+  }
+
+  return eventWhere;
+}
+
 export interface TransactionRecord {
   timestamp: string;
   streamId: string;
@@ -144,23 +264,15 @@ export async function streamTransactionCSV(
   options: ExportOptions,
   res: Response,
 ): Promise<void> {
-  const { direction, startDate, endDate, tokenAddress } = options;
-
-  // Build where clause
-  const where: any = {
-    OR: [],
-  };
-
-  if (direction === "outgoing" || direction === "all") {
-    where.OR.push({ sender: userAddress });
-  }
-  if (direction === "incoming" || direction === "all") {
-    where.OR.push({ recipient: userAddress });
+  try {
+    validateExportOptions(options);
+  } catch (error) {
+    logger.warn("[Export] Invalid CSV export options:", error);
+    res.status(400).json({ error: (error as Error).message });
+    return;
   }
 
-  if (tokenAddress) {
-    where.tokenAddress = tokenAddress;
-  }
+  const where = buildWhereClause(userAddress, options);
 
   // Set response headers
   const filename = `flowfi-statement-${userAddress}-${new Date().toISOString().split("T")[0]}.csv`;
@@ -172,36 +284,28 @@ export async function streamTransactionCSV(
   res.write(CSV_HEADERS + "\n");
 
   try {
-    // Stream data in batches using cursor pagination
-    const BATCH_SIZE = 100;
-    let cursor: string | undefined;
+    const snapshot = await captureSnapshot();
+    const eventWhere = buildEventWhere(options, snapshot);
+    const BATCH_SIZE = resolveBatchSize();
+
+    let cursor: { createdAt: bigint; id: string } | undefined;
     let processedCount = 0;
 
     while (true) {
       const streams = await prisma.stream.findMany({
         where,
         take: BATCH_SIZE,
-        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-        orderBy: { createdAt: "asc" },
+        ...(cursor
+          ? {
+              skip: 1,
+              cursor: { createdAt_id: cursor },
+            }
+          : {}),
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
         include: {
           events: {
-            where: {
-              ...(startDate || endDate
-                ? {
-                    timestamp: {
-                      ...(startDate
-                        ? {
-                            gte: BigInt(Math.floor(startDate.getTime() / 1000)),
-                          }
-                        : {}),
-                      ...(endDate
-                        ? { lte: BigInt(Math.floor(endDate.getTime() / 1000)) }
-                        : {}),
-                    },
-                  }
-                : {}),
-            },
-            orderBy: { timestamp: "asc" },
+            where: eventWhere,
+            orderBy: [{ timestamp: "asc" }, { id: "asc" }],
           },
         },
       });
@@ -219,7 +323,7 @@ export async function streamTransactionCSV(
 
       const lastStream = streams[streams.length - 1];
       if (lastStream) {
-        cursor = lastStream.id;
+        cursor = { createdAt: lastStream.createdAt, id: lastStream.id };
       }
 
       if (streams.length < BATCH_SIZE) break;
@@ -245,23 +349,15 @@ export async function streamTransactionJSON(
   options: ExportOptions,
   res: Response,
 ): Promise<void> {
-  const { direction, startDate, endDate, tokenAddress } = options;
-
-  // Build where clause
-  const where: any = {
-    OR: [],
-  };
-
-  if (direction === "outgoing" || direction === "all") {
-    where.OR.push({ sender: userAddress });
-  }
-  if (direction === "incoming" || direction === "all") {
-    where.OR.push({ recipient: userAddress });
+  try {
+    validateExportOptions(options);
+  } catch (error) {
+    logger.warn("[Export] Invalid JSON export options:", error);
+    res.status(400).json({ error: (error as Error).message });
+    return;
   }
 
-  if (tokenAddress) {
-    where.tokenAddress = tokenAddress;
-  }
+  const where = buildWhereClause(userAddress, options);
 
   // Set response headers
   const filename = `flowfi-statement-${userAddress}-${new Date().toISOString().split("T")[0]}.json`;
@@ -273,8 +369,11 @@ export async function streamTransactionJSON(
   res.write('{"transactions":[');
 
   try {
-    const BATCH_SIZE = 100;
-    let cursor: string | undefined;
+    const snapshot = await captureSnapshot();
+    const eventWhere = buildEventWhere(options, snapshot);
+    const BATCH_SIZE = resolveBatchSize();
+
+    let cursor: { createdAt: bigint; id: string } | undefined;
     let processedCount = 0;
     let isFirst = true;
 
@@ -282,27 +381,17 @@ export async function streamTransactionJSON(
       const streams = await prisma.stream.findMany({
         where,
         take: BATCH_SIZE,
-        ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
-        orderBy: { createdAt: "asc" },
+        ...(cursor
+          ? {
+              skip: 1,
+              cursor: { createdAt_id: cursor },
+            }
+          : {}),
+        orderBy: [{ createdAt: "asc" }, { id: "asc" }],
         include: {
           events: {
-            where: {
-              ...(startDate || endDate
-                ? {
-                    timestamp: {
-                      ...(startDate
-                        ? {
-                            gte: BigInt(Math.floor(startDate.getTime() / 1000)),
-                          }
-                        : {}),
-                      ...(endDate
-                        ? { lte: BigInt(Math.floor(endDate.getTime() / 1000)) }
-                        : {}),
-                    },
-                  }
-                : {}),
-            },
-            orderBy: { timestamp: "asc" },
+            where: eventWhere,
+            orderBy: [{ timestamp: "asc" }, { id: "asc" }],
           },
         },
       });
@@ -324,7 +413,7 @@ export async function streamTransactionJSON(
 
       const lastStream = streams[streams.length - 1];
       if (lastStream) {
-        cursor = lastStream.id;
+        cursor = { createdAt: lastStream.createdAt, id: lastStream.id };
       }
 
       if (streams.length < BATCH_SIZE) break;

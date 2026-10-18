@@ -205,6 +205,73 @@ describe('SSE client receives broadcast for each stream event', () => {
   });
 });
 
+describe('Cross-wallet authorization on stream routes', () => {
+  const OTHER_WALLET = 'GOTHER987XYZ654DEF321GHI098JKL765MNO432PQR109STU876VWX543YZA';
+
+  beforeEach(() => { vi.clearAllMocks(); });
+
+  it('allows a wallet to read its own stream (sender)', async () => {
+    mockPrisma.stream.findUnique.mockResolvedValue(makeStream({ sender: 'GTEST_USER_PUBLIC_KEY' }));
+
+    const res = await request(app).get('/v1/streams/1');
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('streamId', 1);
+  });
+
+  it('allows a wallet to read its own stream (recipient)', async () => {
+    mockPrisma.stream.findUnique.mockResolvedValue(makeStream({ recipient: 'GTEST_USER_PUBLIC_KEY' }));
+
+    const res = await request(app).get('/v1/streams/1');
+    expect(res.status).toBe(200);
+  });
+
+  it('does not leak another wallet\'s stream details', async () => {
+    mockPrisma.stream.findUnique.mockResolvedValue(makeStream({ sender: OTHER_WALLET, recipient: OTHER_WALLET }));
+
+    const res = await request(app).get('/v1/streams/1');
+    // Either forbidden or not-found is acceptable; must not return the record.
+    expect([403, 404]).toContain(res.status);
+    expect(res.body).not.toHaveProperty('sender', OTHER_WALLET);
+    expect(res.body).not.toHaveProperty('recipient', OTHER_WALLET);
+  });
+
+  it('rejects mutation of another wallet\'s stream', async () => {
+    mockPrisma.stream.findUnique.mockResolvedValue(makeStream({ sender: OTHER_WALLET, recipient: OTHER_WALLET }));
+
+    const res = await request(app)
+      .post('/v1/streams/1/cancel')
+      .send({});
+    expect([403, 404]).toContain(res.status);
+    expect(mockPrisma.stream.update).not.toHaveBeenCalled();
+  });
+
+  it('keeps public stream listing accessible without ownership', async () => {
+    mockPrisma.stream.findMany.mockResolvedValue([makeStream({ sender: OTHER_WALLET, recipient: OTHER_WALLET })]);
+    mockPrisma.stream.count.mockResolvedValue(1);
+
+    const res = await request(app).get('/v1/streams');
+    expect(res.status).toBe(200);
+    expect(res.body).toHaveProperty('data');
+  });
+
+  it('returns standardized 400 shape for invalid path parameter', async () => {
+    const res = await request(app).get('/v1/streams/not-a-number/events');
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body.error).toHaveProperty('code');
+    expect(res.body.error).toHaveProperty('message');
+    expect(JSON.stringify(res.body)).not.toMatch(/at .*\.ts:\d+/);
+  });
+
+  it('returns standardized 400 shape for invalid query parameter', async () => {
+    const res = await request(app).get('/v1/streams/1/events?limit=abc');
+    expect(res.status).toBe(400);
+    expect(res.body).toHaveProperty('error');
+    expect(res.body.error).toHaveProperty('code');
+    expect(JSON.stringify(res.body)).not.toMatch(/at .*\.ts:\d+/);
+  });
+});
+
 describe('GET /v1/streams/:id/events — pagination and eventType filter', () => {
   beforeEach(() => { vi.clearAllMocks(); });
 

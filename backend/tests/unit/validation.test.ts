@@ -74,6 +74,45 @@ describe("schema validator middleware", () => {
     expect(names).toEqual(expect.arrayContaining(["x-client", "id"]));
   });
 
+  it("reports body, path, query, and header failures in a single response", async () => {
+    const res = await request(buildApp())
+      .post("/streams/abc?dryRun=maybe&debug=1")
+      .send({ duration: -5 });
+
+    expect(res.status).toBe(400);
+    expect(res.headers["content-type"]).toMatch(/application\/problem\+json/);
+    expect(res.body.type).toBe(INVALID_PARAMETERS_TYPE);
+    expect(res.body.status).toBe(400);
+    const names = res.body.invalidParams.map((p: { name: string }) => p.name);
+    expect(names).toEqual(expect.arrayContaining(["id", "dryRun", "debug", "x-client", "duration"]));
+    expect(res.body.invalidParams).toHaveLength(5);
+  });
+
+  it("forwards non-Zod errors to next without producing a problem response", async () => {
+    const app = express();
+    const boom = new Error("boom");
+    app.use(express.json());
+    app.post(
+      "/streams/:id",
+      validateRequest({
+        params: {
+          safeParse: () => {
+            throw boom;
+          },
+        } as unknown as z.ZodTypeAny,
+      }),
+      (_req, res) => res.json({ ok: true }),
+    );
+    app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+      res.status(500).json({ forwarded: err === boom });
+    });
+
+    const res = await request(app).post("/streams/42").send({});
+
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ forwarded: true });
+  });
+
   it("does not coerce string numbers in the body", async () => {
     const res = await request(buildApp()).post("/streams/42").set("x-client", "web").send({ duration: "10" });
     expect(res.status).toBe(400);
