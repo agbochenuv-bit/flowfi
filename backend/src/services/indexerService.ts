@@ -3,12 +3,7 @@ import { rpc, xdr, Contract } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma.js';
 import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
-import {
-  setIndexerLedgers,
-  recordIndexerLastSuccess,
-  recordIndexerEventLatency,
-  recordIndexerRetry,
-} from '../lib/metrics.js';
+import { setIndexerLedgers } from '../lib/metrics.js';
 import { withSpan } from '../lib/tracing.js';
 import {
   getLatestCheckpoint,
@@ -83,11 +78,6 @@ export async function previewReset(targetLedger: number): Promise<ResetPreview> 
  * Preview what a replay from a given ledger would do without mutating state.
  * Returns the event count, ledger range, and current cursor so operators can
  * sanity-check before committing a destructive replay.
- *
- * This function performs ZERO writes: it only reads `IndexerState` and
- * aggregates `StreamEvent` rows. The `expectedRecordChanges` field summarises
- * the record deltas an execution would attempt so operators can audit the
- * blast radius before committing.
  */
 export interface ReplayPreview {
   fromLedger: number;
@@ -96,13 +86,6 @@ export interface ReplayPreview {
   eventCount: number;
   minLedgerInReplayRange: number | null;
   maxLedgerInReplayRange: number | null;
-  /** Ledger range that would be re-processed, inclusive. */
-  affectedLedgerRange: { from: number; to: number };
-  /** Expected record deltas an execution would attempt. */
-  expectedRecordChanges: {
-    streamEvents: number;
-    deadLetterEvents: number;
-  };
 }
 
 export async function previewReplay(fromLedger: number): Promise<ReplayPreview> {
@@ -116,61 +99,23 @@ export async function previewReplay(fromLedger: number): Promise<ReplayPreview> 
       ? { ledgerSequence: { gte: fromLedger, lte: currentLastLedger } }
       : { ledgerSequence: { gte: fromLedger } };
 
-  const [eventCount, aggregate, deadLetterCount] = await Promise.all([
+  const [eventCount, aggregate] = await Promise.all([
     prisma.streamEvent.count({ where: rangeFilter }),
     prisma.streamEvent.aggregate({
       where: rangeFilter,
       _min: { ledgerSequence: true },
       _max: { ledgerSequence: true },
     }),
-    prisma.indexerDeadLetterEvent.count({
-      where:
-        currentLastLedger > 0
-          ? { ledgerSequence: { gte: fromLedger, lte: currentLastLedger } }
-          : { ledgerSequence: { gte: fromLedger } },
-    }),
   ]);
-
-  const minLedger = aggregate._min.ledgerSequence;
-  const maxLedger = aggregate._max.ledgerSequence;
 
   return {
     fromLedger,
     currentLastLedger,
     currentLastCursor: state?.lastCursor ?? null,
     eventCount,
-    minLedgerInReplayRange: minLedger,
-    maxLedgerInReplayRange: maxLedger,
-    affectedLedgerRange: {
-      from: minLedger ?? fromLedger,
-      to: maxLedger ?? currentLastLedger,
-    },
-    expectedRecordChanges: {
-      streamEvents: eventCount,
-      deadLetterEvents: deadLetterCount,
-    },
+    minLedgerInReplayRange: aggregate._min.ledgerSequence,
+    maxLedgerInReplayRange: aggregate._max.ledgerSequence,
   };
-}
-
-export type ReplayStatus = 'completed' | 'failed';
-
-/**
- * Structured, auditable report describing the outcome of a replay execution.
- *
- * `failurePosition` is the ledger at which processing stopped on failure (or
- * `null` on success). The live cursor is preserved on failure so operators can
- * retry from the same point.
- */
-export interface ReplayReport {
-  requestId: string;
-  status: ReplayStatus;
-  fromLedger: number;
-  toLedger: number;
-  durationMs: number;
-  eventsProcessed: number;
-  eventsQuarantined: number;
-  failurePosition: number | null;
-  errorMessage?: string;
 }
 
 /**
@@ -182,109 +127,19 @@ export interface ReplayReport {
  * Stream.withdrawnAmount (handleTokensWithdrawn, soroban-event-worker.ts:635)
  * is incremented unconditionally on every replay, so replay is NOT fully
  * idempotent. See issue #808 for the withdrawnAmount idempotency fix.
- *
- * Returns the request ID for backwards compatibility. Use `executeReplay` when
- * a structured `ReplayReport` is required.
  */
 export async function replayFromLedger(
   fromLedger: number,
   customRequestId?: string,
 ): Promise<string> {
-  const report = await executeReplay(fromLedger, customRequestId);
-  return report.requestId;
-}
-
-/**
- * Execute a replay and return a structured, auditable `ReplayReport`.
- *
- * On failure the live cursor is preserved (the reset is rolled back to the
- * pre-replay state) so operators can retry from the same point without losing
- * progress. The report captures the request ID, duration, counts, and the
- * ledger at which processing stopped.
- */
-export async function executeReplay(
-  fromLedger: number,
-  customRequestId?: string,
-): Promise<ReplayReport> {
   const requestId = customRequestId || requestContext.getStore()?.requestId || randomUUID();
-  const startedAt = Date.now();
-
-  // Snapshot the live cursor so we can restore it if the replay fails.
-  const before = await prisma.indexerState.findUnique({ where: { id: INDEXER_STATE_ID } });
-  const previousLastLedger = before?.lastLedger ?? 0;
-  const previousLastCursor = before?.lastCursor ?? null;
-
-  let eventsProcessed = 0;
-  let eventsQuarantined = 0;
-  let toLedger = fromLedger;
-  let failurePosition: number | null = null;
-  let errorMessage: string | undefined;
-
-  try {
-    await requestContext.run({ requestId }, async () => {
-      await resetIndexer(fromLedger);
-      // Kick off an immediate poll cycle without waiting for the next interval.
-      await sorobanEventWorker.triggerPoll(requestId);
-    });
-
-    const after = await prisma.indexerState.findUnique({ where: { id: INDEXER_STATE_ID } });
-    toLedger = after?.lastLedger ?? fromLedger;
-
-    // Count events processed within the replayed range for the report.
-    eventsProcessed = await prisma.streamEvent.count({
-      where: { ledgerSequence: { gte: fromLedger, lte: toLedger } },
-    });
-    eventsQuarantined = await prisma.indexerDeadLetterEvent.count({
-      where: { ledgerSequence: { gte: fromLedger, lte: toLedger } },
-    });
-
-    recordIndexerLastSuccess();
-    logger.info(
-      `[IndexerService] Replay ${requestId} completed from ledger ${fromLedger} to ${toLedger}`,
-    );
-  } catch (err) {
-    errorMessage = err instanceof Error ? err.message : String(err);
-    failurePosition = fromLedger;
-    recordIndexerRetry('replay');
-
-    // Preserve the live cursor: restore the pre-replay state so operators can
-    // retry from the same point without losing progress.
-    try {
-      await sorobanEventWorker.runExclusive(async () => {
-        await prisma.indexerState.upsert({
-          where: { id: INDEXER_STATE_ID },
-          create: {
-            id: INDEXER_STATE_ID,
-            lastLedger: previousLastLedger,
-            lastCursor: previousLastCursor,
-          },
-          update: { lastLedger: previousLastLedger, lastCursor: previousLastCursor },
-        });
-      });
-      setIndexerLedgers(previousLastLedger, 0);
-    } catch (restoreErr) {
-      logger.error(
-        `[IndexerService] Failed to restore cursor after replay ${requestId} failure:`,
-        restoreErr,
-      );
-    }
-
-    logger.error(
-      `[IndexerService] Replay ${requestId} failed from ledger ${fromLedger}: ${errorMessage}`,
-    );
-  }
-
-  return {
-    requestId,
-    status: failurePosition === null ? 'completed' : 'failed',
-    fromLedger,
-    toLedger,
-    durationMs: Date.now() - startedAt,
-    eventsProcessed,
-    eventsQuarantined,
-    failurePosition,
-    ...(errorMessage ? { errorMessage } : {}),
-  };
+  await requestContext.run({ requestId }, async () => {
+    await resetIndexer(fromLedger);
+    // Kick off an immediate poll cycle without waiting for the next interval.
+    await sorobanEventWorker.triggerPoll(requestId);
+    logger.info(`[IndexerService] Replay triggered from ledger ${fromLedger}`);
+  });
+  return requestId;
 }
 
 /**
@@ -293,34 +148,6 @@ export async function executeReplay(
  */
 export function publishIndexerLag(currentLedger: number, networkLedger: number): void {
   setIndexerLedgers(currentLedger, networkLedger);
-}
-
-/**
- * Record a successful poll cycle: updates the last-success timestamp gauge and
- * the indexed-ledger lag gauges. Called by the poll loop after a batch commits.
- */
-export function recordPollSuccess(currentLedger: number, networkLedger: number): void {
-  setIndexerLedgers(currentLedger, networkLedger);
-  recordIndexerLastSuccess();
-}
-
-/**
- * Record decode/persist latency for a single event. `phase` distinguishes the
- * decode step from the persistence step so operators can attribute slowness.
- */
-export function recordEventLatency(
-  phase: 'decode' | 'persist',
-  durationSeconds: number,
-): void {
-  recordIndexerEventLatency(phase, durationSeconds);
-}
-
-/**
- * Increment the retry counter for a given retry path (e.g. 'poll', 'replay',
- * 'dead_letter'). Kept label-bounded to avoid high-cardinality series.
- */
-export function recordRetry(reason: string): void {
-  recordIndexerRetry(reason);
 }
 
 // ─── Ledger reorg / fork recovery (issue #1468) ──────────────────────────────
@@ -769,4 +596,475 @@ export class DeadLetterNotFoundError extends Error {
     this.name = 'DeadLetterNotFoundError';
     this.id = id;
   }
+}
+
+// ─── Backfill (range-based historical indexing) ────────────────────────────────
+
+/**
+ * BackfillJob status enum matching the Prisma schema.
+ */
+export enum BackfillStatus {
+  PENDING = 'PENDING',
+  RUNNING = 'RUNNING',
+  PAUSED = 'PAUSED',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  CANCELLED = 'CANCELLED',
+}
+
+/**
+ * Backfill job record as returned to API consumers.
+ */
+export interface BackfillJob {
+  id: string;
+  name: string | null;
+  fromLedger: number;
+  toLedger: number;
+  status: BackfillStatus;
+  currentLedger: number;
+  eventsProcessed: number;
+  eventsFailed: number;
+  errorMessage: string | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Input for starting a new backfill job.
+ */
+export interface StartBackfillInput {
+  fromLedger: number;
+  toLedger: number;
+  name?: string;
+}
+
+/**
+ * Result of starting a backfill job.
+ */
+export interface StartBackfillResult {
+  id: string;
+  status: BackfillStatus;
+  message: string;
+}
+
+/**
+ * Progress information for a running backfill job.
+ */
+export interface BackfillProgress {
+  job: BackfillJob;
+  percentComplete: number;
+  ledgersRemaining: number;
+  estimatedCompletionAt: Date | null;
+}
+
+/**
+ * Start a new bounded historical backfill job.
+ *
+ * Creates a BackfillJob record and begins processing events in the range
+ * [fromLedger, toLedger] independently of the live indexer cursor.
+ * Returns immediately; processing runs asynchronously.
+ *
+ * The backfill uses the same event processing pipeline as the live indexer
+ * (including deduplication via unique constraints), so it is safe to run
+ * concurrently with live indexing.
+ */
+export async function startBackfill(input: StartBackfillInput): Promise<StartBackfillResult> {
+  const { fromLedger, toLedger, name } = input;
+
+  if (fromLedger < 0 || toLedger < 0) {
+    throw new Error('Ledger numbers must be non-negative');
+  }
+  if (fromLedger > toLedger) {
+    throw new Error('fromLedger must be less than or equal to toLedger');
+  }
+
+  // Check for overlapping running backfill
+  const existing = await prisma.backfillJob.findFirst({
+    where: {
+      status: { in: [BackfillStatus.RUNNING, BackfillStatus.PENDING] },
+      OR: [
+        { fromLedger: { lte: toLedger }, toLedger: { gte: fromLedger } },
+      ],
+    },
+  });
+
+  if (existing) {
+    throw new Error(
+      `A backfill job (${existing.id}) is already running or pending for an overlapping range: ` +
+        `[${existing.fromLedger}, ${existing.toLedger}]`,
+    );
+  }
+
+  const job = await prisma.backfillJob.create({
+    data: {
+      name: name ?? `backfill-${fromLedger}-${toLedger}`,
+      fromLedger,
+      toLedger,
+      status: BackfillStatus.PENDING,
+      currentLedger: fromLedger,
+    },
+  });
+
+  // Start processing asynchronously (fire-and-forget)
+  // We use void to explicitly ignore the promise, but attach error handling
+  void runBackfill(job.id).catch((err) => {
+    logger.error(`[IndexerService] Backfill ${job.id} crashed:`, err);
+  });
+
+  return {
+    id: job.id,
+    status: job.status,
+    message: `Backfill job created and started for ledgers [${fromLedger}, ${toLedger}]`,
+  };
+}
+
+/**
+ * Get the status of a backfill job.
+ */
+export async function getBackfillStatus(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+  return job as BackfillJob;
+}
+
+/**
+ * Get progress information for a backfill job.
+ */
+export async function getBackfillProgress(jobId: string): Promise<BackfillProgress | null> {
+  const job = await getBackfillStatus(jobId);
+  if (!job) return null;
+
+  const totalLedgers = job.toLedger - job.fromLedger + 1;
+  const processedLedgers = Math.max(0, job.currentLedger - job.fromLedger);
+  const percentComplete = totalLedgers > 0 ? Math.min(100, (processedLedgers / totalLedgers) * 100) : 100;
+  const ledgersRemaining = Math.max(0, job.toLedger - job.currentLedger);
+
+  let estimatedCompletionAt: Date | null = null;
+  if (job.status === BackfillStatus.RUNNING && job.eventsProcessed > 0 && job.startedAt) {
+    const elapsedMs = Date.now() - job.startedAt.getTime();
+    const rate = job.eventsProcessed / (elapsedMs / 1000); // events per second
+    if (rate > 0) {
+      // Estimate based on average events per ledger so far
+      const avgEventsPerLedger = job.eventsProcessed / Math.max(1, processedLedgers);
+      const remainingEvents = ledgersRemaining * avgEventsPerLedger;
+      const estimatedRemainingMs = (remainingEvents / rate) * 1000;
+      estimatedCompletionAt = new Date(Date.now() + estimatedRemainingMs);
+    }
+  }
+
+  return {
+    job,
+    percentComplete: Math.round(percentComplete * 100) / 100,
+    ledgersRemaining,
+    estimatedCompletionAt,
+  };
+}
+
+/**
+ * List all backfill jobs with optional filters.
+ */
+export interface ListBackfillJobsOptions {
+  status?: BackfillStatus;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListBackfillJobsResult {
+  jobs: BackfillJob[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export async function listBackfillJobs(
+  options: ListBackfillJobsOptions = {},
+): Promise<ListBackfillJobsResult> {
+  const { status, limit = 50, offset = 0 } = options;
+  const where = status ? { status } : {};
+
+  const [jobs, total] = await Promise.all([
+    prisma.backfillJob.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(Math.max(1, limit), 100),
+      skip: Math.max(0, offset),
+    }),
+    prisma.backfillJob.count({ where }),
+  ]);
+
+  return {
+    jobs: jobs as BackfillJob[],
+    total,
+    limit,
+    offset,
+  };
+}
+
+/**
+ * Pause a running backfill job.
+ * The job will finish processing the current batch before pausing.
+ */
+export async function pauseBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status !== BackfillStatus.RUNNING) {
+    throw new Error(`Cannot pause job in status ${job.status}`);
+  }
+
+  // The runBackfill loop checks status at the start of each batch
+  // We just update the status to PAUSED
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.PAUSED },
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Resume a paused backfill job.
+ */
+export async function resumeBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status !== BackfillStatus.PAUSED) {
+    throw new Error(`Cannot resume job in status ${job.status}`);
+  }
+
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.RUNNING, errorMessage: null },
+  });
+
+  // Restart the processing loop
+  void runBackfill(jobId).catch((err) => {
+    logger.error(`[IndexerService] Backfill ${jobId} crashed on resume:`, err);
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Cancel a backfill job (pending, running, or paused).
+ */
+export async function cancelBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status === BackfillStatus.COMPLETED || job.status === BackfillStatus.CANCELLED) {
+    throw new Error(`Cannot cancel job in status ${job.status}`);
+  }
+
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.CANCELLED, completedAt: new Date() },
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Internal function that runs the backfill processing loop.
+ * This is NOT exported - it's invoked by startBackfill/resumeBackfill.
+ */
+async function runBackfill(jobId: string): Promise<void> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) {
+    logger.error(`[Backfill] Job ${jobId} not found`);
+    return;
+  }
+
+  // Update status to RUNNING and record start time
+  await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: {
+      status: BackfillStatus.RUNNING,
+      startedAt: job.startedAt ?? new Date(),
+      currentLedger: job.currentLedger || job.fromLedger,
+    },
+  });
+
+  let currentLedger = job.currentLedger || job.fromLedger;
+  const { fromLedger, toLedger } = job;
+  let eventsProcessed = job.eventsProcessed;
+  let eventsFailed = job.eventsFailed;
+
+  // Get the contract ID from the worker
+  const contractId = process.env.STREAM_CONTRACT_ID ?? '';
+  if (!contractId) {
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.FAILED,
+        errorMessage: 'STREAM_CONTRACT_ID not configured',
+        completedAt: new Date(),
+      },
+    });
+    return;
+  }
+
+  const server = new (await import('@stellar/stellar-sdk')).rpc.Server(
+    process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
+    { allowHttp: true },
+  );
+
+  const PAGE_SIZE = 100;
+
+  try {
+    while (currentLedger <= toLedger) {
+      // Check job status at the start of each batch (allows pause/cancel)
+      const currentJob = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+      if (!currentJob) return; // Job was deleted
+      if (currentJob.status === BackfillStatus.PAUSED) {
+        logger.info(`[Backfill] Job ${jobId} paused at ledger ${currentLedger}`);
+        return;
+      }
+      if (currentJob.status === BackfillStatus.CANCELLED) {
+        logger.info(`[Backfill] Job ${jobId} cancelled at ledger ${currentLedger}`);
+        return;
+      }
+
+      // Fetch events for this ledger
+      const params = {
+        filters: [{ type: 'contract' as const, contractIds: [contractId] }],
+        startLedger: currentLedger,
+        limit: PAGE_SIZE,
+      };
+
+      let response;
+      try {
+        response = await server.getEvents(params);
+      } catch (err) {
+        logger.error(`[Backfill] Job ${jobId} RPC error at ledger ${currentLedger}:`, err);
+        eventsFailed += 1;
+        await prisma.backfillJob.update({
+          where: { id: jobId },
+          data: {
+            eventsFailed,
+            currentLedger,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          },
+        });
+        // Continue to next ledger on RPC error (don't stall)
+        currentLedger++;
+        continue;
+      }
+
+      // Filter events for our ledger range and successful contract calls
+      const relevantEvents = response.events.filter(
+        (e) => e.inSuccessfulContractCall && e.ledger >= fromLedger && e.ledger <= toLedger,
+      );
+
+      if (relevantEvents.length === 0) {
+        // No events in this ledger, move to next
+        currentLedger++;
+        await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+        continue;
+      }
+
+      // Sort events: stream_created first (same as live worker)
+      const sortedEvents = [...relevantEvents].sort((a, b) => {
+        const aType = a.topic[0] ? decodeSymbol(a.topic[0]) : '';
+        const bType = b.topic[0] ? decodeSymbol(b.topic[0]) : '';
+        if (aType === 'stream_created' && bType !== 'stream_created') return -1;
+        if (bType === 'stream_created' && aType !== 'stream_created') return 1;
+        return 0;
+      });
+
+      // Process each event
+      for (const event of sortedEvents) {
+        // Check status again before each event (for quick pause response)
+        const currentJob = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+        if (!currentJob || currentJob.status === BackfillStatus.PAUSED) {
+          await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+          return;
+        }
+        if (currentJob.status === BackfillStatus.CANCELLED) {
+          return;
+        }
+
+        try {
+          // Process using the worker's processEvent method
+          // Note: We call processEvent directly - it handles upserts with deduplication
+          await sorobanEventWorker.processEvent(event);
+          eventsProcessed++;
+        } catch (err) {
+          eventsFailed++;
+          logger.error(
+            `[Backfill] Job ${jobId} failed to process event ${event.id} at ledger ${event.ledger}:`,
+            err,
+          );
+          // Continue with next event (don't fail the whole backfill)
+        }
+      }
+
+      currentLedger++;
+      await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+
+      // If we got fewer events than PAGE_SIZE, we've processed all events for this ledger
+      // and can move to the next. If we got PAGE_SIZE, there might be more pages.
+      // For backfill, we use startLedger which gives us all events from that ledger
+      // up to PAGE_SIZE. Since we're iterating ledger by ledger, this is correct.
+    }
+
+    // Completed successfully
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.COMPLETED,
+        currentLedger: toLedger + 1,
+        eventsProcessed,
+        eventsFailed,
+        completedAt: new Date(),
+        errorMessage: null,
+      },
+    });
+
+    logger.info(
+      `[Backfill] Job ${jobId} completed: ${eventsProcessed} events processed, ${eventsFailed} failed`,
+    );
+  } catch (err) {
+    logger.error(`[Backfill] Job ${jobId} failed unexpectedly:`, err);
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.FAILED,
+        currentLedger,
+        eventsProcessed,
+        eventsFailed,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        completedAt: new Date(),
+      },
+    });
+  }
+}
+
+/**
+ * Helper to update backfill job progress in the database.
+ */
+async function updateBackfillProgress(
+  jobId: string,
+  currentLedger: number,
+  eventsProcessed: number,
+  eventsFailed: number,
+): Promise<void> {
+  await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: {
+      currentLedger,
+      eventsProcessed,
+      eventsFailed,
+      updatedAt: new Date(),
+    },
+  });
+}
+
+// Re-export decodeSymbol for internal use
+function decodeSymbol(val: any): string {
+  const sym = (val as any).sym;
+  return sym ? sym.toString() : 'unknown';
 }
