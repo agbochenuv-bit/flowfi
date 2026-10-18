@@ -63,39 +63,41 @@ function calculateStreamRunway(stream: any, now: number): RunwayCalculation {
 }
 
 /**
- * Check if alert was recently sent to prevent spam
+ * Compute the deterministic deduplication window start for a given time.
+ * Time is floored to the DEDUPLICATION_WINDOW_HOURS bucket so that restarts,
+ * clock skew, and parallel replicas all resolve to the same window key.
  */
-async function wasAlertRecentlySent(
-  streamId: bigint,
-  alertType: string,
-): Promise<boolean> {
-  const cutoff = new Date(
-    Date.now() - DEDUPLICATION_WINDOW_HOURS * 60 * 60 * 1000,
-  );
-
-  const recent = await prisma.alertHistory.findFirst({
-    where: {
-      streamId,
-      alertType,
-      sentAt: {
-        gte: cutoff,
-      },
-    },
-  });
-
-  return !!recent;
+function getWindowStart(nowMs: number): Date {
+  const windowMs = DEDUPLICATION_WINDOW_HOURS * 60 * 60 * 1000;
+  return new Date(Math.floor(nowMs / windowMs) * windowMs);
 }
 
 /**
- * Record alert in history
+ * Attempt to claim an alert for the given (streamId, alertType, windowStart).
+ * Returns true only if this call created the row (i.e. the alert should be
+ * emitted). A Prisma P2002 unique-constraint violation means another worker
+ * (or a previous run) already claimed this window, so we return false.
  */
-async function recordAlert(streamId: bigint, alertType: string): Promise<void> {
-  await prisma.alertHistory.create({
-    data: {
-      streamId,
-      alertType,
-    },
-  });
+async function claimAlert(
+  streamId: bigint,
+  alertType: string,
+  windowStart: Date,
+): Promise<boolean> {
+  try {
+    await prisma.alertHistory.create({
+      data: {
+        streamId,
+        alertType,
+        windowStart,
+      },
+    });
+    return true;
+  } catch (error: any) {
+    if (error?.code === "P2002") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -137,10 +139,22 @@ async function sendLowBalanceAlert(
 }
 
 /**
- * Main worker function - runs every hour
+ * Main worker function - runs every hour.
+ *
+ * Externally observable behavior:
+ * - Each stream/policy (WARNING_48H, CRITICAL_24H) emits at most one alert per
+ *   deduplication window. The window is derived by flooring the current time to
+ *   the DEDUPLICATION_WINDOW_HOURS bucket, so restarts, clock skew, and parallel
+ *   replicas converge on the same (streamId, alertType, windowStart) key.
+ * - SSE broadcasts only fire when the alert row is actually inserted, so
+ *   concurrent workers never double-emit.
+ * - The optional `clock` parameter (defaults to `() => Date.now()`) allows tests
+ *   to control time deterministically.
  */
-export async function runStreamRunwayCheck(): Promise<void> {
-  const startTime = Date.now();
+export async function runStreamRunwayCheck(
+  clock: () => number = () => Date.now(),
+): Promise<void> {
+  const startTime = clock();
   logger.info("[RunwayWorker] Starting runway check...");
 
   try {
@@ -156,7 +170,9 @@ export async function runStreamRunwayCheck(): Promise<void> {
       `[RunwayWorker] Checking ${activeStreams.length} active streams`,
     );
 
-    const now = Math.floor(Date.now() / 1000);
+    const nowMs = clock();
+    const now = Math.floor(nowMs / 1000);
+    const windowStart = getWindowStart(nowMs);
     let warningsSent = 0;
     let criticalsSent = 0;
 
@@ -166,15 +182,19 @@ export async function runStreamRunwayCheck(): Promise<void> {
 
         // Check critical threshold (24 hours)
         if (runway.remainingRunwaySeconds <= CRITICAL_THRESHOLD_HOURS * 3600) {
-          const alreadySent = await wasAlertRecentlySent(
+          const claimed = await claimAlert(
             stream.streamId,
             "CRITICAL_24H",
+            windowStart,
           );
 
-          if (!alreadySent) {
+          if (claimed) {
             await sendLowBalanceAlert(runway, "CRITICAL_24H");
-            await recordAlert(stream.streamId, "CRITICAL_24H");
             criticalsSent++;
+          } else {
+            logger.info(
+              `[RunwayWorker] Skipping CRITICAL_24H for stream ${stream.streamId}: already sent in window ${windowStart.toISOString()}`,
+            );
           }
         }
         // Check warning threshold (48 hours)
@@ -182,15 +202,19 @@ export async function runStreamRunwayCheck(): Promise<void> {
           runway.remainingRunwaySeconds <=
           WARNING_THRESHOLD_HOURS * 3600
         ) {
-          const alreadySent = await wasAlertRecentlySent(
+          const claimed = await claimAlert(
             stream.streamId,
             "WARNING_48H",
+            windowStart,
           );
 
-          if (!alreadySent) {
+          if (claimed) {
             await sendLowBalanceAlert(runway, "WARNING_48H");
-            await recordAlert(stream.streamId, "WARNING_48H");
             warningsSent++;
+          } else {
+            logger.info(
+              `[RunwayWorker] Skipping WARNING_48H for stream ${stream.streamId}: already sent in window ${windowStart.toISOString()}`,
+            );
           }
         }
       } catch (error) {
@@ -201,7 +225,7 @@ export async function runStreamRunwayCheck(): Promise<void> {
       }
     }
 
-    const duration = Date.now() - startTime;
+    const duration = clock() - startTime;
     logger.info(
       `[RunwayWorker] Check complete in ${duration}ms. Warnings: ${warningsSent}, Critical: ${criticalsSent}`,
     );
@@ -213,17 +237,19 @@ export async function runStreamRunwayCheck(): Promise<void> {
 /**
  * Start the worker with hourly interval
  */
-export function startStreamRunwayWorker(): NodeJS.Timeout {
+export function startStreamRunwayWorker(
+  clock: () => number = () => Date.now(),
+): NodeJS.Timeout {
   const INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
   // Run immediately on start
-  runStreamRunwayCheck().catch((error) => {
+  runStreamRunwayCheck(clock).catch((error) => {
     logger.error("[RunwayWorker] Initial run failed:", error);
   });
 
   // Schedule hourly runs
   const timer = setInterval(() => {
-    runStreamRunwayCheck().catch((error) => {
+    runStreamRunwayCheck(clock).catch((error) => {
       logger.error("[RunwayWorker] Scheduled run failed:", error);
     });
   }, INTERVAL_MS);

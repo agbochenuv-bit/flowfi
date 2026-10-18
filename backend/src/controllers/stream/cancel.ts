@@ -6,6 +6,11 @@ import type { AuthenticatedRequest } from '../../types/auth.types.js';
 import * as streamRepository from '../../repositories/stream.repository.js';
 import { parseStreamId } from '../../lib/stream-id.js';
 import { sendApiError } from '../../types/api-error.js';
+import {
+  getIdempotencyContext,
+  runIdempotentCommand,
+  type IdempotencyContext,
+} from '../../lib/idempotency.js';
 
 /**
  * @openapi
@@ -81,23 +86,52 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
       return sendApiError(res, 409, 'CONFLICT', 'Stream is already cancelled or completed');
     }
 
-    // 4. Call Soroban service to cancel on-chain
+    // 4. Validate request payload before touching the idempotency store
     const senderSecret = req.body?.senderSecret;
     if (typeof senderSecret !== 'string' || senderSecret.length === 0) {
       return sendApiError(res, 400, 'INVALID_REQUEST', 'senderSecret is required');
     }
 
-    const txHash = await sorobanService.cancelStream(parsedStreamId, senderSecret);
+    // 5. Resolve the idempotency context (if the client supplied a key).
+    //    The context binds the key to the wallet, operation and request hash.
+    let idempotencyContext: IdempotencyContext | null;
+    try {
+      idempotencyContext = await getIdempotencyContext(req, {
+        wallet: callerAddress,
+        operation: 'stream.cancel',
+        request: { streamId: parsedStreamId },
+      });
+    } catch (idempotencyError) {
+      if (idempotencyError instanceof Error && idempotencyError.name === 'IdempotencyConflictError') {
+        return sendApiError(
+          res,
+          422,
+          'IDEMPOTENCY_KEY_REUSED',
+          'Idempotency key was reused with a different request payload',
+        );
+      }
+      throw idempotencyError;
+    }
 
-    // 5. Update DB record status using repository helper
-    await streamRepository.updateStatus(parsedStreamId, 'CANCELLED');
+    // 6. Execute the command at most once. On retry with the same key the stored
+    //    result is returned instead of submitting another on-chain transaction.
+    const { result } = await runIdempotentCommand(
+      idempotencyContext,
+      async () => {
+        const txHash = await sorobanService.cancelStream(parsedStreamId, senderSecret);
 
-    logger.info(`[CancelStream] Stream ${parsedStreamId} cancelled by ${callerAddress}. Tx: ${txHash}`);
+        // Update DB record status using repository helper
+        await streamRepository.updateStatus(parsedStreamId, 'CANCELLED');
 
-    return res.status(200).json({ 
-      txHash, 
-      status: 'CANCELLED' 
-    });
+        logger.info(
+          `[CancelStream] Stream ${parsedStreamId} cancelled by ${callerAddress}. Tx: ${txHash}`,
+        );
+
+        return { txHash, status: 'CANCELLED' as const };
+      },
+    );
+
+    return res.status(200).json(result);
   } catch (error) {
     logger.error('Error cancelling stream:', error);
     if (error instanceof Error && error.message.includes('Simulation failed')) {

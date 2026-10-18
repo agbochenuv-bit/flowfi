@@ -12,6 +12,11 @@ import {
   sendDeadLetterAlert,
   type DeadLetterAlert,
 } from '../src/services/alert.service.js';
+import {
+  evaluateOperationalAlerts,
+  resetOperationalAlertState,
+  type OperationalAlertSignals,
+} from '../src/services/alert.service.js';
 
 const ALERT: DeadLetterAlert = {
   eventId: 'event-0001',
@@ -160,5 +165,265 @@ describe('sendDeadLetterAlert', () => {
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('ECONNREFUSED')));
 
     await expect(sendDeadLetterAlert(ALERT)).resolves.toBe(false);
+  });
+});
+
+const SECRET = 'super-secret-token-value';
+const RAW_PAYLOAD = '{"rawEventPayload":"leaked-body"}';
+
+function signals(overrides: Partial<OperationalAlertSignals> = {}): OperationalAlertSignals {
+  return {
+    deadLetterCount: 0,
+    indexerLagSeconds: 0,
+    rpcFailureCount: 0,
+    ...overrides,
+  };
+}
+
+describe('operational alert thresholds', () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved['ALERT_WEBHOOK_URL'] = process.env.ALERT_WEBHOOK_URL;
+    process.env.ALERT_WEBHOOK_URL = 'https://hooks.slack.com/services/x';
+    resetOperationalAlertState();
+  });
+
+  afterEach(() => {
+    if (saved['ALERT_WEBHOOK_URL'] === undefined) delete process.env.ALERT_WEBHOOK_URL;
+    else process.env.ALERT_WEBHOOK_URL = saved['ALERT_WEBHOOK_URL'];
+    resetOperationalAlertState();
+    vi.unstubAllGlobals();
+  });
+
+  it('does not fire below the dead-letter threshold', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await evaluateOperationalAlerts(signals({ deadLetterCount: 9 }), {
+      deadLetterThreshold: 10,
+    });
+    expect(result.fired).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('fires exactly at the dead-letter threshold boundary', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await evaluateOperationalAlerts(signals({ deadLetterCount: 10 }), {
+      deadLetterThreshold: 10,
+    });
+    expect(result.fired).toContain('dead_letter_growth');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('fires above the dead-letter threshold', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await evaluateOperationalAlerts(signals({ deadLetterCount: 42 }), {
+      deadLetterThreshold: 10,
+    });
+    expect(result.fired).toContain('dead_letter_growth');
+  });
+
+  it('fires at and above the indexer lag threshold', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const below = await evaluateOperationalAlerts(signals({ indexerLagSeconds: 299 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(below.fired).toEqual([]);
+
+    const at = await evaluateOperationalAlerts(signals({ indexerLagSeconds: 300 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(at.fired).toContain('indexer_lag');
+
+    const above = await evaluateOperationalAlerts(signals({ indexerLagSeconds: 900 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(above.fired).toContain('indexer_lag');
+  });
+
+  it('fires at and above the RPC failure threshold', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const below = await evaluateOperationalAlerts(signals({ rpcFailureCount: 4 }), {
+      rpcFailureThreshold: 5,
+    });
+    expect(below.fired).toEqual([]);
+
+    const at = await evaluateOperationalAlerts(signals({ rpcFailureCount: 5 }), {
+      rpcFailureThreshold: 5,
+    });
+    expect(at.fired).toContain('rpc_failure');
+
+    const above = await evaluateOperationalAlerts(signals({ rpcFailureCount: 12 }), {
+      rpcFailureThreshold: 5,
+    });
+    expect(above.fired).toContain('rpc_failure');
+  });
+});
+
+describe('operational alert deduplication and recovery', () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved['ALERT_WEBHOOK_URL'] = process.env.ALERT_WEBHOOK_URL;
+    process.env.ALERT_WEBHOOK_URL = 'https://hooks.slack.com/services/x';
+    resetOperationalAlertState();
+  });
+
+  afterEach(() => {
+    if (saved['ALERT_WEBHOOK_URL'] === undefined) delete process.env.ALERT_WEBHOOK_URL;
+    else process.env.ALERT_WEBHOOK_URL = saved['ALERT_WEBHOOK_URL'];
+    resetOperationalAlertState();
+    vi.unstubAllGlobals();
+  });
+
+  it('suppresses a second alert within the cooldown window', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const first = await evaluateOperationalAlerts(signals({ deadLetterCount: 20 }), {
+      deadLetterThreshold: 10,
+      cooldownMs: 60_000,
+    });
+    expect(first.fired).toContain('dead_letter_growth');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const second = await evaluateOperationalAlerts(signals({ deadLetterCount: 25 }), {
+      deadLetterThreshold: 10,
+      cooldownMs: 60_000,
+    });
+    expect(second.fired).toEqual([]);
+    expect(second.suppressed).toContain('dead_letter_growth');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('re-fires after the cooldown elapses', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await evaluateOperationalAlerts(signals({ deadLetterCount: 20 }), {
+      deadLetterThreshold: 10,
+      cooldownMs: 1_000,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await evaluateOperationalAlerts(signals({ deadLetterCount: 20 }), {
+      deadLetterThreshold: 10,
+      cooldownMs: 1_000,
+      now: Date.now() + 5_000,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('sends exactly one recovery notification then goes silent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await evaluateOperationalAlerts(signals({ indexerLagSeconds: 600 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const recovered = await evaluateOperationalAlerts(signals({ indexerLagSeconds: 0 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(recovered.recovered).toContain('indexer_lag');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const silent = await evaluateOperationalAlerts(signals({ indexerLagSeconds: 0 }), {
+      indexerLagThresholdSeconds: 300,
+    });
+    expect(silent.recovered).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not send a recovery notification when nothing was firing', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await evaluateOperationalAlerts(signals({ rpcFailureCount: 0 }), {
+      rpcFailureThreshold: 5,
+    });
+    expect(result.recovered).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('operational alerts with disabled integrations', () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved['ALERT_WEBHOOK_URL'] = process.env.ALERT_WEBHOOK_URL;
+    delete process.env.ALERT_WEBHOOK_URL;
+    resetOperationalAlertState();
+  });
+
+  afterEach(() => {
+    if (saved['ALERT_WEBHOOK_URL'] === undefined) delete process.env.ALERT_WEBHOOK_URL;
+    else process.env.ALERT_WEBHOOK_URL = saved['ALERT_WEBHOOK_URL'];
+    resetOperationalAlertState();
+    vi.unstubAllGlobals();
+  });
+
+  it('performs no fetch and reports not delivered when unconfigured', async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+
+    const result = await evaluateOperationalAlerts(signals({ deadLetterCount: 100 }), {
+      deadLetterThreshold: 10,
+    });
+    expect(result.fired).toContain('dead_letter_growth');
+    expect(result.delivered).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('operational alert payload hygiene', () => {
+  const saved: Record<string, string | undefined> = {};
+
+  beforeEach(() => {
+    saved['ALERT_WEBHOOK_URL'] = process.env.ALERT_WEBHOOK_URL;
+    process.env.ALERT_WEBHOOK_URL = 'https://hooks.slack.com/services/x';
+    resetOperationalAlertState();
+  });
+
+  afterEach(() => {
+    if (saved['ALERT_WEBHOOK_URL'] === undefined) delete process.env.ALERT_WEBHOOK_URL;
+    else process.env.ALERT_WEBHOOK_URL = saved['ALERT_WEBHOOK_URL'];
+    resetOperationalAlertState();
+    vi.unstubAllGlobals();
+  });
+
+  it('never leaks raw event payloads or secrets into the webhook body', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await evaluateOperationalAlerts(
+      {
+        deadLetterCount: 50,
+        indexerLagSeconds: 900,
+        rpcFailureCount: 9,
+        // Adversarial extras that must never be serialized.
+        rawEventPayload: RAW_PAYLOAD,
+        secret: SECRET,
+      } as OperationalAlertSignals,
+      { deadLetterThreshold: 10, indexerLagThresholdSeconds: 300, rpcFailureThreshold: 5 },
+    );
+
+    expect(fetchMock).toHaveBeenCalled();
+    for (const call of fetchMock.mock.calls) {
+      const body = String(call[1]?.body ?? '');
+      expect(body).not.toContain(RAW_PAYLOAD);
+      expect(body).not.toContain('leaked-body');
+      expect(body).not.toContain(SECRET);
+    }
   });
 });

@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { registerUser, getUser, getUserEvents, getCurrentUser } from '../src/controllers/user.controller.js';
 import { prisma } from '../src/lib/prisma.js';
+import { ApiError } from '../src/lib/errors.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -75,40 +76,42 @@ describe('User Controller', () => {
   });
 
   describe('getUser', () => {
-    it('should return 400 if publicKey is missing', async () => {
+    it('should throw ApiError 400 if publicKey is missing', async () => {
       req.params = {};
 
-      await getUser(req as Request, res as Response, next);
-
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid publicKey parameter' },
+      await expect(getUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_PUBLIC_KEY',
       });
+      expect(res.status).not.toHaveBeenCalled();
     });
 
-    it('should return 400 if publicKey is malformed', async () => {
+    it('should throw ApiError 400 if publicKey is malformed', async () => {
       req.params = { publicKey: 'invalid-key' };
 
-      await getUser(req as Request, res as Response, next);
-
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+      await expect(getUser(req as Request, res as Response, next)).rejects.toBeInstanceOf(ApiError);
+      await expect(getUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_PUBLIC_KEY',
+        message: 'Invalid Stellar public key format',
       });
+      expect(res.status).not.toHaveBeenCalled();
     });
 
-    it('should return 404 if user not found', async () => {
+    it('should throw ApiError 404 if user not found', async () => {
       req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
       (prisma.user.findUnique as any).mockResolvedValue(null);
 
-      await getUser(req as Request, res as Response, next);
-
-      expect(res.status).toHaveBeenCalledWith(404);
+      await expect(getUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 404,
+        code: 'USER_NOT_FOUND',
+      });
     });
 
-    it('should return user if found', async () => {
+    it('should return user if found and requester owns the wallet', async () => {
       const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
       req.params = { publicKey };
+      (req as any).user = { publicKey };
       const mockUser = { publicKey, sentStreams: [], receivedStreams: [] };
       (prisma.user.findUnique as any).mockResolvedValue(mockUser);
 
@@ -118,9 +121,31 @@ describe('User Controller', () => {
       expect(res.json).toHaveBeenCalledWith(mockUser);
     });
 
+    it('should throw ApiError 403 when requesting another wallet', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      (req as any).user = { publicKey: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' };
+
+      await expect(getUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 403,
+        code: 'FORBIDDEN',
+      });
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
+      expect(res.status).not.toHaveBeenCalled();
+    });
+
+    it('should throw ApiError 401 when unauthenticated', async () => {
+      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+
+      await expect(getUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 401,
+        code: 'UNAUTHENTICATED',
+      });
+    });
+
     it('should query with an explicit select clause excluding internal-only fields', async () => {
       const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
       req.params = { publicKey };
+      (req as any).user = { publicKey };
       const mockUser = { id: 'uuid-1', publicKey, createdAt: new Date(), updatedAt: new Date(), sentStreams: [], receivedStreams: [] };
       (prisma.user.findUnique as any).mockResolvedValue(mockUser);
 
@@ -138,38 +163,52 @@ describe('User Controller', () => {
   });
 
   describe('getUserEvents', () => {
-    it('should return 400 if publicKey is missing', async () => {
+    const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+
+    beforeEach(() => {
+      (req as any).user = { publicKey };
+    });
+
+    it('should throw ApiError 400 if publicKey is missing', async () => {
       req.params = {};
-      await getUserEvents(req as Request, res as Response, next);
-
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid publicKey parameter' },
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_PUBLIC_KEY',
       });
+      expect(res.status).not.toHaveBeenCalled();
     });
 
-    it('should return 400 if publicKey is malformed', async () => {
+    it('should throw ApiError 400 if publicKey is malformed', async () => {
       req.params = { publicKey: 'invalid-key' };
-      await getUserEvents(req as Request, res as Response, next);
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_PUBLIC_KEY',
+        message: 'Invalid Stellar public key format',
+      });
+      expect(res.status).not.toHaveBeenCalled();
+    });
 
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+    it('should throw ApiError 400 if publicKey has wrong format (too short)', async () => {
+      req.params = { publicKey: 'GTOOSHORT' };
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_PUBLIC_KEY',
       });
     });
 
-    it('should return 400 if publicKey has wrong format (too short)', async () => {
-      req.params = { publicKey: 'GTOOSHORT' };
-      await getUserEvents(req as Request, res as Response, next);
+    it('should throw ApiError 403 when requesting another wallet events', async () => {
+      req.params = { publicKey: 'GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF' };
+      req.query = {};
 
-      expect(res.status).toHaveBeenCalledWith(400);
-      expect(res.json).toHaveBeenCalledWith({
-        error: { code: 'INVALID_PUBLIC_KEY', message: 'Invalid Stellar public key format' },
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 403,
+        code: 'FORBIDDEN',
       });
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
     });
 
     it('should return paginated events', async () => {
-      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.params = { publicKey };
       req.query = { limit: '10', offset: '0' };
       (prisma.streamEvent.findMany as any).mockResolvedValue([]);
       (prisma.streamEvent.count as any).mockResolvedValue(0);
@@ -191,7 +230,7 @@ describe('User Controller', () => {
     });
 
     it('includes the related stream by default', async () => {
-      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.params = { publicKey };
       req.query = {};
       (prisma.streamEvent.findMany as any).mockResolvedValue([]);
       (prisma.streamEvent.count as any).mockResolvedValue(0);
@@ -204,7 +243,7 @@ describe('User Controller', () => {
     });
 
     it('omits the related stream when includeStream=false', async () => {
-      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.params = { publicKey };
       req.query = { includeStream: 'false' };
       (prisma.streamEvent.findMany as any).mockResolvedValue([]);
       (prisma.streamEvent.count as any).mockResolvedValue(0);
@@ -216,7 +255,7 @@ describe('User Controller', () => {
     });
 
     it('forwards a comma-separated type filter to the shared query helper', async () => {
-      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+      req.params = { publicKey };
       req.query = { type: 'PAUSED,RESUMED' };
       (prisma.streamEvent.findMany as any).mockResolvedValue([]);
       (prisma.streamEvent.count as any).mockResolvedValue(0);
@@ -227,13 +266,25 @@ describe('User Controller', () => {
       expect(callArgs.where.eventType).toEqual({ in: ['PAUSED', 'RESUMED'] });
     });
 
-    it('returns 400 when the type filter has no valid values', async () => {
-      req.params = { publicKey: 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ' };
+    it('throws ApiError 400 when the type filter has no valid values', async () => {
+      req.params = { publicKey };
       req.query = { type: 'BOGUS' };
 
-      await getUserEvents(req as Request, res as Response, next);
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_QUERY',
+      });
+      expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
+    });
 
-      expect(res.status).toHaveBeenCalledWith(400);
+    it('throws ApiError 400 for out-of-range pagination values', async () => {
+      req.params = { publicKey };
+      req.query = { limit: '1000' };
+
+      await expect(getUserEvents(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 400,
+        code: 'INVALID_QUERY',
+      });
       expect(prisma.streamEvent.findMany).not.toHaveBeenCalled();
     });
   });
@@ -260,6 +311,14 @@ describe('User Controller', () => {
         publicKey: 'GME',
         inMemory: true
       }));
+    });
+
+    it('should throw ApiError 401 when unauthenticated', async () => {
+      await expect(getCurrentUser(req as Request, res as Response, next)).rejects.toMatchObject({
+        status: 401,
+        code: 'UNAUTHENTICATED',
+      });
+      expect(prisma.user.findUnique).not.toHaveBeenCalled();
     });
   });
 });

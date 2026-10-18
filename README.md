@@ -280,6 +280,165 @@ For architecture details, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 - **Preview environments:** every PR gets an ephemeral full-stack preview (migrated + seeded DB) via `.github/workflows/pr-preview.yml`; resources are torn down by `pr-preview-cleanup.yml` on close.
 - **Troubleshooting & FAQ:** [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — Freighter network switching, Friendbot funding, and Soroban RPC errors.
 
+## Operations Runbook: Database Restore & Indexer Recovery
+
+This runbook covers recovering the backend after data loss or corruption: restoring
+PostgreSQL from a backup, verifying the indexer cursor, replaying chain events, and
+avoiding serving inconsistent read models while recovery is in progress.
+
+### Recovery objectives (assumptions)
+
+These are the assumptions the restore exercise validates. Re-measure them after any
+change to backup cadence, database size, or indexer throughput.
+
+| Objective | Assumption | How it is measured |
+|---|---|---|
+| **RPO** (max data loss) | ≤ 5 minutes | Time between the last verified `pg_dump`/WAL checkpoint and the incident |
+| **RTO** (max downtime) | ≤ 30 minutes | From "declare incident" to "API serving verified reads" |
+| **Replay lag** | ≤ 2 minutes per 10k ledgers | `ledger_cursor` catch-up rate during replay |
+| **Read-model staleness** | 0 inconsistent reads served | API returns `503`/`Retry-After` until checkpoint verified |
+
+### 1. Backup procedure
+
+Backups are logical dumps taken on a schedule (default every 5 minutes for the
+`streams`, `events`, and `indexer_state` tables):
+
+```bash
+pg_dump --format=custom --no-owner --no-privileges \
+  --file="flowfi-$(date -u +%Y%m%dT%H%M%SZ).dump" \
+  "$DATABASE_URL"
+```
+
+Store dumps off-host with the same retention as your incident policy. Record the
+dump's creation time and the highest ledger it contains — this is the restore
+baseline used to compute RPO.
+
+### 2. Restore procedure (isolated environment first)
+
+Never restore directly over the production database. Restore into a scratch
+database, verify it, then promote.
+
+```bash
+# 1. Create an empty target database
+createdb flowfi_restore
+
+# 2. Restore the dump
+pg_restore --no-owner --no-privileges --clean --if-exists \
+  --dbname=flowfi_restore flowfi-<timestamp>.dump
+
+# 3. Run migrations to bring the schema to the current version
+cd backend && npm run migrate
+
+# 4. Verify the restored data (see section 3)
+```
+
+### 3. Cursor verification queries
+
+Run these against the restored database before promoting it. Every query must
+return the expected result; otherwise the restore is incomplete and must be
+repeated from a later dump.
+
+```sql
+-- 3.1 Indexer cursor exists and is a sane ledger number
+SELECT id, last_ledger, updated_at
+FROM indexer_state
+WHERE id = 'default';
+-- Expect exactly one row, last_ledger > 0, updated_at recent.
+
+-- 3.2 No gaps between the cursor and the newest indexed event
+SELECT COUNT(*) AS missing
+FROM generate_series(
+  (SELECT last_ledger FROM indexer_state WHERE id = 'default'),
+  (SELECT MAX(ledger) FROM events)
+) AS g
+WHERE NOT EXISTS (SELECT 1 FROM events e WHERE e.ledger = g);
+-- Expect 0.
+
+-- 3.3 Stream read model matches the event log
+SELECT COUNT(*) AS mismatched
+FROM streams s
+WHERE s.last_event_ledger <> (
+  SELECT MAX(e.ledger) FROM events e WHERE e.stream_id = s.id
+);
+-- Expect 0.
+
+-- 3.4 No dead-letter events pending replay
+SELECT COUNT(*) AS dead_letters FROM indexer_dead_letters;
+-- Expect 0 before serving reads.
+```
+
+### 4. Chain replay
+
+If the restored cursor is behind the chain tip (expected after any restore), replay
+events from the cursor forward:
+
+```bash
+cd backend
+# Replay from the verified cursor to the current chain tip
+npm run indexer:replay -- --from-cursor --to-tip --batch-size 200
+```
+
+Replay is idempotent: events already present are skipped by `(tx_hash, event_index)`.
+Monitor progress with:
+
+```sql
+SELECT last_ledger, updated_at FROM indexer_state WHERE id = 'default';
+```
+
+Stop replay and re-run section 3 if any verification query fails.
+
+### 5. Read-model consistency safeguards
+
+While a restore or replay is in progress, the API must not serve reads derived from
+an unverified database. The backend enforces this with a recovery gate:
+
+- On startup, the backend checks `indexer_state.recovery_complete`. If it is `false`,
+  the API returns `503 Service Unavailable` with `Retry-After: 30` for all read
+  endpoints (`/v1/streams*`, `/v1/events*`).
+- The gate is cleared only after the section 3 verification queries pass and the
+  operator marks recovery complete:
+
+```sql
+UPDATE indexer_state
+SET recovery_complete = true, updated_at = NOW()
+WHERE id = 'default';
+```
+
+- SSE subscribers receive a `recovery` event and are reconnected once the gate clears.
+- Alternatively, serve reads from a verified checkpoint by pointing the API at the
+  restored database only after section 3 passes (blue/green promotion).
+
+### 6. Isolated restore exercise
+
+Run this exercise quarterly (and before any major migration) in an isolated
+environment. It is automated by `scripts/restore-exercise.sh` and covered by the
+integration tests in `backend/tests/integration/restore-recovery.test.ts`.
+
+```bash
+# Spins up an ephemeral Postgres, seeds a known dataset, dumps it,
+# restores into a scratch DB, runs the verification queries, and
+# asserts RPO/RTO bounds.
+./scripts/restore-exercise.sh
+```
+
+The exercise records:
+
+- Measured RPO (time between seeded checkpoint and dump) and RTO (restore + verify).
+- Pass/fail for each verification query in section 3.
+- Replay catch-up rate against a simulated chain tip.
+
+Record the results in the incident log. If measured RPO/RTO exceed the assumptions
+in the table above, update the backup cadence or the runbook before the next release.
+
+### 7. Rollout and operational impact
+
+- The `recovery_complete` column is added by a migration; it defaults to `true` for
+  existing rows so normal operation is unaffected.
+- No public API interface changes: the only externally observable difference is the
+  `503` + `Retry-After` response during recovery.
+- Operators must have `pg_dump`/`pg_restore` access and permission to run the replay
+  script. Document these in the on-call access matrix.
+
 ## Security
 
 If you discover a security vulnerability, please see our [Security Policy](SECURITY.md) for information on how to report it responsibly.

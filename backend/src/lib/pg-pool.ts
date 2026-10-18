@@ -4,6 +4,7 @@ import {
   dbPoolConnections,
   dbPoolMaxConnections,
   dbQueryDuration,
+  dbPoolAcquireDuration,
   registerDbPoolStatsProvider,
 } from './metrics.js';
 
@@ -17,14 +18,70 @@ const parsePositiveIntegerEnv = (name: string, defaultValue: number): number => 
   return Number.isInteger(parsedValue) && parsedValue > 0 ? parsedValue : defaultValue;
 };
 
-export const createPgPoolConfig = (overrides?: Partial<pg.PoolConfig>): pg.PoolConfig => ({
-  connectionString: process.env.DATABASE_URL,
-  max: parsePositiveIntegerEnv('PG_POOL_MAX', 10),
-  idleTimeoutMillis: parsePositiveIntegerEnv('PG_IDLE_TIMEOUT_MS', 30_000),
-  connectionTimeoutMillis: parsePositiveIntegerEnv('PG_CONNECTION_TIMEOUT_MS', 5_000),
-  statement_timeout: parsePositiveIntegerEnv('PG_STATEMENT_TIMEOUT_MS', 30_000),
-  ...overrides,
-});
+export interface ConnectionBudgetInputs {
+  maxServerConnections: number;
+  reservedConnections?: number;
+  apiReplicas: number;
+  workerReplicas: number;
+  apiWorkerSplitRatio?: number;
+}
+
+export interface ConnectionBudgetResult {
+  totalAvailable: number;
+  apiPoolMax: number;
+  workerPoolMax: number;
+  totalAllocated: number;
+}
+
+/**
+ * Calculates safe per-replica PostgreSQL connection pool budgets across API and worker instances.
+ * Ensures the aggregate connections across all replicas remain strictly within Postgres server limits.
+ */
+export function calculateConnectionBudget(inputs: ConnectionBudgetInputs): ConnectionBudgetResult {
+  const reserved = inputs.reservedConnections ?? 5;
+  const available = Math.max(1, inputs.maxServerConnections - reserved);
+  const apiRatio = inputs.apiWorkerSplitRatio ?? 0.7;
+
+  const apiTotal = Math.floor(available * apiRatio);
+  const workerTotal = available - apiTotal;
+
+  const apiPoolMax = Math.max(1, Math.floor(apiTotal / Math.max(1, inputs.apiReplicas)));
+  const workerPoolMax = Math.max(1, Math.floor(workerTotal / Math.max(1, inputs.workerReplicas)));
+
+  return {
+    totalAvailable: available,
+    apiPoolMax,
+    workerPoolMax,
+    totalAllocated: apiPoolMax * Math.max(1, inputs.apiReplicas) + workerPoolMax * Math.max(1, inputs.workerReplicas),
+  };
+}
+
+export const createPgPoolConfig = (overrides?: Partial<pg.PoolConfig>): pg.PoolConfig => {
+  let defaultMax = parsePositiveIntegerEnv('PG_POOL_MAX', 10);
+
+  // If server-wide budget calculation is configured via environment variables, compute replica-specific max
+  if (process.env.PG_MAX_SERVER_CONNECTIONS) {
+    const budget = calculateConnectionBudget({
+      maxServerConnections: parsePositiveIntegerEnv('PG_MAX_SERVER_CONNECTIONS', 100),
+      reservedConnections: parsePositiveIntegerEnv('PG_RESERVED_CONNECTIONS', 5),
+      apiReplicas: parsePositiveIntegerEnv('API_REPLICAS', 2),
+      workerReplicas: parsePositiveIntegerEnv('WORKER_REPLICAS', 2),
+    });
+
+    const role = process.env.SERVICE_ROLE || 'api';
+    defaultMax = role === 'worker' ? budget.workerPoolMax : budget.apiPoolMax;
+  }
+
+  return {
+    connectionString: process.env.DATABASE_URL,
+    max: defaultMax,
+    idleTimeoutMillis: parsePositiveIntegerEnv('PG_IDLE_TIMEOUT_MS', 30_000),
+    connectionTimeoutMillis: parsePositiveIntegerEnv('PG_CONNECTION_TIMEOUT_MS', 5_000),
+    statement_timeout: parsePositiveIntegerEnv('PG_STATEMENT_TIMEOUT_MS', 30_000),
+    ...overrides,
+  };
+};
+
 
 /**
  * Snapshot of the pool counts, in the shape the admin API and the Prometheus
@@ -130,6 +187,42 @@ export function instrumentPoolQueryTiming(pool: pg.Pool): void {
   }) as typeof pool.query;
 }
 
+export function instrumentPoolAcquireTiming(pool: pg.Pool): void {
+  const originalConnect = pool.connect?.bind(pool);
+  if (typeof originalConnect !== 'function') return;
+
+  pool.connect = ((...args: unknown[]) => {
+    const startedAt = process.hrtime.bigint();
+    const callback = typeof args[0] === 'function' ? (args[0] as (...cbArgs: unknown[]) => void) : undefined;
+
+    if (callback) {
+      return (originalConnect as any)((err: unknown, client: unknown, done: unknown) => {
+        const duration = Number(process.hrtime.bigint() - startedAt) / 1e9;
+        dbPoolAcquireDuration.observe(duration);
+        callback(err, client, done);
+      });
+    }
+
+    const connectPromise = (originalConnect as () => Promise<pg.PoolClient>)();
+    if (connectPromise && typeof connectPromise.then === 'function') {
+      return connectPromise.then(
+        (client) => {
+          const duration = Number(process.hrtime.bigint() - startedAt) / 1e9;
+          dbPoolAcquireDuration.observe(duration);
+          return client;
+        },
+        (err) => {
+          const duration = Number(process.hrtime.bigint() - startedAt) / 1e9;
+          dbPoolAcquireDuration.observe(duration);
+          throw err;
+        },
+      );
+    }
+
+    return connectPromise;
+  }) as typeof pool.connect;
+}
+
 const POOL_METRICS_INTERVAL_MS = Number(
   process.env.PG_POOL_METRICS_INTERVAL_MS ?? 5_000,
 );
@@ -138,6 +231,7 @@ export const createPgPool = (overrides?: Partial<pg.PoolConfig>): pg.Pool => {
   const pool = new pg.Pool(createPgPoolConfig(overrides));
 
   instrumentPoolQueryTiming(pool);
+  instrumentPoolAcquireTiming(pool);
 
   // Scrape-time sampling: the dedicated pool gauges read the live counts via
   // the registered provider on every `/metrics` request, so the scrape always
@@ -157,6 +251,7 @@ export const createPgPool = (overrides?: Partial<pg.PoolConfig>): pg.Pool => {
 
   return pool;
 };
+
 
 export interface DrainPgPoolOptions {
   /**
