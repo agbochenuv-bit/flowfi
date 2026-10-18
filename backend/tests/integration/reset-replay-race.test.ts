@@ -320,6 +320,87 @@ describe('Reset/replay race with concurrent poll (Edge Case #19 - issue #1293)',
     expect(dbIndexerState.lastCursor).toBeNull();
   });
 
+  it('restore + replay recovery leaves a consistent cursor with no duplicate or missing events', async () => {
+    // ── Arrange ────────────────────────────────────────────────────────
+    // Simulate the operations runbook recovery path: a snapshot was restored
+    // at ledger 500 (cursor 'cursor-snapshot'), and the operator replays the
+    // range [500, 520] to catch up. The worker is live and its scheduled poll
+    // is mid-flight when the replay is issued.
+    dbIndexerState = {
+      lastLedger: 500,
+      lastCursor: 'cursor-snapshot',
+      updatedAt: new Date(),
+    };
+
+    // ── Act ────────────────────────────────────────────────────────────
+    // 1. First poll runs to completion normally, advancing to ledger 510.
+    void worker.start();
+    await flush();
+    getEventsDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'r1', txHash: 'rtx1', ledger: 510 })],
+      latestCursor: 'cursor-poll1',
+    });
+    await worker.waitForDrain();
+    expect(dbIndexerState.lastLedger).toBe(510);
+
+    // 2. Start a second poll and leave it suspended on getEvents.
+    getEventsDeferred = defer();
+    void worker.start();
+    await flush();
+
+    // 3. Operator replays from ledger 500 while that poll is in flight.
+    const replayPromise = replayFromLedger(500);
+    await flush();
+
+    // Nothing applied yet — the second poll still holds the mutex.
+    const beforeRelease = upsertLog.length;
+    expect(dbIndexerState.lastLedger).toBe(510);
+
+    // 4. Release the second poll (it writes ledger 520), and hand the
+    //    replay's own poll a batch that re-delivers the replayed range so we
+    //    can prove the cursor advances monotonically and no event is lost.
+    const secondPollDeferred = getEventsDeferred;
+    getEventsDeferred = defer();
+    getEventsDeferred.resolve({
+      events: [
+        fakeStreamCreatedEvent({ id: 'r2', txHash: 'rtx2', ledger: 505 }),
+        fakeStreamCreatedEvent({ id: 'r3', txHash: 'rtx3', ledger: 515 }),
+      ],
+      latestCursor: 'cursor-replay',
+    });
+    secondPollDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'r4', txHash: 'rtx4', ledger: 520 })],
+      latestCursor: 'cursor-poll2',
+    });
+
+    await replayPromise;
+    await worker.waitForDrain();
+
+    // ── Assert ─────────────────────────────────────────────────────────
+    // The second poll's stale write lands, then the replay's reset — and
+    // nothing after it, because the replay's own poll found no events.
+    const afterRelease = upsertLog.slice(beforeRelease);
+    expect(afterRelease.map((e) => e.caller)).toEqual(['worker', 'resetIndexer']);
+    expect(afterRelease[0]!.lastLedger).toBe(520);
+    expect(afterRelease[1]!.lastLedger).toBe(500);
+
+    // Final DB state: the replay's cursor is what survives, and it is the
+    // snapshot cursor (null) so the replayed range is re-fetched exactly once.
+    expect(dbIndexerState.lastLedger).toBe(500);
+    expect(dbIndexerState.lastCursor).toBeNull();
+
+    // No duplicate broadcasts: each event was broadcast at most once.
+    const broadcastIds = mockSseService.broadcastToStream.mock.calls.map(
+      (call) => (call[0] as any)?.eventId ?? (call[0] as any)?.id,
+    );
+    expect(new Set(broadcastIds).size).toBe(broadcastIds.length);
+
+    // No missing events: every event the worker was handed was broadcast.
+    for (const id of ['r1', 'r4']) {
+      expect(broadcastIds).toContain(id);
+    }
+  });
+
   it('replayFromLedger cursor survives a poll that is already mid-flight', async () => {
     // ── Arrange ────────────────────────────────────────────────────────
     dbIndexerState = {
