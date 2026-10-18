@@ -1,13 +1,13 @@
 import type { Request, Response } from 'express';
 import { sseService } from '../services/sse.service.js';
 import { prisma } from '../lib/prisma.js';
-import { requestContext } from '../logger.js';
 import type { AuthenticatedRequest } from '../types/auth.types.js';
 import { z } from 'zod';
+import { signSseTicket, verifySseTicket } from '../middleware/auth.js';
 
 const subscribeSchema = z.object({
-  streams: z.array(z.string()).optional().default([]),
-  users: z.array(z.string()).optional().default([]),
+  streams: z.array(z.string().regex(/^\d+$/)).max(500).optional().default([]),
+  users: z.array(z.string()).max(500).optional().default([]),
   all: z.boolean().optional().default(false),
 });
 
@@ -18,6 +18,37 @@ const subscribeSchema = z.object({
  * the frontend can fall back to polling or pagination for the remainder.
  */
 const MAX_SSE_STREAMS = 500;
+
+export const createSseTicket = async (req: Request, res: Response) => {
+  try {
+    const { streams, users, all } = subscribeSchema.parse(req.body);
+    const { publicKey } = (req as AuthenticatedRequest).user;
+    const owned = await prisma.stream.findMany({
+      where: { OR: [{ sender: publicKey }, { recipient: publicKey }] },
+      orderBy: { startTime: 'desc' },
+      take: MAX_SSE_STREAMS,
+      select: { streamId: true, sender: true, recipient: true },
+    });
+    const ownedIds = new Set(owned.map((stream) => String(stream.streamId)));
+    const allowedUsers = new Set<string>([publicKey]);
+    for (const stream of owned) {
+      allowedUsers.add(stream.sender);
+      allowedUsers.add(stream.recipient);
+    }
+    const allowedStreams = all || streams.length === 0
+      ? [...ownedIds]
+      : streams.filter((id) => ownedIds.has(id));
+    const allowedSubscriptions = [...new Set(users.filter((key) => allowedUsers.has(key)))];
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ ticket: signSseTicket({ publicKey, streams: allowedStreams, users: allowedSubscriptions }) });
+  } catch (error: unknown) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ message: 'Invalid subscription parameters', errors: error.issues });
+      return;
+    }
+    res.status(500).json({ message: 'Internal server error' });
+  }
+};
 
 
 function getClientIp(req: Request): string {
@@ -38,8 +69,13 @@ export const subscribe = async (req: Request, res: Response) => {
   }
 
   try {
+    const rawTicket = req.query.ticket;
+    const ticket = typeof rawTicket === 'string' ? verifySseTicket(rawTicket) : null;
+    if (!ticket) {
+      return res.status(401).json({ message: 'Missing, invalid, or expired SSE ticket' });
+    }
     const sourceIp = getClientIp(req);
-    const authUserId = (req as AuthenticatedRequest).user?.publicKey;
+    const authUserId = ticket.publicKey;
     const capacity = sseService.checkCapacity(sourceIp, authUserId);
     if (!capacity.allowed) {
       if (capacity.retryAfterSeconds) {
@@ -50,8 +86,7 @@ export const subscribe = async (req: Request, res: Response) => {
       });
     }
 
-    const { publicKey } = (req as AuthenticatedRequest).user;
-    const { streams, users, all } = subscribeSchema.parse(req.query);
+    const { publicKey } = ticket;
 
     // Consistent with GET /v1/events/ (which requires requireAuth and is scoped to user's address),
     // SSE subscriptions are also restricted to streams owned by the authenticated user.
@@ -73,18 +108,10 @@ export const subscribe = async (req: Request, res: Response) => {
     }
 
     let subscriptions: string[];
-    if (all) {
-      // "all" still scoped to the user's own streams
-      subscriptions = [...ownedIds];
-    } else if (streams.length > 0) {
-      // Only allow subscribing to streams the user owns
-      subscriptions = streams.filter((id) => ownedIds.has(id));
-    } else {
-      subscriptions = [...ownedIds];
-    }
+    subscriptions = ticket.streams.filter((id) => ownedIds.has(id));
 
     const userSubscriptions = new Set<string>([`user:${publicKey}`]);
-    for (const key of users.filter((k) => allowedUserKeys.has(k))) {
+    for (const key of ticket.users.filter((k) => allowedUserKeys.has(k))) {
       userSubscriptions.add(`user:${key}`);
     }
     subscriptions.push(...userSubscriptions);
@@ -93,13 +120,12 @@ export const subscribe = async (req: Request, res: Response) => {
 
     res.writeHead(200, {
       'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
 
-    const requestId = requestContext.getStore()?.requestId;
-    res.write(`data: ${JSON.stringify({ type: 'connected', clientId, requestId })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: 'connected', clientId })}\n\n`);
 
     sseService.addClient(clientId, res, subscriptions, sourceIp, publicKey);
     return;

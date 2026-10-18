@@ -10,6 +10,7 @@ import {
   replayDeadLetterEvent,
 } from '../services/indexerService.js';
 import logger from '../logger.js';
+import { recordAuditEvent } from '../services/audit.service.js';
 
 /** Parse an optional positive-integer query param. */
 function parseOptionalInt(raw: unknown): number | undefined {
@@ -108,6 +109,16 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
   try {
     const result = await replayDeadLetterEvent(id);
 
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.dead_letter.replay',
+      targetType: 'dead_letter_event',
+      targetId: id,
+      outcome: result.outcome === 'replayed' ? 'success' : 'failure',
+      after: { outcome: result.outcome },
+      metadata: { attempts: 'attempts' in result ? result.attempts : undefined },
+    });
+
     if (result.outcome === 'not_found') {
       return res.status(404).json({ error: 'Dead-letter event not found' });
     }
@@ -148,9 +159,17 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
  *
  * Replays every pending record sequentially, oldest ledger first.
  */
-export const replayAllDeadLetterHandler = async (_req: Request, res: Response) => {
+export const replayAllDeadLetterHandler = async (req: Request, res: Response) => {
   try {
     const summary = await replayAllDeadLetterEvents();
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.dead_letter.replay_all',
+      targetType: 'dead_letter_queue',
+      targetId: 'pending',
+      outcome: summary.failed === 0 ? 'success' : 'failure',
+      after: { replayed: summary.replayed, failed: summary.failed },
+    });
     return res.status(200).json({ ok: true, ...summary });
   } catch (err) {
     logger.error('[AdminController] Dead-letter replay-all threw:', err);
@@ -175,6 +194,14 @@ export const discardDeadLetterHandler = async (req: Request, res: Response) => {
 
   try {
     const discarded = await discardDeadLetterEvent(id, discardedBy);
+    await recordAuditEvent({
+      actor: discardedBy,
+      action: 'indexer.dead_letter.discard',
+      targetType: 'dead_letter_event',
+      targetId: id,
+      outcome: 'success',
+      after: { discarded: true },
+    });
     return res.status(200).json({ ok: true, discarded });
   } catch (err) {
     if (err instanceof DeadLetterNotFoundError) {

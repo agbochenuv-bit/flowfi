@@ -23,6 +23,8 @@ import { sseService } from '../../services/sse.service.js';
 import { cache } from '../../lib/redis.js';
 import logger from '../../logger.js';
 import { sorobanEventWorker } from '../../workers/soroban-event-worker.js';
+import type { AuthenticatedRequest } from '../../types/auth.types.js';
+import { recordAuditEvent } from '../../services/audit.service.js';
 
 const router = Router();
 
@@ -421,9 +423,27 @@ router.post('/indexer/reset', async (req: Request, res: Response) => {
       res.json({ dryRun: true, preview });
       return;
     }
+    const before = await previewReset(ledger);
     await resetIndexer(ledger);
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.reset',
+      targetType: 'indexer_state',
+      targetId: INDEXER_STATE_ID,
+      outcome: 'success',
+      before: { lastLedger: before.currentLastLedger },
+      after: { lastLedger: ledger },
+    });
     res.json({ ok: true, lastLedger: ledger });
   } catch (err) {
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.reset',
+      targetType: 'indexer_state',
+      targetId: INDEXER_STATE_ID,
+      outcome: 'failure',
+      after: { requestedLedger: ledger },
+    }).catch((auditError) => logger.error('Failed to audit indexer reset:', auditError));
     res.status(500).json({ error: 'Reset failed' });
   }
 });
@@ -500,9 +520,29 @@ router.post('/indexer/replay', async (req: Request, res: Response) => {
       res.json({ dryRun: true, preview });
       return;
     }
+    const before = await previewReplay(fromLedger);
     const requestId = await replayFromLedger(fromLedger);
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      requestId,
+      action: 'indexer.replay',
+      targetType: 'indexer_state',
+      targetId: INDEXER_STATE_ID,
+      outcome: 'success',
+      before: { lastLedger: before.currentLastLedger },
+      after: { fromLedger },
+      metadata: { eventCount: before.eventCount },
+    });
     res.status(202).json({ ok: true, replayingFrom: fromLedger, requestId });
   } catch (err) {
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.replay',
+      targetType: 'indexer_state',
+      targetId: INDEXER_STATE_ID,
+      outcome: 'failure',
+      after: { fromLedger },
+    }).catch((auditError) => logger.error('Failed to audit indexer replay:', auditError));
     res.status(500).json({ error: 'Replay failed' });
   }
 });

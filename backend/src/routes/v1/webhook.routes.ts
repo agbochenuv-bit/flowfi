@@ -3,8 +3,10 @@
  */
 import { Router } from "express";
 import * as webhookController from "../../controllers/webhook.controller.js";
+import { requireAuth } from "../../middleware/auth.js";
 
 const router = Router();
+router.use(requireAuth);
 
 /**
  * @openapi
@@ -20,13 +22,9 @@ const router = Router();
  *           schema:
  *             type: object
  *             required:
- *               - userAddress
  *               - targetUrl
  *               - eventTypes
  *             properties:
- *               userAddress:
- *                 type: string
- *                 description: Stellar public key
  *               targetUrl:
  *                 type: string
  *                 format: uri
@@ -72,11 +70,6 @@ router.post("/", webhookController.createWebhook);
  *     summary: List all webhooks for authenticated user
  *     tags: [Webhooks]
  *     parameters:
- *       - in: query
- *         name: userAddress
- *         required: true
- *         schema:
- *           type: string
  *     responses:
  *       200:
  *         description: List of webhook subscriptions
@@ -113,11 +106,6 @@ router.get("/", webhookController.listWebhooks);
  *     parameters:
  *       - in: path
  *         name: id
- *         required: true
- *         schema:
- *           type: string
- *       - in: query
- *         name: userAddress
  *         required: true
  *         schema:
  *           type: string

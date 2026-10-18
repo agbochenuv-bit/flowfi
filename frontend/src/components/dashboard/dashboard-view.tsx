@@ -673,6 +673,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
     retryNow,
   } = useStreamEvents({
     userPublicKeys: [session.publicKey],
+    jwtToken: session.accessToken,
     autoReconnect: true,
   });
 

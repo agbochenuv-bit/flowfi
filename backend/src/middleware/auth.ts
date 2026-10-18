@@ -144,6 +144,54 @@ export function verifyJwt(token: string): { publicKey: string } | null {
   }
 }
 
+const SSE_TICKET_TTL_SECONDS = 60;
+
+export interface SseTicket {
+  publicKey: string;
+  streams: string[];
+  users: string[];
+}
+
+export function signSseTicket(ticket: SseTicket): string {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt({
+    sub: ticket.publicKey,
+    iat: now,
+    exp: now + SSE_TICKET_TTL_SECONDS,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
+    scope: 'sse:subscribe',
+    streams: ticket.streams,
+    users: ticket.users,
+  });
+}
+
+export function verifySseTicket(token: string): SseTicket | null {
+  const verified = verifyJwt(token);
+  if (!verified) return null;
+  try {
+    const [, body] = token.split('.');
+    if (!body) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      payload.scope !== 'sse:subscribe' ||
+      payload.sub !== verified.publicKey ||
+      !Number.isInteger(payload.iat) ||
+      !Number.isInteger(payload.exp) ||
+      payload.exp - payload.iat > SSE_TICKET_TTL_SECONDS ||
+      payload.exp <= now ||
+      !Array.isArray(payload.streams) ||
+      !Array.isArray(payload.users) ||
+      payload.streams.some((id: unknown) => typeof id !== 'string') ||
+      payload.users.some((key: unknown) => typeof key !== 'string')
+    ) return null;
+    return { publicKey: verified.publicKey, streams: payload.streams, users: payload.users };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Challenge / Verify handlers ────────────────────────────────────────────
 
 export function issueChallenge(req: Request, res: Response): void {

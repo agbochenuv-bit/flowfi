@@ -25,6 +25,7 @@ import {
   getAddress,
   getNetworkDetails,
 } from "@stellar/freighter-api";
+import { getApiBaseUrl, fetchWithTimeout } from "@/lib/api/_shared";
 
 export type WalletId = "freighter" | "albedo" | "xbull" | "hana" | "walletconnect";
 
@@ -42,6 +43,7 @@ export interface WalletSession {
   connectedAt: string;
   network: string;
   mocked: boolean;
+  accessToken?: string;
 }
 
 // ── Error types ───────────────────────────────────────────────────────────────
@@ -153,6 +155,62 @@ export async function connectWallet(
   const publicKey = result.publicKey ?? result.address;
   if (!publicKey) throw new Error(`${walletId} did not return a public key.`);
   return buildSession(walletId, publicKey, STELLAR_NETWORK === "MAINNET" ? "Mainnet" : "Testnet");
+}
+
+export async function authenticateWallet(
+  publicKey: string,
+  walletId: WalletId,
+): Promise<string> {
+  const apiBase = getApiBaseUrl();
+  const authBase = `${apiBase}${apiBase.endsWith("/v1") ? "" : "/v1"}/auth`;
+  const challengeResponse = await fetchWithTimeout(`${authBase}/challenge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ publicKey }),
+  });
+  if (!challengeResponse.ok) {
+    throw new Error(`Wallet authentication challenge failed (${challengeResponse.status})`);
+  }
+  const { nonce } = await challengeResponse.json() as { nonce: string };
+
+  const { Account, BASE_FEE, Networks, Operation, TransactionBuilder } =
+    await import("@stellar/stellar-sdk");
+  const networkPassphrase = STELLAR_NETWORK === "MAINNET" ? Networks.PUBLIC : Networks.TESTNET;
+  const nonceBytes = new Uint8Array(nonce.match(/.{2}/g)!.map((byte) => Number.parseInt(byte, 16)));
+  const transaction = new TransactionBuilder(new Account(publicKey, "0"), {
+    fee: BASE_FEE,
+    networkPassphrase,
+  })
+    .addOperation(Operation.manageData({ name: "flowfi-auth", value: nonceBytes }))
+    .setTimeout(60)
+    .build();
+
+  type SignedTransaction = { signedTxXdr?: string; error?: unknown };
+  type SignTransaction = (xdr: string, options: { networkPassphrase: string }) => Promise<SignedTransaction>;
+  let sign: SignTransaction;
+  if (walletId === "freighter") {
+    sign = (await import("@stellar/freighter-api")).signTransaction as SignTransaction;
+  } else {
+    const bridge = (window as unknown as Record<string, { signTransaction?: SignTransaction }>)[walletId];
+    if (!bridge?.signTransaction) throw new Error("This wallet does not support signed API authentication.");
+    sign = bridge.signTransaction.bind(bridge);
+  }
+
+  const signed = await sign(transaction.toXDR(), { networkPassphrase });
+  if (signed.error || !signed.signedTxXdr) {
+    throw new Error("Wallet authentication signature was declined or unavailable.");
+  }
+  const verifyResponse = await fetchWithTimeout(`${authBase}/verify`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ publicKey, signedTransaction: signed.signedTxXdr }),
+  });
+  if (!verifyResponse.ok) {
+    throw new Error(`Wallet authentication failed (${verifyResponse.status})`);
+  }
+  const result = await verifyResponse.json() as { token: string };
+  if (!result.token) throw new Error("Wallet authentication response did not include a token.");
+  return result.token;
 }
 
 // ── Error message mapping ─────────────────────────────────────────────────────

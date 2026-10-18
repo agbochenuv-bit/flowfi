@@ -7,7 +7,6 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { WEBHOOK_EVENT_TYPES, type WebhookSubscription } from "@/lib/api/webhooks";
 
 interface Props {
-  userAddress: string;
   subscription?: WebhookSubscription;
   secretKey?: string;
   onClose: () => void;
@@ -15,7 +14,7 @@ interface Props {
   onRegenerate?: () => Promise<string>;
 }
 
-export function WebhookModal({ userAddress: _userAddress, subscription, secretKey, onClose, onSave, onRegenerate }: Props) {
+export function WebhookModal({ subscription, secretKey, onClose, onSave, onRegenerate }: Props) {
   const [targetUrl, setTargetUrl] = useState(subscription?.targetUrl ?? "");
   const [events, setEvents] = useState<string[]>(subscription?.eventTypes ?? [...WEBHOOK_EVENT_TYPES]);
   const [saving, setSaving] = useState(false);

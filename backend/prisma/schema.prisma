@@ -108,19 +108,40 @@ model StreamEvent {
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
 model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                     String   @id @default(uuid())
+  userAddress            String   // Stellar public key of the owner
+  targetUrl              String   // Destination webhook URL (must be HTTPS)
+  secretKey              String   // AES-256-GCM envelope encrypted
+  previousSecretKey      String?  // Encrypted prior key during bounded rotation overlap
+  previousSecretExpiresAt DateTime?
+  eventTypes             String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
+  isActive               Boolean  @default(true)
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
   deliveries  WebhookDelivery[]
 
   @@index([userAddress])
   @@index([isActive])
+}
+
+// Append-only record for security-sensitive operational changes.
+model AuditEvent {
+  id         String   @id @default(uuid())
+  occurredAt DateTime @default(now())
+  actor      String
+  requestId  String?
+  action     String
+  targetType String
+  targetId   String
+  outcome    String
+  before     Json?    @db.JsonB
+  after      Json?    @db.JsonB
+  metadata   Json?    @db.JsonB
+
+  @@index([occurredAt])
+  @@index([targetType, targetId])
+  @@index([actor, occurredAt])
 }
 
 // WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)

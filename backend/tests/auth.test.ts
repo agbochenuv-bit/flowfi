@@ -244,7 +244,8 @@ describe('Authentication & Middleware Tests', () => {
 
       // Any route that uses requireAuth
       const res = await request(app)
-        .get('/v1/events/subscribe')
+        .post('/v1/events/subscribe-ticket')
+        .send({ streams: [], users: [] })
         .set('Authorization', `Bearer ${token}`);
 
       // Even if it returns 200 or 404/500, we check that it's NOT 401
@@ -259,7 +260,8 @@ describe('Authentication & Middleware Tests', () => {
       const fakeJwt = `${fakeHeader}.${fakePayload}.invalidsig`;
 
       const res = await request(app)
-        .get('/v1/events/subscribe')
+        .post('/v1/events/subscribe-ticket')
+        .send({ streams: [], users: [] })
         .set('Authorization', `Bearer ${fakeJwt}`);
 
       expect(res.status).toBe(401);
@@ -267,7 +269,7 @@ describe('Authentication & Middleware Tests', () => {
     });
 
     it('test_auth_middleware_rejects_missing_header', async () => {
-      const res = await request(app).get('/v1/events/subscribe');
+      const res = await request(app).post('/v1/events/subscribe-ticket').send({});
       expect(res.status).toBe(401);
       expect(res.body.message).toMatch(/Missing Bearer token/i);
     });
@@ -401,7 +403,7 @@ describe('Authentication & Middleware Tests', () => {
       expect(res.body.events).toEqual([]);
     });
 
-    it('test_events_endpoint_rejects_authenticated_mismatched_address', async () => {
+    it('test_events_endpoint_ignores_caller_supplied_address', async () => {
       const keypair = makeKeypair();
       const otherKeypair = makeKeypair();
       const now = Math.floor(Date.now() / 1000);
@@ -418,8 +420,12 @@ describe('Authentication & Middleware Tests', () => {
         .query({ address: otherKeypair.publicKey() })
         .set('Authorization', `Bearer ${token}`);
 
-      expect(res.status).toBe(403);
-      expect(res.body.error).toBe('Forbidden');
+      expect(res.status).toBe(200);
+      const prisma = await import('../src/lib/prisma.js');
+      const args = vi.mocked(prisma.prisma.streamEvent.findMany).mock.calls.at(-1)?.[0];
+      expect(args?.where).toMatchObject({
+        stream: { OR: [{ sender: keypair.publicKey() }, { recipient: keypair.publicKey() }] },
+      });
     });
   });
 });

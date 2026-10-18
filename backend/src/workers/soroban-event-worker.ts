@@ -1,6 +1,7 @@
 import { randomUUID } from "crypto";
 import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../lib/prisma.js";
+import { recordAuditEvent } from "../services/audit.service.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
 import { sseService } from "../services/sse.service.js";
 import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
@@ -704,6 +705,17 @@ export class SorobanEventWorker {
           timestamp,
         },
       });
+
+      await recordAuditEvent({
+        actor: admin,
+        action: "protocol.fee_config.update",
+        targetType: "protocol_fee_config",
+        targetId: event.txHash,
+        outcome: "success",
+        before: { treasury: oldTreasury, feeRateBps: oldFeeRateBps },
+        after: { treasury: newTreasury, feeRateBps: newFeeRateBps },
+        metadata: { transactionHash: event.txHash, ledger: event.ledger },
+      }, tx);
     });
 
     sseService.broadcastToAdmin("stream.fee_config_updated", {

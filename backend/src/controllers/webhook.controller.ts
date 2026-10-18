@@ -4,23 +4,28 @@
 import type { Request, Response } from "express";
 import * as webhookService from "../services/webhook.service.js";
 import logger from "../logger.js";
+import type { AuthenticatedRequest } from "../types/auth.types.js";
+
+function getAuthenticatedAddress(req: Request): string {
+  return (req as AuthenticatedRequest).user.publicKey;
+}
 
 export async function createWebhook(
   req: Request,
   res: Response,
 ): Promise<void> {
   try {
-    const { userAddress, targetUrl, eventTypes } = req.body;
+    const { targetUrl, eventTypes } = req.body;
 
-    if (!userAddress || !targetUrl || !Array.isArray(eventTypes)) {
+    if (!targetUrl || !Array.isArray(eventTypes)) {
       res.status(400).json({
-        error: "Missing required fields: userAddress, targetUrl, eventTypes",
+        error: "Missing required fields: targetUrl, eventTypes",
       });
       return;
     }
 
     const subscription = await webhookService.createWebhookSubscription(
-      userAddress,
+      getAuthenticatedAddress(req),
       targetUrl,
       eventTypes,
     );
@@ -43,22 +48,10 @@ export async function createWebhook(
 
 export async function listWebhooks(req: Request, res: Response): Promise<void> {
   try {
-    const { userAddress } = req.query;
-
-    if (!userAddress || typeof userAddress !== "string") {
-      res.status(400).json({ error: "userAddress query parameter required" });
-      return;
-    }
-
     const subscriptions =
-      await webhookService.listWebhookSubscriptions(userAddress);
+      await webhookService.listWebhookSubscriptions(getAuthenticatedAddress(req));
 
-    // Don't expose secret keys
-    const safeSubscriptions = subscriptions.map(
-      ({ secretKey, ...rest }) => rest,
-    );
-
-    res.json({ subscriptions: safeSubscriptions });
+    res.json({ subscriptions });
   } catch (error: any) {
     logger.error("[Webhook Controller] List error:", error);
     res.status(500).json({ error: "Failed to list webhooks" });
@@ -72,14 +65,12 @@ export async function deleteWebhook(
   try {
     const idParam = req.params.id;
     const id = Array.isArray(idParam) ? idParam[0] : idParam;
-    const { userAddress } = req.query;
-
-    if (!id || !userAddress || typeof userAddress !== "string") {
-      res.status(400).json({ error: "Invalid id or userAddress required" });
+    if (!id) {
+      res.status(400).json({ error: "Invalid id" });
       return;
     }
 
-    await webhookService.deleteWebhookSubscription(id, userAddress);
+    await webhookService.deleteWebhookSubscription(id, getAuthenticatedAddress(req));
 
     res.status(204).send();
   } catch (error: any) {
@@ -91,12 +82,11 @@ export async function deleteWebhook(
 export async function updateWebhook(req: Request, res: Response): Promise<void> {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const { userAddress } = req.query;
-    if (!id || typeof userAddress !== "string") {
-      res.status(400).json({ error: "id and userAddress are required" });
+    if (!id) {
+      res.status(400).json({ error: "id is required" });
       return;
     }
-    const subscription = await webhookService.updateWebhookSubscription(id, userAddress, req.body);
+    const subscription = await webhookService.updateWebhookSubscription(id, getAuthenticatedAddress(req), req.body);
     res.json(subscription);
   } catch (error: any) {
     res.status(400).json({ error: error.message || "Failed to update webhook" });
@@ -106,12 +96,12 @@ export async function updateWebhook(req: Request, res: Response): Promise<void> 
 export async function listDeliveries(req: Request, res: Response): Promise<void> {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const { userAddress, page = "1", limit = "20" } = req.query;
-    if (!id || typeof userAddress !== "string") {
-      res.status(400).json({ error: "id and userAddress are required" });
+    const { page = "1", limit = "20" } = req.query;
+    if (!id) {
+      res.status(400).json({ error: "id is required" });
       return;
     }
-    res.json(await webhookService.listWebhookDeliveries(id, userAddress, Number(page), Number(limit)));
+    res.json(await webhookService.listWebhookDeliveries(id, getAuthenticatedAddress(req), Number(page), Number(limit)));
   } catch (error: any) {
     res.status(400).json({ error: error.message || "Failed to list webhook deliveries" });
   }
@@ -120,12 +110,11 @@ export async function listDeliveries(req: Request, res: Response): Promise<void>
 export async function regenerateSecret(req: Request, res: Response): Promise<void> {
   try {
     const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
-    const { userAddress } = req.body;
-    if (!id || !userAddress) {
-      res.status(400).json({ error: "id and userAddress are required" });
+    if (!id) {
+      res.status(400).json({ error: "id is required" });
       return;
     }
-    res.json({ secretKey: await webhookService.regenerateWebhookSecret(id, userAddress) });
+    res.json({ secretKey: await webhookService.regenerateWebhookSecret(id, getAuthenticatedAddress(req)) });
   } catch (error: any) {
     res.status(400).json({ error: error.message || "Failed to regenerate webhook secret" });
   }
@@ -135,14 +124,12 @@ export async function testWebhook(req: Request, res: Response): Promise<void> {
   try {
     const idParam = req.params.id;
     const id = Array.isArray(idParam) ? idParam[0] : idParam;
-    const { userAddress } = req.body;
-
-    if (!id || !userAddress) {
-      res.status(400).json({ error: "id and userAddress required" });
+    if (!id) {
+      res.status(400).json({ error: "id required" });
       return;
     }
 
-    const result = await webhookService.sendTestWebhook(id, userAddress);
+    const result = await webhookService.sendTestWebhook(id, getAuthenticatedAddress(req));
 
     res.json({
       message: "Test webhook sent",

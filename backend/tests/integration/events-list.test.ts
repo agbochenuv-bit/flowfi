@@ -1,7 +1,7 @@
 /**
  * Integration tests for GET /v1/events.
  *
- * Verifies the activity-page contract: address filter, event-type filter,
+ * Verifies the activity-page contract: authenticated wallet scope, event-type filter,
  * pagination via limit/offset, and the shape returned to the frontend
  * (events, total, hasMore).
  */
@@ -84,33 +84,21 @@ describe('GET /v1/events', () => {
   });
 
   it('rejects requests missing authentication', async () => {
-    const res = await request(app).get(`/v1/events?address=${ADDR}`);
+    const res = await request(app).get('/v1/events');
     expect(res.status).toBe(401);
   });
 
-  it('rejects requests missing the `address` query parameter', async () => {
+  it('uses the authenticated wallet rather than a caller-supplied address', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+    mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
     const res = await request(app)
-      .get('/v1/events')
+      .get('/v1/events?address=GOTHER123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA')
       .set('Authorization', `Bearer ${token}`);
-    expect(res.status).toBe(400);
-    expect(res.body.error).toMatch(/address/i);
-    expect(mocks.prisma.streamEvent.findMany).not.toHaveBeenCalled();
-  });
-
-  it('rejects requests with mismatched authenticated user and address query', async () => {
-    const now = Math.floor(Date.now() / 1000);
-    const otherToken = signJwt({
-      sub: 'GOTHER123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
-      iat: now,
-      exp: now + 3600,
-      iss: 'flowfi-api',
-      aud: 'flowfi-api',
-    });
-    const res = await request(app)
-      .get(`/v1/events?address=${ADDR}`)
-      .set('Authorization', `Bearer ${otherToken}`);
-    expect(res.status).toBe(403);
-    expect(res.body.error).toBe('Forbidden');
+    expect(res.status).toBe(200);
+    const args = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+      where: { stream: { OR: Array<{ sender?: string; recipient?: string }> } };
+    };
+    expect(args.where.stream.OR).toEqual([{ sender: ADDR }, { recipient: ADDR }]);
   });
 
   it('returns the paged event list for the wallet', async () => {
@@ -119,7 +107,7 @@ describe('GET /v1/events', () => {
     mocks.prisma.streamEvent.count.mockResolvedValueOnce(5);
 
     const res = await request(app)
-      .get(`/v1/events?address=${ADDR}&limit=2`)
+      .get('/v1/events?limit=2')
       .set('Authorization', `Bearer ${token}`);
 
     expect(res.status).toBe(200);
@@ -143,7 +131,7 @@ describe('GET /v1/events', () => {
     mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
 
     const res = await request(app)
-      .get(`/v1/events?address=${ADDR}&type=PAUSED,RESUMED`)
+      .get('/v1/events?type=PAUSED,RESUMED')
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(200);
 
@@ -155,7 +143,7 @@ describe('GET /v1/events', () => {
 
   it('rejects a type filter when no values are valid', async () => {
     const res = await request(app)
-      .get(`/v1/events?address=${ADDR}&type=BOGUS`)
+      .get('/v1/events?type=BOGUS')
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(400);
     expect(mocks.prisma.streamEvent.findMany).not.toHaveBeenCalled();
@@ -166,7 +154,7 @@ describe('GET /v1/events', () => {
     mocks.prisma.streamEvent.count.mockResolvedValueOnce(100);
 
     const res = await request(app)
-      .get(`/v1/events?address=${ADDR}&limit=10&page=4`)
+      .get('/v1/events?limit=10&page=4')
       .set('Authorization', `Bearer ${token}`);
     expect(res.status).toBe(200);
     expect(res.body.offset).toBe(30);
@@ -182,7 +170,7 @@ describe('GET /v1/events', () => {
     mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
 
     await request(app)
-      .get(`/v1/events?address=${ADDR}`)
+      .get('/v1/events')
       .set('Authorization', `Bearer ${token}`);
 
     const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
@@ -196,7 +184,7 @@ describe('GET /v1/events', () => {
     mocks.prisma.streamEvent.count.mockResolvedValueOnce(0);
 
     await request(app)
-      .get(`/v1/events?address=${ADDR}&includeStream=true`)
+      .get('/v1/events?includeStream=true')
       .set('Authorization', `Bearer ${token}`);
 
     const callArgs = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
@@ -238,7 +226,7 @@ describe('GET /v1/users/:publicKey/events and GET /v1/events filtering parity', 
     mocks.prisma.streamEvent.count.mockResolvedValue(0);
 
     await request(app)
-      .get(`/v1/events?address=${VALID_ADDR}`)
+      .get('/v1/events')
       .set('Authorization', `Bearer ${validAddrToken}`);
     const eventsWhere = mocks.prisma.streamEvent.findMany.mock.calls[0]![0].where;
 
@@ -257,7 +245,7 @@ describe('GET /v1/users/:publicKey/events and GET /v1/events filtering parity', 
     mocks.prisma.streamEvent.count.mockResolvedValue(0);
 
     await request(app)
-      .get(`/v1/events?address=${VALID_ADDR}&type=PAUSED,RESUMED`)
+      .get('/v1/events?type=PAUSED,RESUMED')
       .set('Authorization', `Bearer ${validAddrToken}`);
     const eventsWhere = mocks.prisma.streamEvent.findMany.mock.calls[0]![0].where;
 
@@ -274,7 +262,7 @@ describe('GET /v1/users/:publicKey/events and GET /v1/events filtering parity', 
 
   it('both reject a type filter with no valid values', async () => {
     const eventsRes = await request(app)
-      .get(`/v1/events?address=${VALID_ADDR}&type=BOGUS`)
+      .get('/v1/events?type=BOGUS')
       .set('Authorization', `Bearer ${validAddrToken}`);
     const userEventsRes = await request(app).get(`/v1/users/${VALID_ADDR}/events?type=BOGUS`);
 
