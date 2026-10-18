@@ -12,6 +12,9 @@ const hoisted = vi.hoisted(() => ({
   processEvent: vi.fn(),
   runExclusive: vi.fn(),
   sendDeadLetterAlert: vi.fn(),
+  setIndexerLedgers: vi.fn(),
+  setIndexerLastSuccessTimestamp: vi.fn(),
+  indexerRetriesTotal: { inc: vi.fn() },
 }));
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -60,7 +63,9 @@ vi.mock('../src/services/alert.service.js', () => ({
 // Metrics and tracing are side-effect-only here; stub them so the assertions
 // below are not perturbed by the shared Prometheus registry.
 vi.mock('../src/lib/metrics.js', () => ({
-  setIndexerLedgers: vi.fn(),
+  setIndexerLedgers: hoisted.setIndexerLedgers,
+  setIndexerLastSuccessTimestamp: hoisted.setIndexerLastSuccessTimestamp,
+  indexerRetriesTotal: hoisted.indexerRetriesTotal,
   indexerEventsProcessedTotal: { inc: vi.fn() },
   indexerPollsTotal: { inc: vi.fn() },
   recordRpcRequest: vi.fn(),
@@ -632,6 +637,185 @@ describe('replayAllDeadLetterEvents', () => {
       expect.objectContaining({ orderBy: [{ ledgerSequence: 'asc' }, { createdAt: 'asc' }] }),
     );
     expect(mockedWorker.processEvent).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('previewReplayFromLedger', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('reports the affected ledger range without writing anything', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce({
+      id: 'singleton',
+      lastLedger: 500,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    });
+
+    const preview = await indexerService.previewReplayFromLedger(100);
+
+    expect(preview).toMatchObject({
+      fromLedger: 100,
+      currentLedger: 500,
+      cursorPreserved: true,
+    });
+    expect(preview.affectedLedgerRange).toEqual({ from: 100, to: 500 });
+    expect(preview.expectedRecordChanges).toEqual(
+      expect.objectContaining({ ledgersRewound: 400 }),
+    );
+    expect(typeof preview.requestId).toBe('string');
+    expect(preview.requestId.length).toBeGreaterThan(0);
+    // Preview must never mutate state or trigger the worker.
+    expect(mockedPrisma.indexerState.upsert).not.toHaveBeenCalled();
+    expect(mockedWorker.triggerPoll).not.toHaveBeenCalled();
+    expect(mockedWorker.runExclusive).not.toHaveBeenCalled();
+  });
+
+  it('treats a missing state row as ledger 0 and keeps the cursor null', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce(null);
+
+    const preview = await indexerService.previewReplayFromLedger(0);
+
+    expect(preview.currentLedger).toBe(0);
+    expect(preview.currentCursor).toBeNull();
+    expect(preview.affectedLedgerRange).toEqual({ from: 0, to: 0 });
+    expect(mockedPrisma.indexerState.upsert).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative target ledger before reading state', async () => {
+    await expect(indexerService.previewReplayFromLedger(-1)).rejects.toThrow();
+    expect(mockedPrisma.indexerState.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+describe('replayFromLedger execution report', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('returns a reproducible report with requestId, duration and counts', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce({
+      id: 'singleton',
+      lastLedger: 500,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    });
+    mockedPrisma.indexerState.upsert.mockResolvedValueOnce({
+      id: 'singleton',
+      lastLedger: 100,
+      lastCursor: null,
+      updatedAt: new Date(),
+    });
+    mockedWorker.triggerPoll.mockResolvedValueOnce(undefined);
+
+    const report = await indexerService.replayFromLedger(100, { requestId: 'req-1' });
+
+    expect(report).toMatchObject({
+      requestId: 'req-1',
+      outcome: 'executed',
+      fromLedger: 100,
+      previousLedger: 500,
+      previousCursor: 'cursor-live',
+      cursorPreserved: false,
+    });
+    expect(report.counts).toEqual(
+      expect.objectContaining({ ledgersRewound: 400, stateWrites: 1, pollsTriggered: 1 }),
+    );
+    expect(typeof report.durationMs).toBe('number');
+    expect(report.durationMs).toBeGreaterThanOrEqual(0);
+    expect(report.failurePosition).toBeNull();
+  });
+
+  it('generates a requestId when the caller does not supply one', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce(null);
+    mockedPrisma.indexerState.upsert.mockResolvedValueOnce({});
+    mockedWorker.triggerPoll.mockResolvedValueOnce(undefined);
+
+    const report = await indexerService.replayFromLedger(10);
+
+    expect(typeof report.requestId).toBe('string');
+    expect(report.requestId.length).toBeGreaterThan(0);
+  });
+
+  it('preserves the live cursor and reports the failure position when the poll throws', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce({
+      id: 'singleton',
+      lastLedger: 500,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    });
+    mockedPrisma.indexerState.upsert.mockResolvedValueOnce({});
+    mockedWorker.triggerPoll.mockRejectedValueOnce(new Error('rpc down'));
+
+    const report = await indexerService.replayFromLedger(100, { requestId: 'req-2' });
+
+    expect(report.outcome).toBe('failed');
+    expect(report.requestId).toBe('req-2');
+    expect(report.cursorPreserved).toBe(true);
+    expect(report.failurePosition).toEqual(
+      expect.objectContaining({ stage: 'triggerPoll', ledger: 100 }),
+    );
+    expect(report.errorMessage).toBe('rpc down');
+    expect(report.counts.pollsTriggered).toBe(0);
+  });
+
+  it('is reproducible: identical inputs yield identical summaries apart from timing', async () => {
+    const setup = () => {
+      mockedPrisma.indexerState.findUnique.mockResolvedValueOnce({
+        id: 'singleton',
+        lastLedger: 500,
+        lastCursor: 'cursor-live',
+        updatedAt: new Date(),
+      });
+      mockedPrisma.indexerState.upsert.mockResolvedValueOnce({});
+      mockedWorker.triggerPoll.mockResolvedValueOnce(undefined);
+    };
+
+    setup();
+    const first = await indexerService.replayFromLedger(100, { requestId: 'req-x' });
+    setup();
+    const second = await indexerService.replayFromLedger(100, { requestId: 'req-x' });
+
+    const strip = (r: typeof first) => ({ ...r, durationMs: 0 });
+    expect(strip(first)).toEqual(strip(second));
+  });
+});
+
+describe('indexer metrics instrumentation', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('records indexed-ledger lag and last-success time on status reads', async () => {
+    mockedPrisma.indexerState.findUnique.mockResolvedValueOnce({
+      id: 'singleton',
+      lastLedger: 123,
+      lastCursor: 'cursor-xyz',
+      updatedAt: new Date(),
+    });
+
+    await indexerService.getIndexerStatus();
+
+    expect(hoisted.setIndexerLedgers).toHaveBeenCalledWith(123);
+    expect(hoisted.setIndexerLastSuccessTimestamp).toHaveBeenCalled();
+  });
+
+  it('increments retry counters when a dead-letter replay fails', async () => {
+    mockedPrisma.indexerDeadLetterEvent.findUnique.mockResolvedValueOnce({
+      id: 'row-1',
+      eventId: 'event-0001',
+      eventType: 'stream_created',
+      ledgerSequence: 482910,
+      payload: indexerService.serializeDeadLetterPayload(makeEvent()),
+      attempts: 1,
+    });
+    mockedWorker.processEvent.mockRejectedValueOnce(new Error('boom'));
+    mockedPrisma.indexerDeadLetterEvent.update.mockResolvedValueOnce({ attempts: 2 });
+
+    await indexerService.replayDeadLetterEvent('row-1');
+
+    expect(hoisted.indexerRetriesTotal.inc).toHaveBeenCalled();
   });
 });
 

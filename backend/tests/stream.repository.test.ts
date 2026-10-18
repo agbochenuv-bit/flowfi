@@ -171,4 +171,137 @@ describe('Stream Repository', () => {
       expect(result.streams).toHaveLength(5);
     });
   });
+
+  describe('findStreams ordering and pagination stability', () => {
+    it('should preserve result ordering returned by the database', async () => {
+      const rows = [
+        { streamId: 3n, startTime: new Date('2024-03-01T00:00:00Z') },
+        { streamId: 2n, startTime: new Date('2024-02-01T00:00:00Z') },
+        { streamId: 1n, startTime: new Date('2024-01-01T00:00:00Z') },
+      ];
+      (prisma.stream.findMany as any).mockResolvedValue(rows);
+      (prisma.stream.count as any).mockResolvedValue(3);
+
+      const result = await findStreams({ limit: 10, offset: 0 });
+
+      expect(result.streams).toEqual(rows);
+      expect(result.streams.map((s: any) => s.streamId)).toEqual([3n, 2n, 1n]);
+    });
+
+    it('should keep ordering stable across pages with offset pagination', async () => {
+      const all = [
+        { streamId: 5n },
+        { streamId: 4n },
+        { streamId: 3n },
+        { streamId: 2n },
+        { streamId: 1n },
+      ];
+      (prisma.stream.count as any).mockResolvedValue(all.length);
+
+      (prisma.stream.findMany as any).mockResolvedValueOnce(all.slice(0, 2));
+      const first = await findStreams({ limit: 2, offset: 0 });
+
+      (prisma.stream.findMany as any).mockResolvedValueOnce(all.slice(2, 4));
+      const second = await findStreams({ limit: 2, offset: 2 });
+
+      (prisma.stream.findMany as any).mockResolvedValueOnce(all.slice(4, 5));
+      const third = await findStreams({ limit: 2, offset: 4 });
+
+      expect(first.streams.map((s: any) => s.streamId)).toEqual([5n, 4n]);
+      expect(second.streams.map((s: any) => s.streamId)).toEqual([3n, 2n]);
+      expect(third.streams.map((s: any) => s.streamId)).toEqual([1n]);
+
+      expect(first.hasMore).toBe(true);
+      expect(second.hasMore).toBe(true);
+      expect(third.hasMore).toBe(false);
+
+      expect(prisma.stream.findMany).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ take: 2, skip: 0 }),
+      );
+      expect(prisma.stream.findMany).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ take: 2, skip: 2 }),
+      );
+      expect(prisma.stream.findMany).toHaveBeenNthCalledWith(
+        3,
+        expect.objectContaining({ take: 2, skip: 4 }),
+      );
+    });
+
+    it('should handle empty result set', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue([]);
+      (prisma.stream.count as any).mockResolvedValue(0);
+
+      const result = await findStreams({ limit: 10, offset: 0 });
+
+      expect(result.streams).toEqual([]);
+      expect(result.total).toBe(0);
+      expect(result.hasMore).toBe(false);
+    });
+
+    it('should handle offset beyond total results', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue([]);
+      (prisma.stream.count as any).mockResolvedValue(3);
+
+      const result = await findStreams({ limit: 10, offset: 100 });
+
+      expect(result.streams).toEqual([]);
+      expect(result.total).toBe(3);
+      expect(result.hasMore).toBe(false);
+      expect(prisma.stream.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ take: 10, skip: 100 }),
+      );
+    });
+
+    it('should report hasMore true on first page when total exceeds page size', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue(Array(2).fill({}));
+      (prisma.stream.count as any).mockResolvedValue(3);
+
+      const result = await findStreams({ limit: 2, offset: 0 });
+
+      expect(result.hasMore).toBe(true);
+      expect(result.total).toBe(3);
+    });
+
+    it('should report hasMore false on last page when offset + page size equals total', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue(Array(2).fill({}));
+      (prisma.stream.count as any).mockResolvedValue(4);
+
+      const result = await findStreams({ limit: 2, offset: 2 });
+
+      expect(result.hasMore).toBe(false);
+      expect(result.total).toBe(4);
+    });
+
+    it('should apply deterministic tie-breaker ordering with secondary sort key', async () => {
+      (prisma.stream.findMany as any).mockResolvedValue([]);
+      (prisma.stream.count as any).mockResolvedValue(0);
+
+      await findStreams({ limit: 10, offset: 0, sortBy: 'startTime', sortOrder: 'desc' });
+
+      expect(prisma.stream.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          orderBy: expect.anything(),
+        }),
+      );
+    });
+
+    it('should preserve ordering when filtering by status and paginating', async () => {
+      const rows = [{ streamId: 9n }, { streamId: 7n }];
+      (prisma.stream.findMany as any).mockResolvedValue(rows);
+      (prisma.stream.count as any).mockResolvedValue(2);
+
+      const result = await findStreams({ limit: 2, offset: 0, status: 'active' });
+
+      expect(result.streams.map((s: any) => s.streamId)).toEqual([9n, 7n]);
+      expect(prisma.stream.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({
+          where: expect.objectContaining({ isActive: true, isPaused: false }),
+          take: 2,
+          skip: 0,
+        }),
+      );
+    });
+  });
 });

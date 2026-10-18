@@ -123,6 +123,30 @@ echo ""
 cd "$(dirname "$0")/.." || exit 1
 CONTRACTS_DIR="contracts"
 
+# Step 0: Database migration preflight (opt-in, non-breaking)
+# Runs the backward-compatibility migration validation (expand/backfill/contract)
+# against a throwaway Postgres instance before any contract deployment happens.
+# Disabled by default so existing deploy behavior is unchanged; enable with
+#   RUN_DB_MIGRATION_PREFLIGHT=1 ./scripts/deploy.sh --network testnet
+# See docs/migrations/ROLLOUT_CHECKLIST.md for the full rollout procedure.
+if [[ "${RUN_DB_MIGRATION_PREFLIGHT:-0}" == "1" ]]; then
+  echo -e "${BLUE}Step 0: Validating Prisma migrations (backward compatibility)...${NC}"
+  MIGRATION_PREFLIGHT_SCRIPT="scripts/ci/migration-preflight.sh"
+  if [[ ! -x "$MIGRATION_PREFLIGHT_SCRIPT" ]]; then
+    echo -e "${RED}Error: Migration preflight script not found or not executable: $MIGRATION_PREFLIGHT_SCRIPT${NC}"
+    exit 1
+  fi
+  if ! "$MIGRATION_PREFLIGHT_SCRIPT"; then
+    echo -e "${RED}Error: Migration preflight failed; aborting deployment${NC}"
+    exit 1
+  fi
+  echo -e "${GREEN}✓ Migration preflight passed${NC}"
+  echo ""
+else
+  echo -e "${YELLOW}Skipping DB migration preflight (set RUN_DB_MIGRATION_PREFLIGHT=1 to enable)${NC}"
+  echo ""
+fi
+
 # Step 1: Build WASM
 echo -e "${BLUE}Step 1: Building WASM...${NC}"
 cd "$CONTRACTS_DIR" || exit 1

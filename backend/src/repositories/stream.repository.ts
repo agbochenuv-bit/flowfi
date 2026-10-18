@@ -111,10 +111,18 @@ export const findStreams = async (params: FindStreamsParams): Promise<FindStream
   const sortField = params.sortField || 'startTime';
   const sortOrder = params.sortOrder || 'desc';
 
+  // Add a deterministic tie-breaker (streamId) so pagination is stable when
+  // multiple rows share the same sort value. This matches the composite
+  // indexes (e.g. [sender, startTime, streamId]) used by the query planner.
+  const orderBy: Record<string, 'asc' | 'desc'>[] = [{ [sortField]: sortOrder }];
+  if (sortField !== 'streamId') {
+    orderBy.push({ streamId: sortOrder });
+  }
+
   const [streams, total] = await Promise.all([
     prisma.stream.findMany({
       where,
-      orderBy: { [sortField]: sortOrder },
+      orderBy,
       take: params.limit,
       skip: params.offset,
       include: {

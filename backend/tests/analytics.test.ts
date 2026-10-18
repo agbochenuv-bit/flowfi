@@ -7,7 +7,7 @@
  * validation errors, and the DefiLlama adapter mapping.
  */
 
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
 const queryMock = vi.fn();
 
@@ -32,6 +32,12 @@ import {
   getHistoricalAnalytics,
   getProtocolTvl,
   resetTimescaleCacheForTests,
+  resetAnalyticsCacheForTests,
+  invalidateAnalyticsCache,
+  getAnalyticsCacheStatsForTests,
+  ANALYTICS_CACHE_STALENESS_MS,
+  resolveUtcWindow,
+  bucketStartUtc,
 } from "../src/services/analytics.service.js";
 
 describe("analytics service (#1480)", () => {
@@ -149,5 +155,230 @@ describe("analytics service (#1480)", () => {
     expect(series.points[0]?.avgTvlStroops).toBe("123");
     expect(series.points[0]?.peakStreams).toBe(9);
     expect(queryMock.mock.calls.at(-1)![0]).toContain("daily_protocol_metrics");
+  });
+});
+
+describe("analytics time-window semantics (#61)", () => {
+  const originalTz = process.env.TZ;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryMock.mockReset();
+    resetTimescaleCacheForTests();
+    resetAnalyticsCacheForTests();
+  });
+
+  afterEach(() => {
+    if (originalTz === undefined) {
+      delete process.env.TZ;
+    } else {
+      process.env.TZ = originalTz;
+    }
+  });
+
+  it("resolves windows to UTC boundaries regardless of the process timezone", () => {
+    const anchor = new Date("2026-09-28T13:37:45.123Z");
+    const windows = ["24h", "7d", "30d", "90d"] as const;
+    const results: Record<string, unknown> = {};
+
+    for (const tz of ["UTC", "America/New_York", "Asia/Kolkata", "Pacific/Kiritimati"]) {
+      process.env.TZ = tz;
+      results[tz] = windows.map((w) => resolveUtcWindow(w, anchor));
+    }
+
+    // Every timezone must produce byte-identical UTC windows.
+    expect(results["America/New_York"]).toEqual(results["UTC"]);
+    expect(results["Asia/Kolkata"]).toEqual(results["UTC"]);
+    expect(results["Pacific/Kiritimati"]).toEqual(results["UTC"]);
+
+    const day = resolveUtcWindow("24h", anchor);
+    expect(day.start.toISOString()).toBe("2026-09-27T13:37:45.123Z");
+    expect(day.end.toISOString()).toBe("2026-09-28T13:37:45.123Z");
+    // Half-open interval: start inclusive, end exclusive.
+    expect(day.startInclusive).toBe(true);
+    expect(day.endInclusive).toBe(false);
+  });
+
+  it("buckets timestamps into half-open UTC buckets", () => {
+    const bucketMs = 24 * 60 * 60 * 1000;
+    const exactBoundary = new Date("2026-09-28T00:00:00.000Z");
+    const justBefore = new Date("2026-09-27T23:59:59.999Z");
+    const justAfter = new Date("2026-09-28T00:00:00.001Z");
+
+    expect(bucketStartUtc(exactBoundary, bucketMs).toISOString()).toBe(
+      "2026-09-28T00:00:00.000Z",
+    );
+    expect(bucketStartUtc(justBefore, bucketMs).toISOString()).toBe(
+      "2026-09-27T00:00:00.000Z",
+    );
+    expect(bucketStartUtc(justAfter, bucketMs).toISOString()).toBe(
+      "2026-09-28T00:00:00.000Z",
+    );
+  });
+
+  it("produces repeatable aggregates across timezone changes", async () => {
+    const rows = [
+      {
+        bucket: new Date("2026-09-28T00:00:00Z"),
+        token_address: "TOKEN_A",
+        avg_tvl: "123",
+        aggregate_velocity: "4",
+        peak_streams: 9,
+      },
+    ];
+
+    const run = async (tz: string) => {
+      process.env.TZ = tz;
+      resetTimescaleCacheForTests();
+      resetAnalyticsCacheForTests();
+      queryMock.mockReset();
+      queryMock.mockResolvedValueOnce({ rows: [{ hypertable: "stream_flow_snapshots" }] });
+      queryMock.mockResolvedValueOnce({ rows });
+      return getHistoricalAnalytics("90d", "1d");
+    };
+
+    const utc = await run("UTC");
+    const ny = await run("America/New_York");
+    const kolkata = await run("Asia/Kolkata");
+
+    expect(ny).toEqual(utc);
+    expect(kolkata).toEqual(utc);
+    expect(utc.points[0]?.bucket).toBe("2026-09-28T00:00:00.000Z");
+  });
+
+  it("incorporates events indexed after an initial query once the cache is invalidated", async () => {
+    queryMock.mockResolvedValueOnce({ rows: [{ hypertable: "stream_flow_snapshots" }] });
+    queryMock.mockResolvedValueOnce({
+      rows: [
+        {
+          bucket: new Date("2026-09-28T00:00:00Z"),
+          token_address: "TOKEN_A",
+          avg_tvl: "100",
+          aggregate_velocity: "1",
+          peak_streams: 1,
+        },
+      ],
+    });
+
+    const first = await getHistoricalAnalytics("7d", "1d");
+    expect(first.points).toHaveLength(1);
+
+    // A late-arriving indexed event lands in the same UTC bucket.
+    queryMock.mockResolvedValueOnce({
+      rows: [
+        {
+          bucket: new Date("2026-09-28T00:00:00Z"),
+          token_address: "TOKEN_A",
+          avg_tvl: "250",
+          aggregate_velocity: "3",
+          peak_streams: 2,
+        },
+      ],
+    });
+
+    // Without invalidation the cached series is served (documented staleness).
+    const cached = await getHistoricalAnalytics("7d", "1d");
+    expect(cached.points[0]?.avgTvlStroops).toBe("100");
+
+    invalidateAnalyticsCache();
+    const refreshed = await getHistoricalAnalytics("7d", "1d");
+    expect(refreshed.points[0]?.avgTvlStroops).toBe("250");
+    expect(refreshed.points[0]?.peakStreams).toBe(2);
+  });
+
+  it("scopes aggregates to the requested network", async () => {
+    queryMock.mockResolvedValueOnce({ rows: [{ hypertable: "stream_flow_snapshots" }] });
+    queryMock.mockResolvedValueOnce({ rows: [] });
+
+    await getHistoricalAnalytics("7d", "1d", { network: "testnet" });
+
+    const dataCall = queryMock.mock.calls.at(-1)!;
+    expect(String(dataCall[0])).toContain("network");
+    expect(dataCall[1]).toContain("testnet");
+  });
+});
+
+describe("analytics caching and invalidation (#62)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    queryMock.mockReset();
+    resetTimescaleCacheForTests();
+    resetAnalyticsCacheForTests();
+  });
+
+  const primeTimescale = () => {
+    queryMock.mockResolvedValueOnce({ rows: [{ hypertable: "stream_flow_snapshots" }] });
+  };
+
+  it("serves repeated identical queries from cache without re-querying", async () => {
+    primeTimescale();
+    queryMock.mockResolvedValueOnce({ rows: [] });
+
+    await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+    const callsAfterFirst = queryMock.mock.calls.length;
+    await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+
+    expect(queryMock.mock.calls.length).toBe(callsAfterFirst);
+    expect(getAnalyticsCacheStatsForTests().hits).toBeGreaterThanOrEqual(1);
+  });
+
+  it("does not cross networks in the cache key", async () => {
+    primeTimescale();
+    queryMock.mockResolvedValueOnce({ rows: [] });
+    await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+
+    queryMock.mockResolvedValueOnce({ rows: [] });
+    await getHistoricalAnalytics("30d", "1d", { network: "testnet" });
+
+    // Two distinct data queries were issued: one per network.
+    const dataCalls = queryMock.mock.calls.filter((c) =>
+      String(c[0]).includes("daily_protocol_metrics"),
+    );
+    expect(dataCalls).toHaveLength(2);
+    expect(getAnalyticsCacheStatsForTests().misses).toBeGreaterThanOrEqual(2);
+  });
+
+  it("does not cross users in the cache key", async () => {
+    primeTimescale();
+    queryMock.mockResolvedValueOnce({ rows: [] });
+    await getHistoricalAnalytics("30d", "1d", { network: "mainnet", userId: "user-a" });
+
+    queryMock.mockResolvedValueOnce({ rows: [] });
+    await getHistoricalAnalytics("30d", "1d", { network: "mainnet", userId: "user-b" });
+
+    const dataCalls = queryMock.mock.calls.filter((c) =>
+      String(c[0]).includes("daily_protocol_metrics"),
+    );
+    expect(dataCalls).toHaveLength(2);
+  });
+
+  it("expires entries after the documented staleness window", async () => {
+    vi.useFakeTimers();
+    try {
+      primeTimescale();
+      queryMock.mockResolvedValueOnce({ rows: [] });
+      await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+
+      vi.advanceTimersByTime(ANALYTICS_CACHE_STALENESS_MS - 1);
+      const beforeExpiry = queryMock.mock.calls.length;
+      await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+      expect(queryMock.mock.calls.length).toBe(beforeExpiry);
+
+      vi.advanceTimersByTime(2);
+      queryMock.mockResolvedValueOnce({ rows: [] });
+      await getHistoricalAnalytics("30d", "1d", { network: "mainnet" });
+      expect(queryMock.mock.calls.length).toBeGreaterThan(beforeExpiry);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("bounds the cache size", async () => {
+    primeTimescale();
+    for (let i = 0; i < 300; i += 1) {
+      queryMock.mockResolvedValueOnce({ rows: [] });
+      await getHistoricalAnalytics("30d", "1d", { network: `net-${i}` });
+    }
+    expect(getAnalyticsCacheStatsForTests().size).toBeLessThanOrEqual(256);
   });
 });

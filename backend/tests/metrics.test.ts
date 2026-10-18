@@ -295,6 +295,105 @@ describe('metrics registry', () => {
   });
 });
 
+describe('indexer observability metrics', () => {
+  /**
+   * The indexer metrics are the ones an operator pages on: lag, throughput,
+   * decode/persist latency, retries and last-success time. They must be
+   * documented (HELP text carries units), labelled with bounded values only,
+   * and aggregate sensibly across multiple worker instances.
+   */
+  const INDEXER_METRICS = [
+    'flowfi_indexer_lag_ledgers',
+    'flowfi_indexer_events_per_ledger',
+    'flowfi_indexer_decode_duration_seconds',
+    'flowfi_indexer_persist_duration_seconds',
+    'flowfi_indexer_retries_total',
+    'flowfi_indexer_last_success_timestamp_seconds',
+  ] as const;
+
+  beforeEach(() => {
+    vi.resetModules();
+  });
+
+  it('exports every indexer metric with a HELP line documenting units', async () => {
+    const { getMetricsRegistry } = await import('../src/lib/metrics.js');
+    const body = await getMetricsRegistry().metrics();
+
+    for (const name of INDEXER_METRICS) {
+      expect(body, `missing metric: ${name}`).toContain(name);
+      // Every metric must carry a HELP line; units live there.
+      expect(body, `missing HELP for ${name}`).toMatch(
+        new RegExp(`# HELP ${name} .+`),
+      );
+    }
+
+    // Units are part of the contract, not just the name.
+    expect(body).toMatch(/# HELP flowfi_indexer_lag_ledgers .*ledgers/);
+    expect(body).toMatch(/# HELP flowfi_indexer_decode_duration_seconds .*seconds/);
+    expect(body).toMatch(/# HELP flowfi_indexer_persist_duration_seconds .*seconds/);
+    expect(body).toMatch(/# HELP flowfi_indexer_last_success_timestamp_seconds .*seconds/);
+  });
+
+  it('keeps indexer label sets bounded and free of high-cardinality identifiers', async () => {
+    const { getMetricsRegistry } = await import('../src/lib/metrics.js');
+    const series = await getMetricsRegistry().getMetricsAsJSON();
+
+    const indexerSeries = series.filter((m) => m.name.startsWith('flowfi_indexer_'));
+    expect(indexerSeries.length).toBeGreaterThan(0);
+
+    const forbidden = /(tx_?hash|transaction|wallet|address|account|stream_?id|user)/i;
+    for (const metric of indexerSeries) {
+      for (const labelName of Object.keys(metric.values[0]?.labels ?? {})) {
+        expect(labelName, `${metric.name} has high-cardinality label`).not.toMatch(forbidden);
+      }
+    }
+  });
+
+  it('records lag, events per ledger, latency, retries and last-success time', async () => {
+    const metrics = await import('../src/lib/metrics.js');
+    const registry = metrics.getMetricsRegistry();
+
+    // Drive the owning component's recording helpers rather than poking the
+    // registry directly, so the test covers the real call path.
+    metrics.recordIndexerLag({ networkLedger: 1_000, currentLedger: 990 });
+    metrics.observeIndexerEventsPerLedger(7);
+    metrics.observeIndexerDecodeDuration(0.012);
+    metrics.observeIndexerPersistDuration(0.034);
+    metrics.incrementIndexerRetries({ reason: 'rpc_timeout' });
+    metrics.incrementIndexerRetries({ reason: 'rpc_timeout' });
+    metrics.setIndexerLastSuccess(Date.now());
+
+    const body = await registry.metrics();
+    expect(body).toMatch(/flowfi_indexer_lag_ledgers 10/);
+    expect(body).toMatch(/flowfi_indexer_events_per_ledger_count 1/);
+    expect(body).toMatch(/flowfi_indexer_events_per_ledger_sum 7/);
+    expect(body).toMatch(/flowfi_indexer_decode_duration_seconds_count 1/);
+    expect(body).toMatch(/flowfi_indexer_persist_duration_seconds_count 1/);
+    expect(body).toMatch(/flowfi_indexer_retries_total\{reason="rpc_timeout"\} 2/);
+    expect(body).toMatch(/flowfi_indexer_last_success_timestamp_seconds \d{10,}/);
+  });
+
+  it('clamps lag at zero when the indexer is ahead of the network', async () => {
+    const metrics = await import('../src/lib/metrics.js');
+    metrics.recordIndexerLag({ networkLedger: 500, currentLedger: 505 });
+
+    const body = await metrics.getMetricsRegistry().metrics();
+    expect(body).toMatch(/flowfi_indexer_lag_ledgers 0/);
+  });
+
+  it('aggregates across multiple worker instances without label collisions', async () => {
+    const metrics = await import('../src/lib/metrics.js');
+
+    // Two workers report the same bounded label set; the registry must sum
+    // them rather than overwrite, so a scrape reflects the whole fleet.
+    metrics.incrementIndexerRetries({ reason: 'db_error' }, 3);
+    metrics.incrementIndexerRetries({ reason: 'db_error' }, 4);
+
+    const body = await metrics.getMetricsRegistry().metrics();
+    expect(body).toMatch(/flowfi_indexer_retries_total\{reason="db_error"\} 7/);
+  });
+});
+
 describe('normalizeRoute', () => {
   beforeEach(async () => {
     vi.resetModules();

@@ -45,3 +45,30 @@ export const healthRateLimiter = createRateLimiter({
     status: 429,
   },
 });
+
+/**
+ * Dedicated limiter for webhook delivery replay (issue #59).
+ *
+ * Replaying failed deliveries fans out outbound HTTP requests to subscriber
+ * endpoints, so it is far more expensive than a normal read. Replays are
+ * scoped per IP *and* per authenticated wallet address so that a single
+ * caller cannot exhaust the budget for other users behind the same NAT/proxy,
+ * while still bounding the total fan-out a single IP can trigger.
+ *
+ * 5 replays per 10 minutes is enough for normal operational retries but low
+ * enough to prevent an attacker from using the replay endpoint as an
+ * outbound request amplifier.
+ */
+export const webhookReplayRateLimiter = createRateLimiter({
+  windowMs: 10 * 60 * 1000, // 10 minutes
+  max: 5, // 5 replay requests per window per IP + user address
+  keyGenerator: (req) => {
+    const userAddress =
+      (req as { user?: { address?: string } }).user?.address ?? 'anonymous';
+    return `${req.ip}:${userAddress.toLowerCase()}`;
+  },
+  message: {
+    message: 'Too many webhook replay requests, please try again later.',
+    status: 429,
+  },
+});

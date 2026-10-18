@@ -188,5 +188,115 @@ describe('streamEvent.repository', () => {
 
       expect(result.hasMore).toBe(false);
     });
+
+    describe('ordering and pagination stability', () => {
+      const makeEvent = (id: string, timestamp: Date) => ({ id, timestamp });
+
+      it('always orders by timestamp desc so index-backed reads are deterministic', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+        (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+        await listEventsForWallet({ address: ADDR, limit: 10, offset: 0 });
+
+        const callArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+        expect(callArgs.orderBy).toEqual({ timestamp: 'desc' });
+      });
+
+      it('preserves the order returned by the database without re-sorting', async () => {
+        const rows = [
+          makeEvent('evt-3', new Date('2024-03-03T00:00:00.000Z')),
+          makeEvent('evt-2', new Date('2024-03-02T00:00:00.000Z')),
+          makeEvent('evt-1', new Date('2024-03-01T00:00:00.000Z')),
+        ];
+        (prisma.streamEvent.findMany as any).mockResolvedValue(rows);
+        (prisma.streamEvent.count as any).mockResolvedValue(3);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 0 });
+
+        expect(result.events.map((e: any) => e.id)).toEqual(['evt-3', 'evt-2', 'evt-1']);
+      });
+
+      it('keeps tie-breaker ordering stable for events sharing a timestamp', async () => {
+        const ts = new Date('2024-05-01T12:00:00.000Z');
+        const rows = [
+          makeEvent('evt-b', ts),
+          makeEvent('evt-a', ts),
+          makeEvent('evt-c', ts),
+        ];
+        (prisma.streamEvent.findMany as any).mockResolvedValue(rows);
+        (prisma.streamEvent.count as any).mockResolvedValue(3);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 0 });
+
+        // The repository must not reorder rows; the database tie-breaker wins.
+        expect(result.events.map((e: any) => e.id)).toEqual(['evt-b', 'evt-a', 'evt-c']);
+      });
+
+      it('returns an empty page with hasMore false when there are no events', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+        (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 0 });
+
+        expect(result.events).toEqual([]);
+        expect(result.total).toBe(0);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('reports hasMore true on the first page when more rows exist', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue(Array(10).fill({}));
+        (prisma.streamEvent.count as any).mockResolvedValue(11);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 0 });
+
+        expect(result.hasMore).toBe(true);
+      });
+
+      it('reports hasMore false on the last page when the page is exactly full', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue(Array(10).fill({}));
+        (prisma.streamEvent.count as any).mockResolvedValue(20);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 10 });
+
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('reports hasMore false when the offset is beyond the total', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+        (prisma.streamEvent.count as any).mockResolvedValue(5);
+
+        const result = await listEventsForWallet({ address: ADDR, limit: 10, offset: 50 });
+
+        expect(result.events).toEqual([]);
+        expect(result.hasMore).toBe(false);
+      });
+
+      it('passes skip/take unchanged for the last partial page', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue(Array(3).fill({}));
+        (prisma.streamEvent.count as any).mockResolvedValue(23);
+
+        await listEventsForWallet({ address: ADDR, limit: 10, offset: 20 });
+
+        expect(prisma.streamEvent.findMany).toHaveBeenCalledWith(
+          expect.objectContaining({ take: 10, skip: 20 }),
+        );
+      });
+
+      it('uses the same where-clause for the page and the count query', async () => {
+        (prisma.streamEvent.findMany as any).mockResolvedValue([]);
+        (prisma.streamEvent.count as any).mockResolvedValue(0);
+
+        await listEventsForWallet({
+          address: ADDR,
+          types: ['PAUSED'],
+          limit: 10,
+          offset: 0,
+        });
+
+        const findArgs = (prisma.streamEvent.findMany as any).mock.calls[0][0];
+        const countArgs = (prisma.streamEvent.count as any).mock.calls[0][0];
+        expect(countArgs.where).toEqual(findArgs.where);
+      });
+    });
   });
 });

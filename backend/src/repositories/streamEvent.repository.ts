@@ -97,6 +97,60 @@ export function resolveEventsOffset(params: {
   return Math.max(0, (page - 1) * limit);
 }
 
+/** A single event row to persist via the batched helper. */
+export interface StreamEventCreateInput {
+  txHash: string;
+  logIndex: number;
+  eventType: string;
+  streamId?: string | null;
+  actor?: string | null;
+  amount?: string | null;
+  metadata?: Prisma.InputJsonValue | null;
+  ledger?: number | null;
+  timestamp?: Date | string | null;
+}
+
+/** Minimal transaction client surface required by the batched helper. */
+export type StreamEventTxClient = Pick<Prisma.TransactionClient, "streamEvent">;
+
+/**
+ * Persist a bounded batch of stream events in a single round trip.
+ *
+ * Uses `createMany({ skipDuplicates: true })` so that re-processing a ledger
+ * range (e.g. after a worker crash/retry) never raises unique-constraint
+ * errors and never inserts duplicate rows: event-level idempotency is
+ * preserved by the existing `(txHash, logIndex)` unique constraint.
+ *
+ * The caller is expected to pass a transaction client (`tx`) so the batch
+ * insert and the cursor advance commit atomically. When omitted, the batch
+ * runs against the shared `prisma` client (single statement, still atomic).
+ *
+ * Returns the number of rows actually inserted (duplicates are skipped).
+ */
+export async function createManySkipDuplicates(
+  events: StreamEventCreateInput[],
+  tx: StreamEventTxClient = prisma,
+): Promise<number> {
+  if (events.length === 0) return 0;
+
+  const result = await tx.streamEvent.createMany({
+    data: events.map((event) => ({
+      txHash: event.txHash,
+      logIndex: event.logIndex,
+      eventType: event.eventType,
+      streamId: event.streamId ?? null,
+      actor: event.actor ?? null,
+      amount: event.amount ?? null,
+      metadata: event.metadata ?? undefined,
+      ledger: event.ledger ?? null,
+      timestamp: event.timestamp ?? undefined,
+    })),
+    skipDuplicates: true,
+  });
+
+  return result.count;
+}
+
 export interface ListEventsForWalletParams {
   /** Stellar public key to match as either the stream sender or recipient. */
   address: string;
@@ -139,7 +193,10 @@ export async function listEventsForWallet(
   const [events, total] = await Promise.all([
     prisma.streamEvent.findMany({
       where,
-      orderBy: { timestamp: "desc" },
+      // Deterministic tie-breaker on `id` keeps offset/cursor pagination
+      // stable when multiple events share the same `timestamp`, and matches
+      // the (timestamp DESC, id DESC) index used for this access pattern.
+      orderBy: [{ timestamp: "desc" }, { id: "desc" }],
       skip: offset,
       take: limit,
       ...(includeStream ? { include: { stream: true } } : {}),
