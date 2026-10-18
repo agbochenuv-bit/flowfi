@@ -53,6 +53,83 @@ export interface OutboxDispatchResult {
   dead: number;
 }
 
+export const ALLOWED_WEBHOOK_EVENT_TYPES = [
+  "STREAM_CREATED",
+  "STREAM_UPDATED",
+  "STREAM_CANCELLED",
+  "STREAM_COMPLETED",
+  "STREAM_WITHDRAWN",
+  "TEST_PING",
+] as const;
+
+export type WebhookEventType = (typeof ALLOWED_WEBHOOK_EVENT_TYPES)[number];
+
+export const MAX_REPLAY_LIMIT = 100;
+export const MAX_REPLAY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+
+export type WebhookErrorCode =
+  | "WEBHOOK_NOT_FOUND"
+  | "WEBHOOK_FORBIDDEN"
+  | "WEBHOOK_DISABLED"
+  | "WEBHOOK_DELETED"
+  | "WEBHOOK_INVALID_URL"
+  | "WEBHOOK_INVALID_EVENT_TYPES"
+  | "WEBHOOK_DUPLICATE"
+  | "WEBHOOK_INVALID_REPLAY";
+
+export class WebhookError extends Error {
+  constructor(
+    public readonly code: WebhookErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = "WebhookError";
+  }
+}
+
+function validateTargetUrl(targetUrl: string): void {
+  if (typeof targetUrl !== "string" || !targetUrl.startsWith("https://")) {
+    throw new WebhookError(
+      "WEBHOOK_INVALID_URL",
+      "Webhook URL must use HTTPS",
+    );
+  }
+}
+
+function validateEventTypes(eventTypes: string[]): void {
+  if (!Array.isArray(eventTypes) || eventTypes.length === 0) {
+    throw new WebhookError(
+      "WEBHOOK_INVALID_EVENT_TYPES",
+      "At least one event type is required",
+    );
+  }
+  const allowed = new Set<string>(ALLOWED_WEBHOOK_EVENT_TYPES);
+  for (const eventType of eventTypes) {
+    if (!allowed.has(eventType)) {
+      throw new WebhookError(
+        "WEBHOOK_INVALID_EVENT_TYPES",
+        `Unsupported webhook event type: ${eventType}`,
+      );
+    }
+  }
+}
+
+async function findOwnedSubscription(id: string, userAddress: string) {
+  const subscription = await prisma.webhookSubscription.findUnique({
+    where: { id },
+  });
+  if (!subscription) {
+    throw new WebhookError("WEBHOOK_NOT_FOUND", "Webhook subscription not found");
+  }
+  if (subscription.userAddress !== userAddress) {
+    throw new WebhookError(
+      "WEBHOOK_FORBIDDEN",
+      "Webhook subscription does not belong to this user",
+    );
+  }
+  return subscription;
+}
+
 /**
  * Produce a stable, sorted-key JSON representation of a payload so that
  * signatures are reproducible regardless of key ordering.
@@ -419,9 +496,18 @@ export async function createWebhookSubscription(
   targetUrl: string,
   eventTypes: string[],
 ): Promise<WebhookSubscription> {
-  // Validate HTTPS
-  if (!targetUrl.startsWith("https://")) {
-    throw new Error("Webhook URL must use HTTPS");
+  validateTargetUrl(targetUrl);
+  validateEventTypes(eventTypes);
+
+  // Reject duplicates (same user + target URL) among active subscriptions
+  const existing = await prisma.webhookSubscription.findFirst({
+    where: { userAddress, targetUrl, isActive: true },
+  });
+  if (existing) {
+    throw new WebhookError(
+      "WEBHOOK_DUPLICATE",
+      "An active webhook subscription for this URL already exists",
+    );
   }
 
   // Generate secure secret
@@ -465,15 +551,36 @@ export async function deleteWebhookSubscription(
   id: string,
   userAddress: string,
 ): Promise<void> {
-  await prisma.webhookSubscription.updateMany({
-    where: {
-      id,
-      userAddress, // Ensure user owns this webhook
-    },
-    data: {
-      isActive: false,
-    },
+  const owned = await findOwnedSubscription(id, userAddress);
+  if (!owned.isActive) {
+    throw new WebhookError(
+      "WEBHOOK_DELETED",
+      "Webhook subscription is already disabled or deleted",
+    );
+  }
+  await prisma.webhookSubscription.update({
+    where: { id },
+    data: { isActive: false },
   });
+}
+
+export async function disableWebhookSubscription(
+  id: string,
+  userAddress: string,
+): Promise<Omit<WebhookSubscription, "secretKey">> {
+  const owned = await findOwnedSubscription(id, userAddress);
+  if (!owned.isActive) {
+    throw new WebhookError(
+      "WEBHOOK_DISABLED",
+      "Webhook subscription is already disabled",
+    );
+  }
+  const updated = await prisma.webhookSubscription.update({
+    where: { id },
+    data: { isActive: false },
+  });
+  const { secretKey: _secretKey, ...safe } = updated;
+  return safe;
 }
 
 export async function updateWebhookSubscription(
@@ -481,15 +588,47 @@ export async function updateWebhookSubscription(
   userAddress: string,
   input: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean },
 ): Promise<Omit<WebhookSubscription, "secretKey">> {
-  if (input.targetUrl !== undefined && !input.targetUrl.startsWith("https://")) {
-    throw new Error("Webhook URL must use HTTPS");
+  const owned = await findOwnedSubscription(id, userAddress);
+  if (!owned.isActive) {
+    throw new WebhookError(
+      "WEBHOOK_DISABLED",
+      "Cannot update a disabled or deleted webhook subscription",
+    );
   }
-  const subscription = await prisma.webhookSubscription.updateMany({
-    where: { id, userAddress },
-    data: input,
+
+  const data: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean } = {};
+  if (input.targetUrl !== undefined) {
+    validateTargetUrl(input.targetUrl);
+    if (input.targetUrl !== owned.targetUrl) {
+      const duplicate = await prisma.webhookSubscription.findFirst({
+        where: {
+          userAddress,
+          targetUrl: input.targetUrl,
+          isActive: true,
+          id: { not: id },
+        },
+      });
+      if (duplicate) {
+        throw new WebhookError(
+          "WEBHOOK_DUPLICATE",
+          "An active webhook subscription for this URL already exists",
+        );
+      }
+    }
+    data.targetUrl = input.targetUrl;
+  }
+  if (input.eventTypes !== undefined) {
+    validateEventTypes(input.eventTypes);
+    data.eventTypes = input.eventTypes;
+  }
+  if (input.isActive !== undefined) {
+    data.isActive = input.isActive;
+  }
+
+  const updated = await prisma.webhookSubscription.update({
+    where: { id },
+    data,
   });
-  if (subscription.count === 0) throw new Error("Webhook subscription not found");
-  const updated = await prisma.webhookSubscription.findUniqueOrThrow({ where: { id } });
   const { secretKey: _secretKey, ...safe } = updated;
   return safe;
 }
@@ -517,11 +656,99 @@ export async function listWebhookDeliveries(
 }
 
 export async function regenerateWebhookSecret(id: string, userAddress: string): Promise<string> {
-  const owned = await prisma.webhookSubscription.findFirst({ where: { id, userAddress } });
-  if (!owned) throw new Error("Webhook subscription not found");
+  await findOwnedSubscription(id, userAddress);
   const secretKey = crypto.randomBytes(32).toString("hex");
   await prisma.webhookSubscription.update({ where: { id }, data: { secretKey } });
   return secretKey;
+}
+
+/**
+ * Replay failed deliveries for a subscription within a bounded window.
+ * Only FAILED deliveries (never delivered successfully) are re-sent.
+ * Successful deliveries are never re-sent. An audit row is written per replay.
+ */
+export async function replayFailedDeliveries(
+  id: string,
+  userAddress: string,
+  options: { since?: Date | string; limit?: number } = {},
+): Promise<{
+  replayed: number;
+  succeeded: number;
+  failed: number;
+  skipped: number;
+  replayId: string;
+}> {
+  const subscription = await findOwnedSubscription(id, userAddress);
+  if (!subscription.isActive) {
+    throw new WebhookError(
+      "WEBHOOK_DISABLED",
+      "Cannot replay deliveries for a disabled webhook subscription",
+    );
+  }
+
+  const now = Date.now();
+  const sinceDate = options.since ? new Date(options.since) : new Date(now - MAX_REPLAY_WINDOW_MS);
+  if (Number.isNaN(sinceDate.getTime())) {
+    throw new WebhookError("WEBHOOK_INVALID_REPLAY", "Invalid replay window start");
+  }
+  const windowStart = new Date(Math.max(sinceDate.getTime(), now - MAX_REPLAY_WINDOW_MS));
+
+  const requestedLimit = Math.floor(options.limit ?? MAX_REPLAY_LIMIT);
+  if (!Number.isFinite(requestedLimit) || requestedLimit < 1) {
+    throw new WebhookError("WEBHOOK_INVALID_REPLAY", "Replay limit must be at least 1");
+  }
+  const limit = Math.min(MAX_REPLAY_LIMIT, requestedLimit);
+
+  const failedDeliveries = await prisma.webhookDelivery.findMany({
+    where: {
+      subscriptionId: id,
+      deliveredAt: null,
+      createdAt: { gte: windowStart },
+    },
+    orderBy: { createdAt: "asc" },
+    take: limit,
+  });
+
+  const replayId = crypto.randomUUID();
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const delivery of failedDeliveries) {
+    const result = await deliverWebhook(
+      subscription as WebhookSubscription,
+      JSON.parse(delivery.payload) as WebhookPayload,
+    );
+    if (result.success) {
+      succeeded++;
+    } else {
+      failed++;
+    }
+  }
+
+  await prisma.webhookDeliveryReplay.create({
+    data: {
+      id: replayId,
+      subscriptionId: id,
+      userAddress,
+      since: windowStart,
+      limit,
+      replayedCount: failedDeliveries.length,
+      succeededCount: succeeded,
+      failedCount: failed,
+    },
+  });
+
+  logger.info(
+    `[Webhook] Replayed ${failedDeliveries.length} failed deliveries for ${id} (replay ${replayId})`,
+  );
+
+  return {
+    replayed: failedDeliveries.length,
+    succeeded,
+    failed,
+    skipped: 0,
+    replayId,
+  };
 }
 
 /**
@@ -540,7 +767,7 @@ export async function sendTestWebhook(
   });
 
   if (!subscription) {
-    throw new Error("Webhook subscription not found");
+    throw new WebhookError("WEBHOOK_NOT_FOUND", "Webhook subscription not found");
   }
 
   const testPayload: WebhookPayload = {

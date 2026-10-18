@@ -105,126 +105,81 @@ def verify(secret_for_kid, raw_body: bytes, header: str, now: int | None = None)
     return hmac.compare_digest(expected, v1)
 ```
 
-Always use a constant-time comparison (`hmac.compare_digest`) and reject
-requests whose `t` is outside the tolerance window **before** doing any
-business work.
+## Endpoint lifecycle
 
-## Timestamp tolerance
+Webhook endpoints are owned by the account that created them. Every
+lifecycle operation is authorized against that ownership: a caller may only
+create, update, disable, or delete endpoints belonging to their own account.
+Requests against endpoints owned by another account are rejected as
+not-found (they do not leak existence).
 
-- Default tolerance is **±300 seconds (5 minutes)** around the receiver's
-  clock. Requests outside this window are rejected as expired.
-- Keep receiver clocks NTP-synchronized; skew larger than the tolerance will
-  cause valid deliveries to be rejected.
-- The tolerance is a receiver-side policy. FlowFi always signs with its own
-  current time; it does not re-sign on retry, so a delivery that is retried
-  after the tolerance window will be rejected by a strict receiver. Receivers
-  that need to accept late retries should widen their tolerance or dedupe by
-  event id (see below) rather than disabling the timestamp check.
+### Create
 
-## Replay prevention
+- `POST /webhooks` registers a new endpoint.
+- The request is validated before persistence: the URL must be an absolute
+  `https` URL, and the secret must be present and meet the minimum length.
+  Invalid input is rejected with a validation error and nothing is stored.
+- New endpoints are created in the **enabled** state and begin receiving
+  deliveries immediately.
 
-A valid signature only proves authenticity, not freshness. To prevent replay:
+### Update
 
-1. **Enforce the timestamp tolerance** (above). This bounds the replay window.
-2. **Deduplicate by event id.** Every delivery includes a stable `id` (the
-   event id) and an `Idempotency-Key` header equal to that id. Record processed
-   ids for at least the tolerance window (longer is safer) and ignore repeats.
-3. **Treat handlers as idempotent.** Because delivery is at-least-once (see
-   below), the same event may legitimately arrive more than once. Apply the
-   business effect exactly once keyed by the event id.
+- `PATCH /webhooks/{id}` updates the URL and/or rotates the secret.
+- The same validation rules as create apply. An update that fails validation
+  leaves the stored endpoint unchanged.
+- Rotating the secret takes effect for subsequent deliveries; in-flight
+  retries for already-signed attempts are not re-signed.
 
-```python
-def handle(secret_for_kid, headers, raw_body, seen_ids):
-    if not verify(secret_for_kid, raw_body, headers["X-FlowFi-Signature"]):
-        return 401
-    event = json.loads(raw_body)
-    if event["id"] in seen_ids:
-        return 200  # already processed; acknowledge without re-applying
-    apply_event(event)
-    seen_ids.add(event["id"])
-    return 200
-```
+### Disable
 
-## Outbox delivery semantics
+- `POST /webhooks/{id}/disable` transitions the endpoint to the **disabled**
+  state.
+- While disabled, the endpoint receives **no new deliveries**. Events that
+  occur during the disabled window are not queued for the endpoint; they are
+  not delivered retroactively when it is re-enabled.
+- Disabling is idempotent: disabling an already-disabled endpoint succeeds
+  without error.
 
-Delivery scheduling is written to a **transactional outbox** in the same
-database transaction as the business change that produced the event. This
-guarantees that a committed business change always has a deliverable event
-record, even if the process crashes immediately after commit.
+### Delete
 
-- **At-least-once.** Each outbox record is delivered one or more times until
-  acknowledged. Use the `Idempotency-Key` / event `id` to dedupe.
-- **No duplicate outbox records.** The outbox write is part of the business
-  transaction and is keyed by the event id, so retries of the business
-  operation do not create a second outbox row.
-- **Bounded retries.** Failed attempts (non-2xx, timeout, connection error) are
-  retried with exponential backoff: 30s → 1m → 5m → 30m → 2h (six attempts).
-- **Durable attempt state.** Each attempt records its outcome, attempt count,
-  and next-attempt time so retries survive restarts.
-- **Dead-letter after max attempts.** After the final attempt the record is
-  moved to the dead-letter table for operator triage via `/admin`. Dead-lettered
-  events can be replayed manually.
+- `DELETE /webhooks/{id}` removes the endpoint.
+- Deletion is idempotent from the caller's perspective: deleting an
+  already-deleted endpoint returns success.
+- After deletion the endpoint receives no further deliveries. Its delivery
+  history remains available for audit until retention expires.
 
-## Key rotation
+## Replay of failed deliveries
 
-Signing keys are identified by `kid`. To rotate without breaking receivers:
+Replay re-sends previously **failed** deliveries for a single endpoint. It is
+scoped and bounded by design:
 
-1. **Publish the new key.** Add the new `kid`/secret to the receiver's
-   configuration while the old key is still active. Receivers must accept any
-   `kid` they know.
-2. **Switch signing.** FlowFi begins signing with the new `kid`. During the
-   overlap, receivers accept both old and new `kid`s.
-3. **Retire the old key.** After the maximum retry window has elapsed (so no
-   in-flight delivery still uses the old key), remove the old `kid` from the
-   receiver configuration and from FlowFi.
-
-Never reuse a `kid` for a different secret. Unknown `kid`s must be rejected.
-
-## Secrets and logging
-
-Signing secrets are **redacted from all logs**. Log lines may include the
-`kid`, timestamp, and event id, but never the secret or the full `v1` value.
-If you suspect a secret leaked, rotate it following the procedure above.
-
-## Shared test vectors
-
-These vectors use the secret `whsec_test_0123456789` with `kid=k1` and
-timestamp `t=1700000000`. The signed message is `1700000000.<raw_body>`.
-
-| Case | Raw body | Expected result |
-| ---- | -------- | --------------- |
-| Valid | `{"amount":"1","id":"evt_1"}` | accepted |
-| Modified | `{"amount":"2","id":"evt_1"}` (body changed, header unchanged) | rejected (signature mismatch) |
-| Expired | valid body, `t=1700000000`, verified at `now=1700001000` | rejected (outside ±300s) |
-| Replayed | valid body, valid signature, event `id` already in `seen_ids` | acknowledged `200`, not re-applied |
-
-Reference values for the **Valid** case (compute with the secret above):
-
-```
-signed_payload = "1700000000." + '{"amount":"1","id":"evt_1"}'
-v1 = <hex HMAC-SHA256 of signed_payload with whsec_test_0123456789>
-X-FlowFi-Signature: t=1700000000,v1=<v1>,kid=k1
-```
-
-The **Modified** case reuses the Valid header but sends a different body, so
-`v1` no longer matches. The **Expired** case is the Valid request verified with
-`now` more than 300 seconds past `t`. The **Replayed** case is the Valid
-request delivered a second time; the receiver must dedupe by event id.
+- **Failed-only.** Only deliveries that ended in a failed terminal state
+  (dead-lettered after exhausting retries) are eligible. Successful
+  deliveries are never re-sent by replay.
+- **Bounded window.** Replay accepts an explicit time window. Deliveries
+  outside the window are ignored, and the number of deliveries replayed per
+  request is capped. Requests exceeding the cap are rejected rather than
+  silently truncated.
+- **Scoped.** Replay targets exactly one endpoint owned by the caller;
+  ownership checks apply as for the other lifecycle operations.
+- **Rate limited.** Replay requests are subject to a per-account rate limit.
+  Requests over the limit are rejected with a rate-limit error and no
+  deliveries are re-sent.
+- **Audit history.** Each replay request records an audit entry capturing the
+  requesting account, the target endpoint, the window, and the set of
+  deliveries replayed. Replayed deliveries are marked as replays in the
+  delivery history so operators can distinguish them from original attempts.
 
 ## Rollout and migration notes
 
-- **Schema migration.** Adds the outbox table (event id, payload, dedupe key,
-  attempt count, next-attempt time, status) and the dead-letter table. The
-  migration is additive and backward compatible.
-- **Backfill.** Events created before the outbox existed are backfilled into
-  the outbox once, keyed by event id, so no duplicate records are created.
-- **Dual-read window.** During rollout the dispatcher reads from both the
-  legacy scheduling path and the outbox, deduping by event id, until the
-  backfill is verified. After the window the legacy path is removed.
-- **Signature compatibility.** The `t=...,v1=...,kid=...` header format is
-  additive over the previous `sha256=<hex>` header. During the transition,
-  deliveries include both; receivers should prefer the new format and may
-  continue to accept the legacy header until the compatibility window closes.
-- **Operational impact.** Delivery is at-least-once; receivers must be
-  idempotent. Monitor outbox lag, retry counts, and dead-letter volume.
-</｜｜DSML｜｜ parameter>
+- New schema fields back the lifecycle and replay features: an endpoint
+  `state` (enabled/disabled) and delivery records that track terminal failure
+  and replay provenance.
+- Existing endpoints migrate to the **enabled** state, preserving current
+  delivery behavior.
+- Existing delivery records are treated as non-replayable unless they are in
+  a failed terminal state; successful historical deliveries are never
+  eligible for replay.
+- The public delivery contract (signature header, backoff schedule) is
+  unchanged; lifecycle and replay are additive and do not alter existing
+  endpoints' behavior until an operator uses them.

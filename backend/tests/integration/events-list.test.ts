@@ -58,6 +58,7 @@ vi.mock('../../src/lib/redis.js', () => ({
 
 import app from '../../src/app.js';
 import { signJwt } from '../../src/middleware/auth.js';
+import { exportEvents } from '../../src/services/export.service.js';
 
 const ADDR = 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA';
 const now = Math.floor(Date.now() / 1000);
@@ -281,5 +282,122 @@ describe('GET /v1/users/:publicKey/events and GET /v1/events filtering parity', 
     expect(eventsRes.status).toBe(400);
     expect(userEventsRes.status).toBe(400);
     expect(mocks.prisma.streamEvent.findMany).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Export service integration tests.
+ *
+ * The export service pages through stream events with keyset pagination so
+ * that large account exports stay bounded in memory and produce a
+ * snapshot-consistent result even when new events arrive mid-export.
+ */
+describe('exportEvents (bounded, snapshot-consistent exports)', () => {
+  const EXPORT_ADDR = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+
+  function makeExportEvent(id: string, timestamp: number, overrides: Record<string, unknown> = {}) {
+    return makeEvent({ id, timestamp, ...overrides });
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('pages with keyset pagination and never materializes the full result set', async () => {
+    const batchSize = 2;
+    const batches = [
+      [makeExportEvent('e5', 5), makeExportEvent('e4', 4)],
+      [makeExportEvent('e3', 3), makeExportEvent('e2', 2)],
+      [makeExportEvent('e1', 1)],
+    ];
+    let call = 0;
+    mocks.prisma.streamEvent.findMany.mockImplementation(async () => batches[call++] ?? []);
+
+    const seen: string[] = [];
+    const result = await exportEvents({
+      address: EXPORT_ADDR,
+      batchSize,
+      onBatch: (events: Array<{ id: string }>) => {
+        expect(events.length).toBeLessThanOrEqual(batchSize);
+        seen.push(...events.map((e) => e.id));
+      },
+    });
+
+    expect(seen).toEqual(['e5', 'e4', 'e3', 'e2', 'e1']);
+    expect(result.count).toBe(5);
+    expect(mocks.prisma.streamEvent.findMany).toHaveBeenCalledTimes(3);
+
+    for (const [args] of mocks.prisma.streamEvent.findMany.mock.calls) {
+      expect((args as { take: number }).take).toBe(batchSize);
+    }
+  });
+
+  it('uses a stable keyset cursor so new events arriving mid-export do not shift results', async () => {
+    const batchSize = 2;
+    // First batch: newest two events at export start.
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([
+      makeExportEvent('e5', 5),
+      makeExportEvent('e4', 4),
+    ]);
+    // A new event (e6) arrives after the first batch was read. The second
+    // batch must not include it because the cursor is anchored to e4.
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([
+      makeExportEvent('e3', 3),
+      makeExportEvent('e2', 2),
+    ]);
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([makeExportEvent('e1', 1)]);
+
+    const seen: string[] = [];
+    const result = await exportEvents({
+      address: EXPORT_ADDR,
+      batchSize,
+      onBatch: (events: Array<{ id: string }>) => {
+        seen.push(...events.map((e) => e.id));
+      },
+    });
+
+    expect(seen).toEqual(['e5', 'e4', 'e3', 'e2', 'e1']);
+    expect(seen).not.toContain('e6');
+    expect(result.count).toBe(5);
+
+    // Second and subsequent calls must carry a cursor derived from the last
+    // event of the previous batch, not an offset.
+    const secondArgs = mocks.prisma.streamEvent.findMany.mock.calls[1]![0] as {
+      cursor?: { id: string };
+      skip?: number;
+    };
+    expect(secondArgs.cursor).toEqual({ id: 'e4' });
+    expect(secondArgs.skip).toBe(1);
+  });
+
+  it('applies explicit event-type filters to every batch query', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+
+    await exportEvents({
+      address: EXPORT_ADDR,
+      batchSize: 100,
+      eventTypes: ['PAUSED', 'RESUMED'],
+    });
+
+    const args = mocks.prisma.streamEvent.findMany.mock.calls[0]![0] as {
+      where: { eventType?: { in: string[] }; stream: { OR: unknown[] } };
+    };
+    expect(args.where.eventType).toEqual({ in: ['PAUSED', 'RESUMED'] });
+    expect(args.where.stream.OR).toEqual([{ sender: EXPORT_ADDR }, { recipient: EXPORT_ADDR }]);
+  });
+
+  it('rejects a batch size above the configured maximum', async () => {
+    await expect(
+      exportEvents({ address: EXPORT_ADDR, batchSize: 100_000 }),
+    ).rejects.toThrow(/batch/i);
+    expect(mocks.prisma.streamEvent.findMany).not.toHaveBeenCalled();
+  });
+
+  it('handles an empty account without issuing extra queries', async () => {
+    mocks.prisma.streamEvent.findMany.mockResolvedValueOnce([]);
+
+    const result = await exportEvents({ address: EXPORT_ADDR, batchSize: 50 });
+    expect(result.count).toBe(0);
+    expect(mocks.prisma.streamEvent.findMany).toHaveBeenCalledTimes(1);
   });
 });

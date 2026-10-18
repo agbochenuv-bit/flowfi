@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
 import type { Request, Response, NextFunction } from 'express';
+import { trace } from '@opentelemetry/api';
 import logger, { requestContext } from '../logger.js';
+import { injectTraceContext } from '../lib/tracing.js';
 
 const MAX_REQUEST_ID_LENGTH = 128;
 
@@ -20,6 +22,19 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
 
   res.setHeader('X-Request-ID', requestId);
 
+  // Extract or link active trace context
+  const activeSpan = trace.getActiveSpan();
+  const traceId = activeSpan?.spanContext().traceId;
+  if (traceId && traceId !== '0'.repeat(32)) {
+    res.setHeader('X-Trace-ID', traceId);
+  }
+
+  const outboundHeaders: Record<string, string> = {};
+  injectTraceContext(outboundHeaders);
+  if (outboundHeaders.traceparent) {
+    res.setHeader('traceparent', outboundHeaders.traceparent);
+  }
+
   const startMs = Date.now();
 
   res.on('finish', () => {
@@ -29,11 +44,18 @@ export function requestIdMiddleware(req: Request, res: Response, next: NextFunct
       status: res.statusCode,
       durationMs: Date.now() - startMs,
       requestId,
+      ...(traceId && traceId !== '0'.repeat(32) ? { traceId } : {}),
     });
   });
 
-  requestContext.run({ requestId }, () => {
-    logger.info('request received', { method: req.method, path: req.path, requestId });
+  requestContext.run({ requestId, ...(traceId ? { traceId } : {}) }, () => {
+    logger.info('request received', {
+      method: req.method,
+      path: req.path,
+      requestId,
+      ...(traceId && traceId !== '0'.repeat(32) ? { traceId } : {}),
+    });
     next();
   });
 }
+
