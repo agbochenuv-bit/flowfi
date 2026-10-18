@@ -9,6 +9,7 @@
  */
 
 import type { CreateStreamParams } from './types.js';
+import { abortable, throwIfAborted, withAbortSignal } from './cancellation.js';
 
 export interface BuildCallArgs {
   /** Source account (G...) paying the fee and authorizing the call. */
@@ -18,7 +19,7 @@ export interface BuildCallArgs {
 }
 
 export interface SimulationAdapter {
-  simulateTransaction(tx: unknown): Promise<{
+  simulateTransaction(tx: unknown, opts?: { signal?: AbortSignal }): Promise<{
     assembledTx?: unknown;
     minResourceFee?: string | number | bigint;
     error?: unknown;
@@ -73,9 +74,11 @@ export async function buildContractCallXdr(args: {
   const source = new Account(sourceAccount, '0');
   const contract = new Contract(contractId);
 
-  const encodedArgs = encodeMethodArgs(method, methodArgs, { nativeToScVal });
+  const encodedArgs = encodeMethodArgs(method, methodArgs, {
+    nativeToScVal: (value, opts) => nativeToScVal(value, opts as never),
+  });
 
-  const op = contract.call(method, ...encodedArgs);
+  const op = contract.call(method, ...(encodedArgs as never[]));
   const tx = new TransactionBuilder(source, {
     fee: String(baseFeeStroops ?? FALLBACK_BASE_FEE_STROOPS),
     networkPassphrase,
@@ -224,6 +227,7 @@ export async function simulateAndAssemble(args: {
   networkPassphrase: string;
   rpcUrl: string;
   feeBufferMultiplier?: number;
+  signal?: AbortSignal;
   rpcClient?: {
     simulateTransaction(tx: unknown): Promise<unknown>;
   };
@@ -234,7 +238,12 @@ export async function simulateAndAssemble(args: {
   const tx = TransactionBuilder.fromXDR(args.unsignedXdr, args.networkPassphrase);
 
   const server = args.rpcClient ?? new rpc.Server(args.rpcUrl, { allowHttp: args.rpcUrl.startsWith('http://') });
-  const simulation = (await (server as unknown as SimulationAdapter).simulateTransaction(tx)) as {
+  throwIfAborted(args.signal);
+  const runSimulation = () =>
+    (server as unknown as SimulationAdapter).simulateTransaction(tx, { signal: args.signal });
+  const simulation = (await (args.signal
+    ? withAbortSignal(server, args.signal, runSimulation)
+    : runSimulation())) as {
     error?: unknown;
     minResourceFee?: string;
     assembledTx?: unknown;
@@ -252,7 +261,7 @@ export async function simulateAndAssemble(args: {
     const { rpc: rpcNs } = await import('@stellar/stellar-sdk');
     const assemble = (rpcNs as unknown as { assembleTransaction?: (t: unknown, s: unknown) => Promise<unknown> }).assembleTransaction;
     if (typeof assemble === 'function' && simulation) {
-      assembled = await assemble(tx, simulation);
+        assembled = await abortable(Promise.resolve(assemble(tx, simulation)), args.signal);
     }
     if (simulation.assembledTx) assembled = simulation.assembledTx;
   } catch {

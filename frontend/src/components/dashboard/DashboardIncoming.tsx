@@ -194,6 +194,7 @@ export function DashboardIncoming({
         streams={incomingStreams}
         onWithdraw={onWithdraw}
         withdrawingStreamId={withdrawingStreamId}
+        network={session?.network ?? "Unknown"}
         selectedStreamId={selectedStreamId}
       />
       {showBatchClaim && (

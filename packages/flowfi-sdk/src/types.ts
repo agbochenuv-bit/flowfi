@@ -12,6 +12,8 @@ export interface FlowFiClientConfig {
   networkPassphrase: string;
   /** Deployed `stream_contract` contract ID (C... address). */
   contractId: string;
+  /** Optional funded account used as the transaction source for read simulations. */
+  readOnlySourceAccount?: string;
   /**
    * Safety multiplier applied on top of the simulated resource fee.
    * `1.2` means "charge 20% more than simulation". Defaults to `1.25`.

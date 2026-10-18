@@ -7,6 +7,7 @@ import {
 } from '../lib/metrics.js';
 import logger from '../logger.js';
 import type { Prisma } from '../generated/prisma/index.js';
+import { recordAuditEvent } from './audit.service.js';
 
 /**
  * Ledger checkpointing + fork/reorg recovery engine (issue #1468).
@@ -293,6 +294,24 @@ export async function rollbackAboveLedger(safeLedger: number): Promise<RollbackR
       update: { lastLedger: safeLedger, lastCursor: null },
     });
 
+    await recordAuditEvent({
+      actor: 'system:indexer',
+      action: 'indexer.reconciliation.rollback',
+      targetType: 'ledger_reconciliation',
+      targetId: String(safeLedger),
+      outcome: 'success',
+      before: { safeLedger: null },
+      after: { safeLedger },
+      metadata: {
+        eventsDeleted: deleted.count,
+        streamsRecomputed,
+        streamsDeleted,
+        checkpointsReverted: reverted.count,
+        ledgersRolledBack: ledgers.length,
+        highestRevertedLedger,
+      },
+    }, tx);
+
     return {
       eventsDeleted: deleted.count,
       streamsRecomputed,
@@ -334,7 +353,21 @@ export async function verifyAndRecover(
       `Rolling back to ledger ${detection.safeLedger}.`,
   );
 
-  const rollback = await rollbackAboveLedger(detection.safeLedger);
+  let rollback: RollbackResult;
+  try {
+    rollback = await rollbackAboveLedger(detection.safeLedger);
+  } catch (error) {
+    await recordAuditEvent({
+      actor: 'system:indexer',
+      action: 'indexer.reconciliation.rollback',
+      targetType: 'ledger_reconciliation',
+      targetId: String(detection.safeLedger),
+      outcome: 'failure',
+      after: { safeLedger: detection.safeLedger },
+      metadata: { firstInvalidLedger: detection.firstInvalidLedger },
+    });
+    throw error;
+  }
   indexerReorgEventsTotal.inc({ outcome: 'rolled_back' });
   setIndexerRevertedLedgers(rollback.ledgersRolledBack);
 

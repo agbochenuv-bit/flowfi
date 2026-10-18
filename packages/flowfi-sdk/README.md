@@ -55,6 +55,56 @@ const stream = await client.getStream(1n); // null when pruned via close_stream
 const claimable = await client.getClaimableAmount(1n);
 ```
 
+## Real-Time Events
+
+`FlowFiEventClient` is an optional, framework-independent SSE client. It parses
+the `/v1/events/subscribe` event frames, exposes named events and lifecycle
+callbacks, and resumes with `Last-Event-ID` when the server supplies an SSE ID.
+
+```ts
+import { FlowFiEventClient } from '@flowfi/sdk';
+
+const events = new FlowFiEventClient('https://api.flowfi.io/v1/events/subscribe', {
+  headers: { Authorization: `Bearer ${token}` },
+});
+events.on('stream.created', ({ data, lastEventId }) => console.log(data, lastEventId));
+events.onLifecycle('reconnect', ({ attempt, delayMs }) => console.log(attempt, delayMs));
+events.connect();
+// events.close();
+```
+
+## Cancellation
+
+SDK read and write methods accept a final `{ signal, timeoutMs }` options
+argument. The timeout applies to the complete operation; aborting while a
+wallet approval is pending rejects the operation and prevents later submission.
+The wallet extension may still display its own approval prompt until it is
+dismissed.
+
+```ts
+const controller = new AbortController();
+await client.createStream(params, signer, { signal: controller.signal, timeoutMs: 30_000 });
+```
+
+## Testnet Smoke Suite
+
+This suite is separate from the default unit tests and never submits a
+transaction. Configure all values for an existing testnet deployment and a
+funded source account before running it:
+
+```bash
+FLOWFI_TESTNET_RPC_URL=https://soroban-testnet.stellar.org \
+FLOWFI_TESTNET_CONTRACT_ID=C... \
+FLOWFI_TESTNET_SOURCE_SECRET=S... \
+FLOWFI_TESTNET_STREAM_ID=1 \
+npm run test:smoke:testnet
+```
+
+It builds and simulates a generated contract-call envelope, signs it locally,
+then exercises `getStream` and `getClaimableAmount` against that deployment.
+Keep the source secret in your local environment or secret manager; it is never
+printed by the suite.
+
 ## Architecture
 
 | File | Responsibility |

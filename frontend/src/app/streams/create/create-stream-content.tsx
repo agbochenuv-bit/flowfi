@@ -10,7 +10,7 @@ import {
   toSorobanErrorMessage,
   TOKEN_ADDRESSES
 } from "@/lib/soroban";
-import { hasValidPrecision } from "@/utils/amount";
+import { getDefaultTokenDecimals, hasValidPrecision } from "@/utils/amount";
 import { toast } from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -18,8 +18,6 @@ import Link from "next/link";
 import { ArrowLeft, FileText, X } from "lucide-react";
 import { useWallet } from "@/context/wallet-context";
 import { useStreamForm } from "@/hooks/useStreamForm";
-
-const TOKEN_DECIMALS = 7;
 
 export default function CreateStreamContent() {
   const { status, session } = useWallet();
@@ -45,6 +43,7 @@ export default function CreateStreamContent() {
     draftSavedAt,
   } = useStreamForm({
     walletPublicKey: session?.publicKey,
+    walletNetwork: session?.network,
     enableDraftPersistence: true,
     initialData: { token: "XLM", duration: "30" },
   });
@@ -197,6 +196,9 @@ export default function CreateStreamContent() {
                   </option>
                 ))}
               </select>
+              {errors.token && (
+                <p className="text-xs text-red-400 mt-1" role="alert">{errors.token}</p>
+              )}
             </div>
             <div className="space-y-2">
               <label htmlFor="create-stream-amount" className="text-sm font-medium text-slate-300">
@@ -212,7 +214,7 @@ export default function CreateStreamContent() {
                 onChange={(e) => {
                   const newValue = e.target.value;
                   if (newValue === '' || /^\d*\.?\d*$/.test(newValue)) {
-                    if (hasValidPrecision(newValue, TOKEN_DECIMALS)) {
+                    if (hasValidPrecision(newValue, getDefaultTokenDecimals(formData.token))) {
                       updateFormData({ amount: newValue });
                     }
                   }
@@ -255,6 +257,9 @@ export default function CreateStreamContent() {
           </div>
 
           <div className="rounded-2xl bg-accent/5 p-6 space-y-4">
+            {errors.rate && (
+              <p className="text-sm text-red-400" role="alert">{errors.rate}</p>
+            )}
             <div className="flex justify-between items-center text-sm">
               <span className="text-slate-400">Streaming Rate</span>
               <span className="font-mono font-medium text-accent">

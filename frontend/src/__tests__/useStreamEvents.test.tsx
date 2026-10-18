@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act } from '@testing-library/react';
 import { useStreamEvents } from '../hooks/useStreamEvents';
+import type { UseStreamEventsOptions } from '../hooks/useStreamEvents';
 
 // ─── EventSource mock ─────────────────────────────────────────────────────────
 
@@ -70,16 +71,31 @@ describe('useStreamEvents', () => {
     MockEventSource.instance = null;
     MockEventSource.instanceCount = 0;
     vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ticket: 'scoped-ticket' }),
+    }));
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    vi.unstubAllGlobals();
   });
 
-  it('connects and reports connected=true on open', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
+  async function renderAuthenticatedHook(options: UseStreamEventsOptions = {}) {
+    const hook = renderHook(() => useStreamEvents({ jwtToken: 'test-jwt', ...options }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return hook;
+  }
+
+  it('connects and reports connected=true on open', async () => {
+    const { result } = await renderAuthenticatedHook(
+      { streamIds: ['1'], autoReconnect: false },
     );
 
     act(() => { MockEventSource.instance?.open(); });
@@ -88,17 +104,13 @@ describe('useStreamEvents', () => {
     expect(result.current.error).toBeNull();
   });
 
-  it('starts disconnected before the connection opens', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('starts disconnected before the connection opens', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
     expect(result.current.connected).toBe(false);
   });
 
-  it('updates events when a stream.created event arrives', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('updates events when a stream.created event arrives', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
 
     act(() => {
       MockEventSource.instance?.open();
@@ -110,10 +122,8 @@ describe('useStreamEvents', () => {
     expect((result.current.events[0]?.data as { streamId: number }).streamId).toBe(1);
   });
 
-  it('keeps at most 100 events (oldest are dropped)', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('keeps at most 100 events (oldest are dropped)', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
 
     act(() => {
       MockEventSource.instance?.open();
@@ -125,10 +135,8 @@ describe('useStreamEvents', () => {
     expect(result.current.events.length).toBeLessThanOrEqual(100);
   });
 
-  it('sets error and connected=false on connection error', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('sets error and connected=false on connection error', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
 
     act(() => {
       MockEventSource.instance?.open();
@@ -139,10 +147,8 @@ describe('useStreamEvents', () => {
     expect(result.current.error).toBeInstanceOf(Error);
   });
 
-  it('reconnects after an error when autoReconnect=true', () => {
-    renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: true, maxRetryDelay: 500 }),
-    );
+  it('reconnects after an error when autoReconnect=true', async () => {
+    await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: true, maxRetryDelay: 500 });
 
     const first = MockEventSource.instance;
     act(() => { first?.open(); });
@@ -155,14 +161,12 @@ describe('useStreamEvents', () => {
     expect(MockEventSource.instance).not.toBeNull();
   });
 
-  it('grows the reconnect delay exponentially across consecutive failures', () => {
+  it('grows the reconnect delay exponentially across consecutive failures', async () => {
     // Keep `streamIds` referentially stable across re-renders (an inline
     // array literal would change identity on every render and cause the
     // hook to reconnect on its own, independent of the backoff timer).
     const streamIds = ['1'];
-    renderHook(() =>
-      useStreamEvents({ streamIds, autoReconnect: true, maxRetryDelay: 30000 }),
-    );
+    await renderAuthenticatedHook({ streamIds, autoReconnect: true, maxRetryDelay: 30000 });
 
     const first = MockEventSource.instance;
     act(() => { first?.triggerError(); });
@@ -194,11 +198,9 @@ describe('useStreamEvents', () => {
     expect(MockEventSource.instance).not.toBe(third);
   });
 
-  it('caps the reconnect delay at maxRetryDelay', () => {
+  it('caps the reconnect delay at maxRetryDelay', async () => {
     const streamIds = ['1'];
-    renderHook(() =>
-      useStreamEvents({ streamIds, autoReconnect: true, maxRetryDelay: 1500 }),
-    );
+    await renderAuthenticatedHook({ streamIds, autoReconnect: true, maxRetryDelay: 1500 });
 
     const first = MockEventSource.instance;
     act(() => { first?.triggerError(); });
@@ -214,11 +216,9 @@ describe('useStreamEvents', () => {
     expect(MockEventSource.instance).not.toBe(second);
   });
 
-  it('resets the backoff delay to the initial value after a successful connection', () => {
+  it('resets the backoff delay to the initial value after a successful connection', async () => {
     const streamIds = ['1'];
-    renderHook(() =>
-      useStreamEvents({ streamIds, autoReconnect: true, maxRetryDelay: 30000 }),
-    );
+    await renderAuthenticatedHook({ streamIds, autoReconnect: true, maxRetryDelay: 30000 });
 
     const first = MockEventSource.instance;
     act(() => { first?.triggerError(); });
@@ -235,10 +235,8 @@ describe('useStreamEvents', () => {
     expect(MockEventSource.instance).not.toBe(second);
   });
 
-  it('clearEvents empties the events array', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('clearEvents empties the events array', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
 
     act(() => {
       MockEventSource.instance?.open();
@@ -252,17 +250,16 @@ describe('useStreamEvents', () => {
     expect(result.current.events).toHaveLength(0);
   });
 
-  it('appends a jwtToken to the SSE URL when provided', () => {
-    renderHook(() =>
-      useStreamEvents({ jwtToken: 'mytoken', autoReconnect: false }),
-    );
-    expect(MockEventSource.instance?.url).toContain('token=mytoken');
+  it('exchanges the JWT in an Authorization header and only puts a scoped ticket in the SSE URL', async () => {
+    await renderAuthenticatedHook({ jwtToken: 'mytoken', autoReconnect: false });
+    const [, init] = vi.mocked(fetch).mock.calls[0] ?? [];
+    expect((init as RequestInit)?.headers).toMatchObject({ Authorization: 'Bearer mytoken' });
+    expect(MockEventSource.instance?.url).toContain('ticket=scoped-ticket');
+    expect(MockEventSource.instance?.url).not.toContain('mytoken');
   });
 
-  it('handles all named event types', () => {
-    const { result } = renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: false }),
-    );
+  it('handles all named event types', async () => {
+    const { result } = await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: false });
 
     const types = [
       'stream.created',
@@ -284,11 +281,12 @@ describe('useStreamEvents', () => {
     expect(result.current.events).toHaveLength(types.length);
   });
 
-  it('creates only one EventSource across multiple re-renders and incoming events', () => {
+  it('creates only one EventSource across multiple re-renders and incoming events', async () => {
     const { result, rerender } = renderHook(
       (opts: { streamIds: string[] } = { streamIds: ['1'] }) =>
-        useStreamEvents({ ...opts, autoReconnect: false }),
+        useStreamEvents({ ...opts, jwtToken: 'test-jwt', autoReconnect: false }),
     );
+      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); });
 
     const firstInstance = MockEventSource.instance;
 
@@ -316,10 +314,8 @@ describe('useStreamEvents', () => {
     expect(MockEventSource.instance).toBe(firstInstance);
   });
 
-  it('stops reconnecting after reaching the cap', () => {
-    renderHook(() =>
-      useStreamEvents({ streamIds: ['1'], autoReconnect: true, maxRetryDelay: 1000 }),
-    );
+  it('stops reconnecting after reaching the cap', async () => {
+    await renderAuthenticatedHook({ streamIds: ['1'], autoReconnect: true, maxRetryDelay: 1000 });
 
     // Trigger errors repeatedly to consume reconnect attempts.
     // The reconnect delay stays at 1000ms (capped by maxRetryDelay).

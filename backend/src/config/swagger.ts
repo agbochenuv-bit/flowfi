@@ -1,5 +1,61 @@
 import swaggerJsdoc from 'swagger-jsdoc';
 
+/**
+ * Recursively sorts object keys so the generated spec is byte-for-byte
+ * reproducible across runs (and therefore safe to diff in CI parity checks).
+ * Arrays keep their declared order because ordering is meaningful there
+ * (e.g. `required`, `enum`, `tags`, `servers`).
+ */
+function sortKeysDeep<T>(value: T): T {
+  if (Array.isArray(value)) {
+    return value.map((item) => sortKeysDeep(item)) as unknown as T;
+  }
+  if (value !== null && typeof value === 'object') {
+    const sorted: Record<string, unknown> = {};
+    for (const key of Object.keys(value as Record<string, unknown>).sort()) {
+      sorted[key] = sortKeysDeep((value as Record<string, unknown>)[key]);
+    }
+    return sorted as T;
+  }
+  return value;
+}
+
+/**
+ * Canonical error responses shared by every versioned endpoint. Route-level
+ * `@openapi` annotations reference these via `$ref` so status codes and
+ * payload shapes cannot drift between routes.
+ */
+const errorResponses = {
+  BadRequest: {
+    description: 'Malformed request (invalid JSON, query or path parameters)',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Unauthorized: {
+    description: 'Missing, malformed or expired bearer token',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Forbidden: {
+    description: 'Authenticated but not permitted to perform this action',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  NotFound: {
+    description: 'Requested resource does not exist',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  Conflict: {
+    description: 'Request conflicts with the current state of the resource',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  TooManyRequests: {
+    description: 'Rate limit exceeded',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+  InternalServerError: {
+    description: 'Unexpected server error',
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
+} as const;
+
 const options: swaggerJsdoc.Options = {
   definition: {
     openapi: '3.1.0',
@@ -27,7 +83,31 @@ FlowFi API supports sandbox mode for testing without affecting production data.
 - Response headers include \`X-Sandbox-Mode: true\`
 - Safe for testing and development
 
-See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.`,
+See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.
+
+## Error Envelope (v1)
+
+All REST endpoints return a stable, versioned error envelope on failure:
+
+\`\`\`json
+{
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Request validation failed",
+    "requestId": "3f1c2b9e-8a4d-4c6e-9f2a-1b7d5e0c9a83",
+    "version": 1,
+    "details": [{ "field": "recipient", "message": "must be a valid Stellar public key" }]
+  }
+}
+\`\`\`
+
+- \`code\` is a stable machine-readable identifier — switch on it, not on \`message\`.
+- \`message\` is always safe; internal exception text is never exposed.
+- \`requestId\` matches the \`X-Request-Id\` response header for log correlation.
+- \`details\` is present for validation failures.
+
+**Migration:** This is an additive, backward-compatible change. Existing \`error.code\`/\`error.message\`
+consumers are unaffected. Unknown codes should be treated as generic failures.`,
       contact: {
         name: 'FlowFi Team',
         url: 'https://github.com/LabsCrypt/flowfi',
@@ -74,6 +154,7 @@ See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.`,
       },
     ],
     components: {
+      responses: errorResponses,
       securitySchemes: {
         BearerAuth: {
           type: 'http',
@@ -481,24 +562,82 @@ See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.`,
             },
           },
         },
-        Error: {
+        ErrorEnvelope: {
           type: 'object',
+          description: `Stable, versioned error envelope returned by every REST endpoint on failure.
+
+**Version:** \`1\` (see \`error.version\`). The envelope is additive and backward compatible:
+existing clients that read \`error.code\` and \`error.message\` keep working, while new clients can
+rely on \`error.requestId\` for correlation and \`error.details\` for structured validation issues.
+
+**Guarantees:**
+- \`error.code\` is a stable, machine-readable identifier (see \`ErrorCode\`). It never changes meaning within a major version.
+- \`error.message\` is a safe, human-readable summary. Internal exception text, stack traces, SQL, and
+  upstream provider payloads are never exposed.
+- \`error.requestId\` echoes the \`X-Request-Id\` response header for log correlation.
+- \`error.details\` is present for validation failures and lists field-level issues.
+
+**Migration:** No breaking change. Clients should switch on \`error.code\` rather than parsing
+\`error.message\`. Unknown codes must be treated as generic failures.`,
+          required: ['error'],
           properties: {
             error: {
               type: 'object',
-              required: ['code', 'message'],
+              required: ['code', 'message', 'requestId', 'version'],
               properties: {
-                code: { type: 'string', example: 'NOT_FOUND' },
-                message: { type: 'string', example: 'Resource not found' },
+                code: {
+                  type: 'string',
+                  description: 'Stable machine-readable error code',
+                  enum: [
+                    'VALIDATION_ERROR',
+                    'UNAUTHORIZED',
+                    'FORBIDDEN',
+                    'NOT_FOUND',
+                    'CONFLICT',
+                    'RATE_LIMITED',
+                    'PAYLOAD_TOO_LARGE',
+                    'UNSUPPORTED_MEDIA_TYPE',
+                    'UPSTREAM_UNAVAILABLE',
+                    'INTERNAL_ERROR',
+                  ],
+                  example: 'NOT_FOUND',
+                },
+                message: {
+                  type: 'string',
+                  description: 'Safe human-readable message; never contains internal exception text',
+                  example: 'Resource not found',
+                },
+                requestId: {
+                  type: 'string',
+                  description: 'Correlation id, also returned in the X-Request-Id response header',
+                  example: '3f1c2b9e-8a4d-4c6e-9f2a-1b7d5e0c9a83',
+                },
+                version: {
+                  type: 'integer',
+                  description: 'Error envelope contract version',
+                  enum: [1],
+                  example: 1,
+                },
                 details: {
                   type: 'array',
                   description: 'Structured validation issues when applicable',
-                  items: { type: 'object' },
+                  items: {
+                    type: 'object',
+                    required: ['field', 'message'],
+                    properties: {
+                      field: { type: 'string', description: 'Dot-path of the offending field', example: 'recipient' },
+                      message: { type: 'string', description: 'Safe description of the issue', example: 'must be a valid Stellar public key' },
+                      code: { type: 'string', description: 'Optional field-level issue code', example: 'INVALID_FORMAT' },
+                    },
+                  },
                 },
               },
             },
           },
-          required: ['error'],
+        },
+        Error: {
+          description: 'Deprecated alias of ErrorEnvelope, retained for backward compatibility.',
+          allOf: [{ $ref: '#/components/schemas/ErrorEnvelope' }],
         },
       },
     },
@@ -506,4 +645,9 @@ See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.`,
   apis: ['./src/**/*.ts'], // Path to the API routes
 };
 
-export const swaggerSpec = swaggerJsdoc(options);
+/**
+ * Deterministic OpenAPI document. Keys are sorted recursively so the artifact
+ * written by `npm run openapi:export` is reproducible and CI can fail on any
+ * undocumented route, schema, status-code or auth change.
+ */
+export const swaggerSpec = sortKeysDeep(swaggerJsdoc(options));

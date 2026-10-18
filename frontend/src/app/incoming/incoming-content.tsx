@@ -8,6 +8,7 @@ import TransactionTracker, {
 import { IncomingStreamCard } from "@/components/streams/IncomingStreamCard";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useWallet } from "@/context/wallet-context";
+import { formatNetwork } from "@/lib/wallet";
 import {
   type IncomingStreamRecord,
 } from "@/lib/api/streams";
@@ -80,6 +81,7 @@ export default function IncomingContent() {
       await withdrawMutation.mutateAsync(stream);
     } catch {
       // Errors are handled by the mutation callback so the UI stays consistent.
+      throw new Error("Withdrawal failed");
     }
   };
 
@@ -165,13 +167,12 @@ export default function IncomingContent() {
               <IncomingStreamCard
                 key={stream.id}
                 stream={stream}
+                network={formatNetwork(session?.network ?? "")}
                 withdrawing={
                   withdrawMutation.isPending &&
                   withdrawMutation.variables?.streamId === stream.streamId
                 }
-                onWithdraw={(selectedStream) => {
-                  void handleWithdraw(selectedStream);
-                }}
+                onWithdraw={handleWithdraw}
               />
             ))}
           </section>

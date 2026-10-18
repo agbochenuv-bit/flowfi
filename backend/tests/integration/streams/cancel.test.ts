@@ -216,3 +216,166 @@ describe('POST /v1/streams/:streamId/cancel', () => {
     expect(res1.body.txHash).toBe(res2.body.txHash);
   });
 });
+
+// ─── Idempotency contract ───────────────────────────────────────────────────
+//
+// Externally observable behaviour for retryable stream commands:
+//   * A request carrying `Idempotency-Key` is bound to (wallet, operation,
+//     request hash). Replaying the same key with the same input returns the
+//     original response body and status, without re-submitting on-chain.
+//   * Replaying the same key with a different input is rejected with 422
+//     `IDEMPOTENCY_KEY_REUSED`.
+//   * Concurrent duplicates with the same key trigger at most one
+//     transaction; the loser waits for and replays the winner's result.
+//   * Keys are retained for a bounded window (24h); after expiry the key may
+//     be reused as a fresh request.
+
+describe('POST /v1/streams/:streamId/cancel — idempotency', () => {
+  const streamId = 123;
+  const idempotencyKey = 'idem-key-cancel-001';
+
+  const mockStream = {
+    streamId,
+    sender: 'G_SENDER_123',
+    isActive: true,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (prisma.stream.findUnique as any).mockResolvedValue(mockStream);
+    (prisma.stream.update as any).mockResolvedValue({ ...mockStream, isActive: false });
+    (sorobanService.cancelStream as any).mockResolvedValue('tx_hash_123');
+  });
+
+  it('returns the original result when the same key is retried with identical input', async () => {
+    const first = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(first.status).toBe(200);
+    expect(first.body).toEqual({ txHash: 'tx_hash_123', status: 'CANCELLED' });
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+
+    // Retry with the same key and identical payload.
+    const retry = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(retry.status).toBe(200);
+    expect(retry.body).toEqual(first.body);
+    // The retry must not submit a second on-chain transaction.
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+    expect(prisma.stream.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects reuse of the same key with a different request body', async () => {
+    const first = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(first.status).toBe(200);
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+
+    // Same key, different input → rejected, no new transaction.
+    const conflict = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_DIFFERENT_SECRET' });
+
+    expect(conflict.status).toBe(422);
+    expect(conflict.body.error).toMatchObject({
+      code: 'IDEMPOTENCY_KEY_REUSED',
+    });
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects reuse of the same key for a different stream (operation binding)', async () => {
+    const first = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(first.status).toBe(200);
+
+    (prisma.stream.findUnique as any).mockResolvedValue({
+      streamId: 456,
+      sender: 'G_SENDER_123',
+      isActive: true,
+    });
+
+    const conflict = await request(app)
+      .post('/v1/streams/456/cancel')
+      .set('Authorization', 'Bearer dummy_token')
+      .set('Idempotency-Key', idempotencyKey)
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(conflict.status).toBe(422);
+    expect(conflict.body.error).toMatchObject({
+      code: 'IDEMPOTENCY_KEY_REUSED',
+    });
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+  });
+
+  it('triggers at most one transaction for concurrent duplicate submissions', async () => {
+    // Make the on-chain call slow so both requests overlap.
+    let resolveCancel: (value: string) => void = () => {};
+    (sorobanService.cancelStream as any).mockImplementation(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveCancel = resolve;
+        }),
+    );
+
+    const send = () =>
+      request(app)
+        .post(`/v1/streams/${streamId}/cancel`)
+        .set('Authorization', 'Bearer dummy_token')
+        .set('Idempotency-Key', idempotencyKey)
+        .send({ senderSecret: 'S_SECRET_123' });
+
+    const promise1 = send();
+    const promise2 = send();
+
+    // Give both requests a chance to reach the idempotency layer.
+    await new Promise((r) => setTimeout(r, 50));
+
+    resolveCancel('tx_hash_123');
+
+    const [res1, res2] = await Promise.all([promise1, promise2]);
+
+    expect(res1.status).toBe(200);
+    expect(res2.status).toBe(200);
+    expect(res1.body).toEqual({ txHash: 'tx_hash_123', status: 'CANCELLED' });
+    expect(res2.body).toEqual(res1.body);
+
+    // Only one on-chain submission despite two concurrent requests.
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(1);
+    expect(prisma.stream.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats requests without an idempotency key as non-idempotent', async () => {
+    const first = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(first.status).toBe(200);
+
+    const second = await request(app)
+      .post(`/v1/streams/${streamId}/cancel`)
+      .set('Authorization', 'Bearer dummy_token')
+      .send({ senderSecret: 'S_SECRET_123' });
+
+    expect(second.status).toBe(200);
+    // Without a key each request submits its own transaction.
+    expect(sorobanService.cancelStream).toHaveBeenCalledTimes(2);
+  });
+});

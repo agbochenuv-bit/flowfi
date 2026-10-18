@@ -1,6 +1,7 @@
 import {
   trace,
   context,
+  propagation,
   SpanStatusCode,
   type Context,
   type Span,
@@ -12,10 +13,10 @@ import {
  *
  * The SDK is initialised in `tracing.ts` (imported for its side effects from
  * `index.ts` before anything else) and the Node auto-instrumentations register
- * the express/http/pg spans automatically. This module adds the two things the
- * auto-instrumentation cannot infer:
- *
- *  - stable span names for domain operations (indexer batches, RPC calls), and
+ * the express/http/pg spans automatically. This module adds:
+ *  - stable span names for domain operations (indexer batches, RPC calls, webhooks),
+ *  - W3C trace context propagation across HTTP, SSE, and asynchronous workers,
+ *  - low-cardinality sanitization to prevent sensitive data/PII leaks, and
  *  - a no-op span fallback so importing instrumentation from unit tests — or
  *    running with `OTEL_SDK_DISABLED=true` — never throws and never records.
  */
@@ -23,13 +24,76 @@ import {
 const TRACER_NAME = 'flowfi-backend';
 
 /**
+ * Sensitive key patterns that must never be recorded into trace span attributes.
+ */
+const SENSITIVE_ATTRIBUTE_PATTERNS = [
+  /auth/i,
+  /token/i,
+  /secret/i,
+  /password/i,
+  /private/i,
+  /key/i,
+  /signature/i,
+  /cookie/i,
+];
+
+/** Maximum string length for trace attributes to avoid unbounded high cardinality */
+const MAX_ATTRIBUTE_VALUE_LENGTH = 256;
+
+/**
+ * Filters and sanitizes attribute maps, stripping sensitive credentials and truncating
+ * high-cardinality payload values.
+ */
+export function sanitizeTraceAttributes(
+  attributes: Record<string, unknown>,
+): Record<string, string | number | boolean> {
+  const sanitized: Record<string, string | number | boolean> = {};
+
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value === undefined || value === null) continue;
+
+    // Redact sensitive keys
+    if (SENSITIVE_ATTRIBUTE_PATTERNS.some((pattern) => pattern.test(key))) {
+      sanitized[key] = '[REDACTED]';
+      continue;
+    }
+
+    if (typeof value === 'boolean' || typeof value === 'number') {
+      sanitized[key] = value;
+      continue;
+    }
+
+    if (typeof value === 'string') {
+      sanitized[key] =
+        value.length > MAX_ATTRIBUTE_VALUE_LENGTH
+          ? `${value.slice(0, MAX_ATTRIBUTE_VALUE_LENGTH)}...[TRUNCATED]`
+          : value;
+      continue;
+    }
+
+    // Exclude raw objects and arrays to prevent high-cardinality explosions
+    sanitized[key] = '[COMPLEX_OBJECT]';
+  }
+
+  return sanitized;
+}
+
+/**
+ * Injects the active trace context into an outbound carrier object (e.g. HTTP headers or webhook headers).
+ */
+export function injectTraceContext(carrier: Record<string, string>): void {
+  propagation.inject(context.active(), carrier);
+}
+
+/**
+ * Extracts trace context from an inbound carrier (e.g. incoming HTTP headers or message metadata).
+ */
+export function extractTraceContext(carrier: Record<string, string>): Context {
+  return propagation.extract(context.active(), carrier);
+}
+
+/**
  * Resolve the tracer on every call rather than caching one at module load.
- *
- * `trace.getTracer` returns a proxy tracer when no provider is registered yet
- * and upgrades itself once the SDK installs one, but caching at import time
- * still pins whichever provider happened to exist then. Resolving per call
- * keeps the helper usable when the SDK is disabled or initialised after this
- * module, and keeps it testable.
  */
 export function getTracer(): Tracer {
   return trace.getTracer(TRACER_NAME);
@@ -51,30 +115,22 @@ const NOOP_SPAN = {
 } as unknown as Span;
 
 /**
- * Run `fn` inside an active span.
- *
- * Tracing must never change behaviour, which means two invariants:
- *
- *  1. `fn` is invoked **exactly once**. An earlier version wrapped the whole
- *     `context.with(...)` call in a catch and re-ran `fn` on any error, so a
- *     handler that threw was executed a second time untraced — the error
- *     vanished and the side effect happened twice.
- *  2. An error raised by `fn` propagates to the caller untouched, so callers
- *     can still react to it (replay failure, quarantine, rollback).
- *
- * The untraced fallback is therefore only used when the span could not be
- * started or the context could not be entered at all — i.e. before `fn` ran.
+ * Run `fn` inside an active span with automatic attribute sanitization.
  */
 export async function withSpan<T>(
   name: string,
-  attributes: Record<string, string | number | boolean>,
+  rawAttributes: Record<string, unknown>,
   fn: (span: Span) => Promise<T>,
+  parentContext?: Context,
 ): Promise<T> {
+  const attributes = sanitizeTraceAttributes(rawAttributes);
+  const activeCtx = parentContext ?? context.active();
+
   let span: Span;
   let spanContext: Context;
   try {
-    span = getTracer().startSpan(name, { attributes });
-    spanContext = trace.setSpan(context.active(), span);
+    span = getTracer().startSpan(name, { attributes }, activeCtx);
+    spanContext = trace.setSpan(activeCtx, span);
   } catch {
     // Could not even start a span: run untraced rather than fail the request.
     return fn(NOOP_SPAN);
@@ -98,21 +154,21 @@ export async function withSpan<T>(
     });
   } catch (err) {
     if (fnRan) {
-      // The error came from `fn` (or from unwinding the context). Propagate it.
       throw err;
     }
-    // The context could not be entered, so `fn` never ran. End the orphaned
-    // span and run once, untraced.
     span.end();
     return fn(NOOP_SPAN);
   }
 }
 
 /** Record an exception on the currently-active span, if there is one. */
-export function recordSpanError(err: unknown, attributes?: Record<string, string | number | boolean>): void {
+export function recordSpanError(err: unknown, rawAttributes?: Record<string, unknown>): void {
   const span = trace.getActiveSpan();
   if (!span) return;
   span.recordException(err as Error);
   span.setStatus({ code: SpanStatusCode.ERROR });
-  if (attributes) span.setAttributes(attributes);
+  if (rawAttributes) {
+    span.setAttributes(sanitizeTraceAttributes(rawAttributes));
+  }
 }
+

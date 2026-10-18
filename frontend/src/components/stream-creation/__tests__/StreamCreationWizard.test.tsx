@@ -16,6 +16,15 @@ vi.mock("@/lib/logger", () => ({
 
 vi.mock("@/lib/soroban", () => ({
   fetchTokenBalanceDisplay: vi.fn().mockResolvedValue("10000"),
+  TOKEN_ADDRESSES: { USDC: "USDC", XLM: "XLM", EURC: "EURC" },
+  SECONDS_PER_UNIT: {
+    seconds: 1n,
+    minutes: 60n,
+    hours: 3600n,
+    days: 86400n,
+    weeks: 604800n,
+    months: 2592000n,
+  },
 }));
 
 vi.mock("@/utils/amount", () => {
@@ -42,7 +51,11 @@ vi.mock("@/utils/amount", () => {
     return null;
   });
 
-  return { hasValidPrecision, validateAmountInput };
+  return {
+    getDefaultTokenDecimals: vi.fn(() => 7),
+    hasValidPrecision,
+    validateAmountInput,
+  };
 });
 
 vi.mock("@/hooks/useModalDialog", () => ({

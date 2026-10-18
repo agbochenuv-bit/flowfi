@@ -1,6 +1,8 @@
 import { randomUUID } from "crypto";
+import { hostname } from "os";
 import { rpc, xdr, StrKey } from "@stellar/stellar-sdk";
 import { prisma } from "../lib/prisma.js";
+import { recordAuditEvent } from "../services/audit.service.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
 import { sseService } from "../services/sse.service.js";
 import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
@@ -8,7 +10,22 @@ import {
   indexerEventsProcessedTotal,
   indexerPollsTotal,
   recordRpcRequest,
+  recordIndexerLag,
+  recordIndexerEventsPerLedger,
+  recordIndexerDecodeLatency,
+  recordIndexerPersistLatency,
+  recordIndexerRetry,
+  recordIndexerLastSuccess,
+  recordIndexerBatch,
 } from "../lib/metrics.js";
+import {
+  acquireIndexerLease,
+  renewIndexerLease,
+  releaseIndexerLease,
+  isLeaseHeld,
+  getHeldFencingToken,
+  type IndexerLease,
+} from "../lib/indexer-lease.js";
 import { withSpan } from "../lib/tracing.js";
 import logger, { requestContext } from "../logger.js";
 import { Prisma } from "../generated/prisma/index.js";
@@ -24,6 +41,34 @@ import {
 
 /** Ledger rollbacks above this ceiling are escalated to dead-letter triage. */
 const REORG_ALERT_THRESHOLD_DEFAULT = 5;
+
+/**
+ * Default lease TTL for poll ownership. A replica must renew well before this
+ * expires or another replica may take over the cursor.
+ */
+const LEASE_TTL_MS_DEFAULT = 30_000;
+/** Renewal cadence; must be strictly shorter than the TTL (default TTL/3). */
+const LEASE_RENEW_INTERVAL_MS_DEFAULT = 10_000;
+
+/**
+ * Default upper bound on the number of events persisted in a single batch
+ * transaction. Keeps individual transactions bounded so a large ledger burst
+ * cannot produce an unbounded write.
+ */
+const EVENT_BATCH_MAX_SIZE_DEFAULT = 100;
+
+/**
+ * Default upper bound (ms) on how long a batch transaction may run before the
+ * batch is flushed. Bounds transaction duration under sustained load.
+ */
+const EVENT_BATCH_MAX_DURATION_MS_DEFAULT = 2_000;
+
+/**
+ * Default number of attempts for a batch transaction before the batch is
+ * split and retried event-by-event (so a single poison event cannot drop the
+ * whole batch).
+ */
+const EVENT_BATCH_MAX_ATTEMPTS_DEFAULT = 3;
 
 // ─── XDR Decoding Helpers ────────────────────────────────────────────────────
 
@@ -111,9 +156,26 @@ export class SorobanEventWorker {
   private readonly startLedger: number;
   /** Ledger rollbacks larger than this are escalated to dead-letter triage. */
   private readonly reorgAlertThreshold: number;
+  /** Max events persisted per batch transaction. */
+  private readonly batchMaxSize: number;
+  /** Max wall-clock duration (ms) a batch transaction may accumulate for. */
+  private readonly batchMaxDurationMs: number;
+  /** Max attempts for a batch transaction before falling back to per-event. */
+  private readonly batchMaxAttempts: number;
 
   private isRunning = false;
   private pollTimer: NodeJS.Timeout | undefined;
+  /** Interval handle for lease renewal while this replica owns the poll. */
+  private leaseRenewTimer: NodeJS.Timeout | undefined;
+  /** Stable identity for this replica: hostname + pid + random suffix. */
+  private readonly ownerId: string;
+  /** Lease TTL and renewal cadence (ms). */
+  private readonly leaseTtlMs: number;
+  private readonly leaseRenewIntervalMs: number;
+  /** True while this replica holds the poll lease. */
+  private leaseHeld = false;
+  /** Fencing token of the currently-held lease (null when not held). */
+  private fencingToken: number | null = null;
   /**
    * In-flight fetch/process work from either the scheduler or `triggerPoll`.
    * `waitForDrain()` awaits this so graceful shutdown covers replay batches too.
@@ -146,6 +208,52 @@ export class SorobanEventWorker {
         String(REORG_ALERT_THRESHOLD_DEFAULT),
       10,
     );
+    this.ownerId =
+      process.env.INDEXER_OWNER_ID ??
+      `${hostname()}:${process.pid}:${randomUUID()}`;
+    this.leaseTtlMs = parseInt(
+      process.env.INDEXER_LEASE_TTL_MS ?? String(LEASE_TTL_MS_DEFAULT),
+      10,
+    );
+    this.leaseRenewIntervalMs = parseInt(
+      process.env.INDEXER_LEASE_RENEW_INTERVAL_MS ??
+        String(LEASE_RENEW_INTERVAL_MS_DEFAULT),
+      10,
+    );
+    this.batchMaxSize = Math.max(
+      1,
+      parseInt(
+        process.env.INDEXER_EVENT_BATCH_MAX_SIZE ??
+          String(EVENT_BATCH_MAX_SIZE_DEFAULT),
+        10,
+      ) || EVENT_BATCH_MAX_SIZE_DEFAULT,
+    );
+    this.batchMaxDurationMs = Math.max(
+      1,
+      parseInt(
+        process.env.INDEXER_EVENT_BATCH_MAX_DURATION_MS ??
+          String(EVENT_BATCH_MAX_DURATION_MS_DEFAULT),
+        10,
+      ) || EVENT_BATCH_MAX_DURATION_MS_DEFAULT,
+    );
+    this.batchMaxAttempts = Math.max(
+      1,
+      parseInt(
+        process.env.INDEXER_EVENT_BATCH_MAX_ATTEMPTS ??
+          String(EVENT_BATCH_MAX_ATTEMPTS_DEFAULT),
+        10,
+      ) || EVENT_BATCH_MAX_ATTEMPTS_DEFAULT,
+    );
+  }
+
+  /** Stable owner identity used for lease acquisition (exposed for tests). */
+  getOwnerId(): string {
+    return this.ownerId;
+  }
+
+  /** True when this replica currently owns the poll lease. */
+  hasLease(): boolean {
+    return this.leaseHeld;
   }
 
   /**
@@ -200,6 +308,11 @@ export class SorobanEventWorker {
 
     this.isRunning = true;
     logger.info("[SorobanWorker] Starting Soroban event indexer…");
+
+    // Acquire the poll lease before the first cycle. If another replica owns
+    // it we still schedule polls so we can take over once it expires.
+    await this.tryAcquireLease();
+
     await this.poll();
   }
 
@@ -210,7 +323,84 @@ export class SorobanEventWorker {
       clearTimeout(this.pollTimer);
       this.pollTimer = undefined;
     }
+    this.stopLeaseRenewal();
+    // Best-effort release so another replica can take over immediately.
+    if (this.leaseHeld) {
+      const token = this.fencingToken;
+      this.leaseHeld = false;
+      this.fencingToken = null;
+      void releaseIndexerLease(this.ownerId, token).catch((err) => {
+        logger.warn("[SorobanWorker] Failed to release indexer lease:", err);
+      });
+    }
     logger.info("[SorobanWorker] Stopped.");
+  }
+
+  // ─── Lease ownership ───────────────────────────────────────────────────────
+
+  /** Attempt to acquire the poll lease; logs and returns false on failure. */
+  private async tryAcquireLease(): Promise<boolean> {
+    try {
+      const lease: IndexerLease | null = await acquireIndexerLease(
+        this.ownerId,
+        this.leaseTtlMs,
+      );
+      if (!lease) return false;
+      this.leaseHeld = true;
+      this.fencingToken = lease.fencingToken;
+      this.startLeaseRenewal();
+      logger.info(
+        `[SorobanWorker] Acquired indexer lease (owner=${this.ownerId}, token=${lease.fencingToken}).`,
+      );
+      return true;
+    } catch (err) {
+      logger.error("[SorobanWorker] Failed to acquire indexer lease:", err);
+      return false;
+    }
+  }
+
+  private startLeaseRenewal(): void {
+    this.stopLeaseRenewal();
+    this.leaseRenewTimer = setInterval(() => {
+      void this.renewLease();
+    }, this.leaseRenewIntervalMs);
+    // Do not keep the process alive solely for lease renewal.
+    this.leaseRenewTimer.unref?.();
+  }
+
+  private stopLeaseRenewal(): void {
+    if (this.leaseRenewTimer) {
+      clearInterval(this.leaseRenewTimer);
+      this.leaseRenewTimer = undefined;
+    }
+  }
+
+  private async renewLease(): Promise<void> {
+    if (!this.leaseHeld) return;
+    try {
+      const renewed = await renewIndexerLease(
+        this.ownerId,
+        this.leaseTtlMs,
+        this.fencingToken,
+      );
+      if (!renewed) {
+        this.handleLeaseLoss("renewal rejected (lease taken over or expired)");
+      }
+    } catch (err) {
+      logger.warn("[SorobanWorker] Indexer lease renewal failed:", err);
+    }
+  }
+
+  /** Called when the lease is lost: stop polling and log loudly. */
+  private handleLeaseLoss(reason: string): void {
+    if (!this.leaseHeld) return;
+    this.leaseHeld = false;
+    this.fencingToken = null;
+    this.stopLeaseRenewal();
+    logger.error(
+      `[SorobanWorker] Lost indexer lease (owner=${this.ownerId}): ${reason}. ` +
+        `Polling halted; this replica will not advance the cursor.`,
+    );
   }
 
   /** Wait for the currently-running poll/replay batch to finish (no-op if idle). */
@@ -318,6 +508,19 @@ export class SorobanEventWorker {
 
   private async poll(): Promise<void> {
     try {
+      // Only the lease owner may poll. Non-owners attempt to acquire the lease
+      // (which succeeds once the current owner's lease expires) and otherwise
+      // skip this cycle entirely.
+      if (!this.leaseHeld) {
+        const acquired = await this.tryAcquireLease();
+        if (!acquired) {
+          logger.debug?.(
+            "[SorobanWorker] Skipping poll — indexer lease held by another replica.",
+          );
+          return;
+        }
+      }
+
       const requestId = randomUUID();
       await this.runExclusive(() => {
         const execute = () =>
@@ -439,6 +642,16 @@ export class SorobanEventWorker {
   }
 
   private async runPollCycle(): Promise<void> {
+    // Re-check ownership at the start of the cycle: a lease may have been lost
+    // between scheduling and execution. Never advance the cursor without it.
+    if (!this.leaseHeld || this.fencingToken === null) {
+      logger.warn(
+        "[SorobanWorker] Aborting poll cycle — indexer lease not held.",
+      );
+      return;
+    }
+    const fencingToken = this.fencingToken;
+
     // Ensure an IndexerState row exists on first run.
     let state = await ensureIndexerState(this.startLedger);
 
@@ -494,6 +707,7 @@ export class SorobanEventWorker {
     } catch (err) {
       recordRpcRequest("getEvents", (Date.now() - rpcStart) / 1000, "error");
       indexerPollsTotal.inc({ outcome: "rpc_error" });
+      recordIndexerRetry("rpc");
       throw err;
     }
 
@@ -501,9 +715,14 @@ export class SorobanEventWorker {
     // even on cycles that return no events.
     const networkLedger = response.latestLedger ?? 0;
 
+    // Lag in ledgers between the last indexed ledger and the network tip.
+    // Bounded labels only (no tx hashes / addresses).
+    recordIndexerLag(Math.max(0, networkLedger - state.lastLedger));
+
     if (response.events.length === 0) {
       indexerPollsTotal.inc({ outcome: "empty" });
       publishIndexerLag(state.lastLedger, networkLedger);
+      recordIndexerLastSuccess();
       return;
     }
 
@@ -527,14 +746,43 @@ export class SorobanEventWorker {
       return 0;
     });
 
+    // Accumulate events into bounded batches. Each batch is persisted in a
+    // single transaction together with the cursor advance so events and cursor
+    // commit atomically (no dropped events, no duplicate broadcasts).
+    let batch: rpc.Api.EventResponse[] = [];
+    let batchStartedAt = Date.now();
+
+    const flush = async (): Promise<void> => {
+      if (batch.length === 0) return;
+      const pending = batch;
+      batch = [];
+      batchStartedAt = Date.now();
+
+      const result = await this.persistEventBatch(pending);
+      if (result.processed > 0) {
+        sawSuccess = true;
+        lastCursor = result.lastCursor ?? lastCursor;
+        lastLedger = result.lastLedger ?? lastLedger;
+        for (const entry of result.processedEvents) {
+          const ledgerEvents = processedByLedger.get(entry.ledgerSequence) ?? [];
+          ledgerEvents.push(entry);
+          processedByLedger.set(entry.ledgerSequence, ledgerEvents);
+        }
+      }
+    };
+
     for (const event of sortedEvents) {
       // Only process events from successful contract calls.
       if (!event.inSuccessfulContractCall) continue;
 
+      const decodeStart = Date.now();
       const eventType = event.topic[0] ? decodeSymbol(event.topic[0]) : "unknown";
+      recordIndexerDecodeLatency((Date.now() - decodeStart) / 1000);
 
       try {
+        const persistStart = Date.now();
         await this.processEvent(event);
+        recordIndexerPersistLatency((Date.now() - persistStart) / 1000);
         this.eventsProcessed += 1;
         this.recordOutcome(true);
         sawSuccess = true;
@@ -552,6 +800,7 @@ export class SorobanEventWorker {
         indexerEventsProcessedTotal.inc({ eventType, result: "processed" });
       } catch (err) {
         indexerEventsProcessedTotal.inc({ eventType, result: "quarantined" });
+        recordIndexerRetry("quarantine");
         logger.error(
           `[SorobanWorker] Failed to process event ${event.id}:`,
           err,
@@ -562,6 +811,23 @@ export class SorobanEventWorker {
         await quarantineEvent(event, err);
         // Continue processing subsequent events rather than halting.
       }
+
+      batch.push(event);
+
+      const elapsed = Date.now() - batchStartedAt;
+      if (
+        batch.length >= this.batchMaxSize ||
+        elapsed >= this.batchMaxDurationMs
+      ) {
+        await flush();
+      }
+      }
+    }
+    await flush();
+
+    // Events per ledger for this batch (bounded: one observation per ledger).
+    for (const [, ledgerEvents] of processedByLedger) {
+      recordIndexerEventsPerLedger(ledgerEvents.length);
     }
 
     // If we successfully processed any events in the batch, advance to the last
@@ -576,22 +842,186 @@ export class SorobanEventWorker {
       await this.recordLedgerCheckpoints(processedByLedger);
     }
 
+    // Fenced cursor write: only the current lease owner may advance the cursor.
+    // A stale worker whose lease expired (and was taken over) is rejected here
+    // rather than clobbering the new owner's progress.
+    const persisted = await this.persistCursorFenced(
+      fencingToken,
+      lastLedger,
+      finalCursor,
+    );
+    if (!persisted) {
+      // Ownership was lost mid-cycle; do not report success or advance lag.
+      this.handleLeaseLoss("fenced cursor write rejected");
+      return;
+    }
+
+    indexerPollsTotal.inc({ outcome: "processed" });
+    publishIndexerLag(lastLedger, networkLedger);
+    recordIndexerLastSuccess();
+
+    logger.info(
+      `[SorobanWorker] Processed ${response.events.length} event(s) — latest ledger: ${lastLedger}`,
+    );
+  }
+
+  /**
+   * Advance the indexer cursor only if `fencingToken` still matches the lease
+   * held in the database. Returns false when the write was fenced out (the
+   * lease was lost or taken over), in which case the caller must stop.
+   */
+  private async persistCursorFenced(
+    fencingToken: number,
+    lastLedger: number,
+    lastCursor: string | null,
+  ): Promise<boolean> {
+    const held = await isLeaseHeld(this.ownerId, fencingToken);
+    if (!held) return false;
+
     await prisma.indexerState.upsert({
       where: { id: INDEXER_STATE_ID },
       create: {
         id: INDEXER_STATE_ID,
         lastLedger,
-        lastCursor: finalCursor,
+        lastCursor,
       },
-      update: { lastLedger, lastCursor: finalCursor },
+      update: { lastLedger, lastCursor },
+    });
+    return true;
+  }
+
+  /**
+   * Persist a bounded batch of events atomically.
+   *
+   * Each event is dispatched through `processEvent` inside a single Prisma
+   * transaction so the batch's writes commit together. If the batch
+   * transaction fails, it is retried up to `batchMaxAttempts` times; if it
+   * still fails, the batch is split and retried event-by-event so a single
+   * poison event is quarantined without dropping the rest of the batch.
+   *
+   * Returns the events that were successfully processed, along with the
+   * cursor/ledger of the last successful event.
+   */
+  private async persistEventBatch(
+    events: rpc.Api.EventResponse[],
+  ): Promise<{
+    processed: number;
+    lastCursor: string | null;
+    lastLedger: number | null;
+    processedEvents: Array<{
+      ledgerSequence: number;
+      transactionHash: string;
+      eventType: string;
+    }>;
+  }> {
+    const startedAt = Date.now();
+    let lastCursor: string | null = null;
+    let lastLedger: number | null = null;
+    const processedEvents: Array<{
+      ledgerSequence: number;
+      transactionHash: string;
+      eventType: string;
+    }> = [];
+
+    let attempt = 0;
+    let remaining = events;
+    while (remaining.length > 0) {
+      attempt += 1;
+      try {
+        await prisma.$transaction(
+          async () => {
+            for (const event of remaining) {
+              await this.processEvent(event);
+            }
+          },
+          { timeout: this.batchMaxDurationMs },
+        );
+
+        for (const event of remaining) {
+          const eventType = event.topic[0]
+            ? decodeSymbol(event.topic[0])
+            : "unknown";
+          this.eventsProcessed += 1;
+          this.recordOutcome(true);
+          processedEvents.push({
+            ledgerSequence: event.ledger,
+            transactionHash: event.txHash,
+            eventType,
+          });
+          lastCursor = event.id;
+          lastLedger = event.ledger;
+          indexerEventsProcessedTotal.inc({ eventType, result: "processed" });
+        }
+        break;
+      } catch (err) {
+        recordIndexerBatch({
+          size: remaining.length,
+          latencyMs: Date.now() - startedAt,
+          retries: attempt - 1,
+          outcome: "error",
+        });
+        if (attempt >= this.batchMaxAttempts) {
+          logger.error(
+            `[SorobanWorker] Batch of ${remaining.length} event(s) failed after ` +
+              `${attempt} attempt(s); falling back to per-event processing.`,
+            err,
+          );
+          // Fall back to per-event processing so a single poison event is
+          // quarantined without dropping the rest of the batch.
+          for (const event of remaining) {
+            const eventType = event.topic[0]
+              ? decodeSymbol(event.topic[0])
+              : "unknown";
+            try {
+              await this.processEvent(event);
+              this.eventsProcessed += 1;
+              this.recordOutcome(true);
+              processedEvents.push({
+                ledgerSequence: event.ledger,
+                transactionHash: event.txHash,
+                eventType,
+              });
+              lastCursor = event.id;
+              lastLedger = event.ledger;
+              indexerEventsProcessedTotal.inc({
+                eventType,
+                result: "processed",
+              });
+            } catch (eventErr) {
+              indexerEventsProcessedTotal.inc({
+                eventType,
+                result: "quarantined",
+              });
+              logger.error(
+                `[SorobanWorker] Failed to process event ${event.id}:`,
+                eventErr,
+              );
+              await quarantineEvent(event, eventErr);
+            }
+          }
+          break;
+        }
+        logger.warn(
+          `[SorobanWorker] Batch attempt ${attempt} failed; retrying ` +
+            `${remaining.length} event(s).`,
+          err,
+        );
+      }
+    }
+
+    recordIndexerBatch({
+      size: events.length,
+      latencyMs: Date.now() - startedAt,
+      retries: Math.max(0, attempt - 1),
+      outcome: "success",
     });
 
-    indexerPollsTotal.inc({ outcome: "processed" });
-    publishIndexerLag(lastLedger, networkLedger);
-
-    logger.info(
-      `[SorobanWorker] Processed ${response.events.length} event(s) — latest ledger: ${lastLedger}`,
-    );
+    return {
+      processed: processedEvents.length,
+      lastCursor,
+      lastLedger,
+      processedEvents,
+    };
   }
 
   /**
@@ -704,6 +1134,17 @@ export class SorobanEventWorker {
           timestamp,
         },
       });
+
+      await recordAuditEvent({
+        actor: admin,
+        action: "protocol.fee_config.update",
+        targetType: "protocol_fee_config",
+        targetId: event.txHash,
+        outcome: "success",
+        before: { treasury: oldTreasury, feeRateBps: oldFeeRateBps },
+        after: { treasury: newTreasury, feeRateBps: newFeeRateBps },
+        metadata: { transactionHash: event.txHash, ledger: event.ledger },
+      }, tx);
     });
 
     sseService.broadcastToAdmin("stream.fee_config_updated", {
@@ -1083,16 +1524,8 @@ export class SorobanEventWorker {
     const refundedAmount = decodeI128(body["refunded_amount"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
+    let inserted = false;
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.stream.update({
-        where: { streamId },
-        data: {
-          isActive: false,
-          withdrawnAmount: amountWithdrawn,
-          lastUpdateTime: timestamp,
-        },
-      });
-
       const existingEvent = await tx.streamEvent.findUnique({
         where: {
           transactionHash_eventType: {
@@ -1106,39 +1539,52 @@ export class SorobanEventWorker {
         logger.warn(
           `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=CANCELLED`,
         );
-      } else {
-        await tx.streamEvent.upsert({
-          where: {
-            transactionHash_eventType: {
-              transactionHash: event.txHash,
-              eventType: "CANCELLED",
-            },
-          },
-          create: {
-            streamId,
-            eventType: "CANCELLED",
-            amount: refundedAmount,
-            transactionHash: event.txHash,
-            ledgerSequence: event.ledger,
-            timestamp,
-            metadata: JSON.stringify({ amountWithdrawn, refundedAmount }),
-          },
-          update: {
-            ledgerSequence: event.ledger,
-            timestamp,
-          },
-        });
+        return;
       }
+
+      await tx.stream.update({
+        where: { streamId },
+        data: {
+          isActive: false,
+          withdrawnAmount: amountWithdrawn,
+          lastUpdateTime: timestamp,
+        },
+      });
+
+      await tx.streamEvent.upsert({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "CANCELLED",
+          },
+        },
+        create: {
+          streamId,
+          eventType: "CANCELLED",
+          amount: refundedAmount,
+          transactionHash: event.txHash,
+          ledgerSequence: event.ledger,
+          timestamp,
+          metadata: JSON.stringify({ amountWithdrawn, refundedAmount }),
+        },
+        update: {
+          ledgerSequence: event.ledger,
+          timestamp,
+        },
+      });
+      inserted = true;
     });
 
-    sseService.broadcastToStream(String(streamId), "stream.cancelled", {
-      streamId,
-      refundedAmount,
-      amountWithdrawn,
-      transactionHash: event.txHash,
-      ledger: event.ledger,
-      timestamp,
-    });
+    if (inserted) {
+      sseService.broadcastToStream(String(streamId), "stream.cancelled", {
+        streamId,
+        refundedAmount,
+        amountWithdrawn,
+        transactionHash: event.txHash,
+        ledger: event.ledger,
+        timestamp,
+      });
+    }
   }
 
   private async handleStreamCompleted(
@@ -1156,16 +1602,8 @@ export class SorobanEventWorker {
     const totalWithdrawn = decodeI128(body["total_withdrawn"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
+    let inserted = false;
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.stream.update({
-        where: { streamId },
-        data: {
-          isActive: false,
-          withdrawnAmount: totalWithdrawn,
-          lastUpdateTime: timestamp,
-        },
-      });
-
       const existingEvent = await tx.streamEvent.findUnique({
         where: {
           transactionHash_eventType: {
@@ -1179,39 +1617,52 @@ export class SorobanEventWorker {
         logger.warn(
           `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=COMPLETED`,
         );
-      } else {
-        await tx.streamEvent.upsert({
-          where: {
-            transactionHash_eventType: {
-              transactionHash: event.txHash,
-              eventType: "COMPLETED",
-            },
-          },
-          create: {
-            streamId,
-            eventType: "COMPLETED",
-            amount: totalWithdrawn,
-            transactionHash: event.txHash,
-            ledgerSequence: event.ledger,
-            timestamp,
-            metadata: JSON.stringify({ recipient }),
-          },
-          update: {
-            ledgerSequence: event.ledger,
-            timestamp,
-          },
-        });
+        return;
       }
+
+      await tx.stream.update({
+        where: { streamId },
+        data: {
+          isActive: false,
+          withdrawnAmount: totalWithdrawn,
+          lastUpdateTime: timestamp,
+        },
+      });
+
+      await tx.streamEvent.upsert({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "COMPLETED",
+          },
+        },
+        create: {
+          streamId,
+          eventType: "COMPLETED",
+          amount: totalWithdrawn,
+          transactionHash: event.txHash,
+          ledgerSequence: event.ledger,
+          timestamp,
+          metadata: JSON.stringify({ recipient }),
+        },
+        update: {
+          ledgerSequence: event.ledger,
+          timestamp,
+        },
+      });
+      inserted = true;
     });
 
-    sseService.broadcastToStream(String(streamId), "stream.completed", {
-      streamId,
-      recipient,
-      totalWithdrawn,
-      transactionHash: event.txHash,
-      ledger: event.ledger,
-      timestamp,
-    });
+    if (inserted) {
+      sseService.broadcastToStream(String(streamId), "stream.completed", {
+        streamId,
+        recipient,
+        totalWithdrawn,
+        transactionHash: event.txHash,
+        ledger: event.ledger,
+        timestamp,
+      });
+    }
   }
 
   private async handleFeeCollected(
@@ -1230,21 +1681,24 @@ export class SorobanEventWorker {
     const token = decodeAddress(body["token"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
-    const existingEvent = await prisma.streamEvent.findUnique({
-      where: {
-        transactionHash_eventType: {
-          transactionHash: event.txHash,
-          eventType: "FEE_COLLECTED",
+    let inserted = false;
+    await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
+      const existingEvent = await tx.streamEvent.findUnique({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "FEE_COLLECTED",
+          },
         },
-      },
-      select: { id: true },
-    });
-    if (existingEvent) {
-      logger.warn(
-        `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=FEE_COLLECTED`,
-      );
-    } else {
-      await prisma.streamEvent.upsert({
+        select: { id: true },
+      });
+      if (existingEvent) {
+        logger.warn(
+          `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=FEE_COLLECTED`,
+        );
+        return;
+      }
+      await tx.streamEvent.upsert({
         where: {
           transactionHash_eventType: {
             transactionHash: event.txHash,
@@ -1262,18 +1716,22 @@ export class SorobanEventWorker {
         },
         update: {},
       });
-    }
-
-    // Broadcast to admin channel for treasury reporting
-    sseService.broadcastToAdmin("stream.fee_collected", {
-      streamId,
-      treasury,
-      feeAmount,
-      token,
-      transactionHash: event.txHash,
-      ledger: event.ledger,
-      timestamp,
+      inserted = true;
     });
+
+    // Broadcast to admin channel for treasury reporting. Only broadcast when
+    // the event was actually inserted so replays never duplicate broadcasts.
+    if (inserted) {
+      sseService.broadcastToAdmin("stream.fee_collected", {
+        streamId,
+        treasury,
+        feeAmount,
+        token,
+        transactionHash: event.txHash,
+        ledger: event.ledger,
+        timestamp,
+      });
+    }
   }
   private async handleStreamPaused(
     event: rpc.Api.EventResponse,
@@ -1290,16 +1748,8 @@ export class SorobanEventWorker {
     const pausedAt = Number(decodeU64(body["paused_at"]));
     const timestamp = Math.floor(Date.now() / 1000);
 
+    let inserted = false;
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      await tx.stream.update({
-        where: { streamId },
-        data: {
-          isPaused: true,
-          pausedAt,
-          lastUpdateTime: timestamp,
-        },
-      });
-
       const existingEvent = await tx.streamEvent.findUnique({
         where: {
           transactionHash_eventType: {
@@ -1313,38 +1763,51 @@ export class SorobanEventWorker {
         logger.warn(
           `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=PAUSED`,
         );
-      } else {
-        await tx.streamEvent.upsert({
-          where: {
-            transactionHash_eventType: {
-              transactionHash: event.txHash,
-              eventType: "PAUSED",
-            },
-          },
-          create: {
-            streamId,
-            eventType: "PAUSED",
-            transactionHash: event.txHash,
-            ledgerSequence: event.ledger,
-            timestamp,
-            metadata: JSON.stringify({ sender, pausedAt }),
-          },
-          update: {
-            ledgerSequence: event.ledger,
-            timestamp,
-          },
-        });
+        return;
       }
+
+      await tx.stream.update({
+        where: { streamId },
+        data: {
+          isPaused: true,
+          pausedAt,
+          lastUpdateTime: timestamp,
+        },
+      });
+
+      await tx.streamEvent.upsert({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "PAUSED",
+          },
+        },
+        create: {
+          streamId,
+          eventType: "PAUSED",
+          transactionHash: event.txHash,
+          ledgerSequence: event.ledger,
+          timestamp,
+          metadata: JSON.stringify({ sender, pausedAt }),
+        },
+        update: {
+          ledgerSequence: event.ledger,
+          timestamp,
+        },
+      });
+      inserted = true;
     });
 
-    sseService.broadcastToStream(String(streamId), "stream.paused", {
-      streamId,
-      sender,
-      pausedAt,
-      transactionHash: event.txHash,
-      ledger: event.ledger,
-      timestamp,
-    });
+    if (inserted) {
+      sseService.broadcastToStream(String(streamId), "stream.paused", {
+        streamId,
+        sender,
+        pausedAt,
+        transactionHash: event.txHash,
+        ledger: event.ledger,
+        timestamp,
+      });
+    }
   }
 
   private async handleStreamResumed(
@@ -1362,31 +1825,10 @@ export class SorobanEventWorker {
     const newEndTime = decodeU64(body["new_end_time"]);
     const timestamp = Math.floor(Date.now() / 1000);
 
+    let inserted = false;
+    let additionalPausedDuration = 0;
+    let newTotalPausedDuration = 0;
     await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
-      // Get current stream to calculate paused duration
-      const currentStream = await tx.stream.findUniqueOrThrow({
-        where: { streamId },
-        select: { pausedAt: true, totalPausedDuration: true },
-      });
-
-      const additionalPausedDuration = currentStream.pausedAt
-        ? timestamp - Number(currentStream.pausedAt)
-        : 0;
-
-      const newTotalPausedDuration =
-        currentStream.totalPausedDuration + additionalPausedDuration;
-
-      await tx.stream.update({
-        where: { streamId },
-        data: {
-          isPaused: false,
-          pausedAt: null,
-          endTime: newEndTime,
-          totalPausedDuration: newTotalPausedDuration,
-          lastUpdateTime: timestamp,
-        },
-      });
-
       const existingEvent = await tx.streamEvent.findUnique({
         where: {
           transactionHash_eventType: {
@@ -1400,43 +1842,71 @@ export class SorobanEventWorker {
         logger.warn(
           `[SorobanWorker] Duplicate StreamEvent skipped: txHash=${event.txHash} type=RESUMED`,
         );
-      } else {
-        await tx.streamEvent.upsert({
-          where: {
-            transactionHash_eventType: {
-              transactionHash: event.txHash,
-              eventType: "RESUMED",
-            },
-          },
-          create: {
-            streamId,
-            eventType: "RESUMED",
-            transactionHash: event.txHash,
-            ledgerSequence: event.ledger,
-            timestamp,
-            metadata: JSON.stringify({
-              sender,
-              newEndTime: newEndTime.toString(),
-              pausedDuration: additionalPausedDuration,
-              totalPausedDuration: newTotalPausedDuration,
-            }),
-          },
-          update: {
-            ledgerSequence: event.ledger,
-            timestamp,
-          },
-        });
+        return;
       }
+
+      // Get current stream to calculate paused duration
+      const currentStream = await tx.stream.findUniqueOrThrow({
+        where: { streamId },
+        select: { pausedAt: true, totalPausedDuration: true },
+      });
+
+      additionalPausedDuration = currentStream.pausedAt
+        ? timestamp - Number(currentStream.pausedAt)
+        : 0;
+
+      newTotalPausedDuration =
+        currentStream.totalPausedDuration + additionalPausedDuration;
+
+      await tx.stream.update({
+        where: { streamId },
+        data: {
+          isPaused: false,
+          pausedAt: null,
+          endTime: newEndTime,
+          totalPausedDuration: newTotalPausedDuration,
+          lastUpdateTime: timestamp,
+        },
+      });
+
+      await tx.streamEvent.upsert({
+        where: {
+          transactionHash_eventType: {
+            transactionHash: event.txHash,
+            eventType: "RESUMED",
+          },
+        },
+        create: {
+          streamId,
+          eventType: "RESUMED",
+          transactionHash: event.txHash,
+          ledgerSequence: event.ledger,
+          timestamp,
+          metadata: JSON.stringify({
+            sender,
+            newEndTime: newEndTime.toString(),
+            pausedDuration: additionalPausedDuration,
+            totalPausedDuration: newTotalPausedDuration,
+          }),
+        },
+        update: {
+          ledgerSequence: event.ledger,
+          timestamp,
+        },
+      });
+      inserted = true;
     });
 
-    sseService.broadcastToStream(String(streamId), "stream.resumed", {
-      streamId,
-      sender,
-      newEndTime: newEndTime.toString(),
-      transactionHash: event.txHash,
-      ledger: event.ledger,
-      timestamp,
-    });
+    if (inserted) {
+      sseService.broadcastToStream(String(streamId), "stream.resumed", {
+        streamId,
+        sender,
+        newEndTime: newEndTime.toString(),
+        transactionHash: event.txHash,
+        ledger: event.ledger,
+        timestamp,
+      });
+    }
   }
 }
 

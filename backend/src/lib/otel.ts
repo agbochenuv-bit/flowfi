@@ -50,6 +50,19 @@ if (process.env.OTEL_SDK_DISABLED !== 'true') {
       getNodeAutoInstrumentations({
         // `fs` instrumentation is extremely noisy and offers no value here.
         '@opentelemetry/instrumentation-fs': { enabled: false },
+        // HTTP semantic conventions can include query strings in url.full.
+        // Keep path-level diagnostics while stripping all query parameters.
+        '@opentelemetry/instrumentation-http': {
+          requestHook: (span, request) => {
+            const rawPath = 'url' in request
+              ? (request as { url?: string }).url
+              : undefined;
+            const path = (rawPath?.split('?', 1)[0] || '/').replace(/G[A-Z2-7]{55}/g, '[wallet]');
+            span.setAttribute('url.full', path);
+            span.setAttribute('http.target', path);
+            span.setAttribute('url.query', '');
+          },
+        },
       }),
     ],
     // Only install a trace exporter when a collector is actually configured;

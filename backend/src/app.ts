@@ -26,6 +26,21 @@ const allowedOrigins = rawCors
   .map((origin) => origin.trim())
   .filter(Boolean);
 
+for (const origin of allowedOrigins) {
+  let parsed: URL;
+  try {
+    parsed = new URL(origin);
+  } catch {
+    throw new Error(`Invalid CORS origin: ${origin}`);
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== origin) {
+    throw new Error(`CORS_ALLOWED_ORIGINS entries must be exact HTTP(S) origins: ${origin}`);
+  }
+  if (isProduction && parsed.protocol !== 'https:') {
+    throw new Error(`Production CORS origins must use HTTPS: ${origin}`);
+  }
+}
+
 // Default in development to only localhost:3000 (frontend dev server)
 if (!process.env.CORS_ALLOWED_ORIGINS && !isProduction) {
   allowedOrigins.push("http://localhost:3000");
@@ -68,6 +83,8 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 
 app.use(
   cors({
+    // Browser authentication uses explicit Bearer headers, never cookies.
+    credentials: false,
     origin(origin, callback) {
       // Allow non-browser clients (no Origin header)
       if (!origin) {
@@ -83,7 +100,6 @@ app.use(
       // Not allowed
       callback(new Error("CORS origin not allowed"));
     },
-    credentials: true,
   }),
 );
 
@@ -186,6 +202,10 @@ app.get("/", (req: Request, res: Response) => {
 
 import { errorHandler } from "./middleware/error.middleware.js";
 
+// Centralized error handler. Must be registered last so every route,
+// validation middleware, and async controller rejection funnels through the
+// single error-mapping boundary. Express 5 forwards rejected promises from
+// async handlers to this middleware automatically.
 app.use(errorHandler);
 
 export default app;

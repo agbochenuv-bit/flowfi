@@ -80,3 +80,73 @@ export function explainSkipReason(readiness: DbReadiness): string {
     `  CI default: ${DEFAULT_TEST_DATABASE_URL}`,
   ].join("\n");
 }
+
+/**
+ * Open a short-lived client against the test database.
+ *
+ * Used by the migration/restore integration suites (issues #63 and #65)
+ * which need to run raw DDL/DML that Prisma's typed client cannot express
+ * (e.g. `CREATE SCHEMA`, `pg_dump`-style snapshot tables, advisory locks).
+ * Callers are responsible for `end()`-ing the returned client.
+ */
+export async function openTestClient(): Promise<Client> {
+  const client = new Client({
+    connectionString: resolveTestDatabaseUrl(),
+    connectionTimeoutMillis: PROBE_TIMEOUT_MS,
+  });
+  await client.connect();
+  return client;
+}
+
+/**
+ * Run `fn` inside a transaction that is always rolled back, so destructive
+ * migration/restore exercises never leak state into the shared test DB.
+ *
+ * The callback receives a dedicated client whose only live transaction is
+ * the one opened here. Any error thrown by `fn` propagates after rollback.
+ */
+export async function withRollbackTx<T>(
+  fn: (client: Client) => Promise<T>,
+): Promise<T> {
+  const client = await openTestClient();
+  try {
+    await client.query("BEGIN");
+    try {
+      return await fn(client);
+    } finally {
+      await client.query("ROLLBACK").catch(() => undefined);
+    }
+  } finally {
+    await client.end().catch(() => undefined);
+  }
+}
+
+/**
+ * Create an isolated, uniquely-named schema and set it as the session
+ * `search_path`, so migration/restore tests can freely create and drop
+ * tables without colliding with the real `public` schema or with other
+ * concurrently running suites.
+ *
+ * Returns the schema name; the caller must drop it (see `dropSchema`).
+ */
+export async function createIsolatedSchema(
+  client: Client,
+  prefix = "it_mig",
+): Promise<string> {
+  const suffix = `${Date.now().toString(36)}_${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+  const schema = `${prefix}_${suffix}`.replace(/[^a-z0-9_]/gi, "_");
+  await client.query(`CREATE SCHEMA "${schema}"`);
+  await client.query(`SET search_path TO "${schema}"`);
+  return schema;
+}
+
+/** Drop an isolated schema created by `createIsolatedSchema`. */
+export async function dropSchema(
+  client: Client,
+  schema: string,
+): Promise<void> {
+  await client.query(`SET search_path TO public`).catch(() => undefined);
+  await client.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
+}

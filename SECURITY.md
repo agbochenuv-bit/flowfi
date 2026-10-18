@@ -77,6 +77,42 @@ Our backend API implements several security measures:
 - **Input Validation**: All inputs are validated using Zod schemas
 - **CORS**: Cross-origin requests are properly configured
 - **Environment Variables**: Sensitive configuration is stored securely
+- **JWT Signing-Key Rotation**: Tokens are signed with a key identified by a `kid` header and verified against a set of keys, so keys can be rotated without logging users out (see below)
+
+### JWT Signing-Key Rotation
+
+FlowFi supports rotating JWT signing keys without invalidating existing sessions. Each issued token carries a `kid` (key identifier) header, and the verifier accepts any key in the current verification set. Rotation is performed by overlapping keys: a new key is added and made active for signing, while the previous key remains in the verification set until every token it signed has expired.
+
+#### Configuration
+
+| Variable | Description |
+| -------- | ----------- |
+| `JWT_KEYS` | JSON object mapping `kid` to key material, e.g. `{"2024-01":"<secret>","2024-07":"<secret>"}`. Every key listed here is accepted for verification. |
+| `JWT_ACTIVE_KID` | The `kid` used to sign newly issued tokens. Must be present in `JWT_KEYS`. |
+
+Startup fails fast if `JWT_ACTIVE_KID` is missing from `JWT_KEYS`, if `JWT_KEYS` is empty or malformed, or if any key material is empty. Tokens whose `kid` is absent from `JWT_KEYS` (unknown or retired keys) are rejected.
+
+#### Secret-Loading Rules
+
+- Key material is supplied only through the environment (or the deployment secret store that populates it); never commit keys to the repository or bake them into images.
+- Diagnostics, logs, and error messages must never include key material. Log `kid` values only.
+- Use a distinct, high-entropy secret per `kid`; do not reuse a secret under a new `kid`.
+- Restrict read access to the secret store to the API service identity.
+
+#### Rotation Runbook
+
+1. **Add the new key.** Generate a new high-entropy secret, add it to `JWT_KEYS` under a new `kid`, and roll out the configuration. New tokens are still signed with the old active key; the new key is only accepted for verification.
+2. **Switch the active key.** Set `JWT_ACTIVE_KID` to the new `kid` and roll out. Newly issued tokens are now signed with the new key.
+3. **Wait the overlap window.** Keep the old key in `JWT_KEYS` for at least the maximum token lifetime (plus clock-skew allowance) so tokens signed with it remain valid.
+4. **Retire the old key.** Remove the old `kid` from `JWT_KEYS` and roll out. Tokens signed with the retired key are now rejected.
+
+#### Externally Observable Behavior
+
+- During steps 1–3, tokens signed by either the old or the new key are accepted; users are not logged out by a rotation.
+- After step 4, only tokens signed by keys still in `JWT_KEYS` are accepted; tokens signed by retired or unknown keys are rejected.
+- Rotation requires no client-side changes and no versioned API change; the `kid` header is additive and ignored by clients.
+- No key material appears in responses, logs, or error diagnostics.
+=======
 
 ### Frontend Security
 

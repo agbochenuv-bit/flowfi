@@ -32,6 +32,16 @@ export {
 } from './builder.js';
 export type { Signer } from './signers/index.js';
 export { CustomSigner, KeypairSigner, FreighterSigner } from './signers/index.js';
+export type { SignerOptions } from './signers/index.js';
+export { FlowFiEventClient } from './events.js';
+export type {
+  EventClientLifecycle,
+  EventClientOptions,
+  EventReconnectInfo,
+  FlowFiEvent,
+  StreamEventType,
+} from './events.js';
+export type { OperationOptions } from './cancellation.js';
 
 export {
   pollTransactionWithRetry,

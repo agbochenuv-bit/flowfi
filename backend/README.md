@@ -17,14 +17,15 @@ This is the Node.js / Express backend for FlowFi. It provides the REST API for t
 Create a `.env` file with the following variables:
 
 ```env
-DATABASE_URL=postgresql://user:password@localhost:5433/flowfi?schema=public
+DATABASE_URL=postgresql://flowfi:flowfi_dev_password@localhost:5433/flowfi?schema=public
 PORT=3001
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 API_BASE_URL=https://api.staging.flowfi.io
 ```
 
 - `API_BASE_URL`: Overrides the Swagger UI server URL for the deployed environment (e.g., staging or production). When set, Swagger UI targets `<API_BASE_URL>/v1` instead of the hardcoded defaults.
+- `DATABASE_URL` is required before the backend starts. Production additionally requires `JWT_SECRET`, `KEEPER_SECRET_KEY`, `ADMIN_PUBLIC_KEY`, `SOROBAN_RPC_URL`, `STELLAR_NETWORK`, `STREAM_CONTRACT_ID`, `CORS_ALLOWED_ORIGINS`, and an HTTPS `API_BASE_URL`. Production startup rejects placeholders, weak signing keys, invalid Stellar keys, network mismatches, wildcard/insecure origins, and enabled sandbox mode. `SOROBAN_RPC_URLS` may add pool failover endpoints but does not replace the primary URL.
 
 ## Prisma Database
 
