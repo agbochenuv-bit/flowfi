@@ -62,8 +62,8 @@ jobs:
       - name: Install Stellar CLI
         if: inputs.contract_id == ''
         run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --install-deps --version 22.0.0
-          echo "$HOME/.stellar-cli/bin" >> "$GITHUB_PATH"
+          curl -fsSL https://raw.githubusercontent.com/stellar/stellar-cli/main/install.sh | sh -s -- --user
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Build & optimize WASM
         if: inputs.contract_id == ''
