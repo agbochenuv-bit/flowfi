@@ -1,5 +1,6 @@
 import path from "node:path";
 import type { NextConfig } from "next";
+import { getSecurityHeaders } from "./src/lib/security-headers";
 
 const nextConfig: NextConfig = {
   // The workspace root lives one level above this directory. Pinning it here
@@ -28,6 +29,15 @@ const nextConfig: NextConfig = {
       },
     ];
   },
+  async headers() {
+    return [
+      {
+        source: "/(.*)",
+        headers: getSecurityHeaders(),
+      },
+    ];
+  },
 };
 
 export default nextConfig;
+

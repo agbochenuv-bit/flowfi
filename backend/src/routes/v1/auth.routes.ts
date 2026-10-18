@@ -20,15 +20,29 @@ const router = Router();
  *               publicKey:
  *                 type: string
  *                 example: GABC...
+ *               audience:
+ *                 type: string
+ *                 description: >-
+ *                   Optional intended audience for the challenge. Defaults to the
+ *                   server-configured audience when omitted.
+ *                 example: app.example.com
+ *               network:
+ *                 type: string
+ *                 description: >-
+ *                   Optional Stellar network binding (e.g. "testnet", "public").
+ *                   Defaults to the server-configured network when omitted.
+ *                 example: testnet
  *     responses:
  *       200:
- *         description: Challenge nonce issued
+ *         description: >-
+ *           Challenge nonce issued. The response echoes the effective audience
+ *           and network the challenge is bound to.
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/AuthChallengeResponse'
  *       400:
- *         description: Invalid publicKey
+ *         description: Invalid publicKey, audience, or network
  *         content:
  *           application/json:
  *             schema:
@@ -40,7 +54,12 @@ const router = Router();
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/challenge', issueChallenge);
+router.post('/challenge', (req, res, next) =>
+  issueChallenge(req, res, next, {
+    audience: req.body?.audience,
+    network: req.body?.network,
+  }),
+);
 
 /**
  * @openapi
@@ -61,6 +80,16 @@ router.post('/challenge', issueChallenge);
  *               signedTransaction:
  *                 type: string
  *                 description: Base64-encoded XDR signed transaction containing the nonce
+ *               audience:
+ *                 type: string
+ *                 description: >-
+ *                   Optional audience the challenge was requested for. Must match
+ *                   the audience bound at challenge issuance.
+ *               network:
+ *                 type: string
+ *                 description: >-
+ *                   Optional network the challenge was requested for. Must match
+ *                   the network bound at challenge issuance.
  *     responses:
  *       200:
  *         description: JWT token
@@ -69,13 +98,16 @@ router.post('/challenge', issueChallenge);
  *             schema:
  *               $ref: '#/components/schemas/AuthVerifyResponse'
  *       400:
- *         description: Missing publicKey or signedTransaction
+ *         description: Missing or malformed publicKey, signedTransaction, audience, or network
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
  *       401:
- *         description: Invalid signature or expired challenge
+ *         description: >-
+ *           Invalid signature, expired challenge, reused (already consumed)
+ *           challenge, or challenge bound to a different wallet, audience, or
+ *           network than the one presented.
  *         content:
  *           application/json:
  *             schema:
@@ -87,6 +119,11 @@ router.post('/challenge', issueChallenge);
  *             schema:
  *               $ref: '#/components/schemas/Error'
  */
-router.post('/verify', verifyChallenge);
+router.post('/verify', (req, res, next) =>
+  verifyChallenge(req, res, next, {
+    audience: req.body?.audience,
+    network: req.body?.network,
+  }),
+);
 
 export default router;

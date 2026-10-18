@@ -45,9 +45,13 @@ function endpoint(path = ""): string {
   return `${base}${base.endsWith("/v1") ? "" : "/v1"}/webhooks${path}`;
 }
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
+async function request<T>(accessToken: string, path: string, init?: RequestInit): Promise<T> {
   const response = await fetchWithTimeout(endpoint(path), {
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      ...init?.headers,
+    },
     ...init,
   });
   if (!response.ok) {
@@ -58,61 +62,60 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export async function listWebhooks(userAddress: string): Promise<WebhookSubscription[]> {
+export async function listWebhooks(accessToken: string): Promise<WebhookSubscription[]> {
   const result = await request<{ subscriptions: WebhookSubscription[] }>(
-    `?userAddress=${encodeURIComponent(userAddress)}`,
+    accessToken,
+    "",
   );
   return result.subscriptions;
 }
 
 export async function createWebhook(input: {
-  userAddress: string;
   targetUrl: string;
   eventTypes: string[];
-}): Promise<{ subscription: WebhookSubscription; secretKey: string }> {
-  return request("", { method: "POST", body: JSON.stringify(input) });
+}, accessToken: string): Promise<{ subscription: WebhookSubscription; secretKey: string }> {
+  return request(accessToken, "", { method: "POST", body: JSON.stringify(input) });
 }
 
 export async function updateWebhook(
   id: string,
-  userAddress: string,
+  accessToken: string,
   input: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean },
 ): Promise<WebhookSubscription> {
-  return request(`/${id}?userAddress=${encodeURIComponent(userAddress)}`, {
+  return request(accessToken, `/${id}`, {
     method: "PATCH",
     body: JSON.stringify(input),
   });
 }
 
-export async function deleteWebhook(id: string, userAddress: string): Promise<void> {
-  await request(`/${id}?userAddress=${encodeURIComponent(userAddress)}`, {
+export async function deleteWebhook(id: string, accessToken: string): Promise<void> {
+  await request(accessToken, `/${id}`, {
     method: "DELETE",
   });
 }
 
 export async function listWebhookDeliveries(
   id: string,
-  userAddress: string,
+  accessToken: string,
   page = 1,
   limit = 20,
 ): Promise<{ deliveries: WebhookDelivery[]; total: number; page: number; limit: number }> {
   return request(
-    `/${id}/deliveries?userAddress=${encodeURIComponent(userAddress)}&page=${page}&limit=${limit}`,
+    accessToken,
+    `/${id}/deliveries?page=${page}&limit=${limit}`,
   );
 }
 
-export async function sendWebhookTest(id: string, userAddress: string): Promise<WebhookTestResult> {
-  const result = await request<{ result: WebhookTestResult }>(`/${id}/test`, {
+export async function sendWebhookTest(id: string, accessToken: string): Promise<WebhookTestResult> {
+  const result = await request<{ result: WebhookTestResult }>(accessToken, `/${id}/test`, {
     method: "POST",
-    body: JSON.stringify({ userAddress }),
   });
   return result.result;
 }
 
-export async function regenerateWebhookSecret(id: string, userAddress: string): Promise<string> {
-  const result = await request<{ secretKey: string }>(`/${id}/secret`, {
+export async function regenerateWebhookSecret(id: string, accessToken: string): Promise<string> {
+  const result = await request<{ secretKey: string }>(accessToken, `/${id}/secret`, {
     method: "POST",
-    body: JSON.stringify({ userAddress }),
   });
   return result.secretKey;
 }

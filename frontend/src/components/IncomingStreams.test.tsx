@@ -1,6 +1,13 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 
+vi.mock("next/navigation", () => ({
+  useRouter: () => ({
+    push: (url: string) => window.history.pushState({}, "", url),
+  }),
+  useSearchParams: () => new URLSearchParams(window.location.search),
+}));
+
 vi.mock("@/hooks/useStreamingAmount", () => ({
   useStreamingAmount: () => 0,
 }));
@@ -64,6 +71,7 @@ function rowRecipients(): string[] {
 describe("IncomingStreams table preferences", () => {
   beforeEach(() => {
     localStorage.clear();
+    window.history.replaceState({}, "", "/");
   });
 
   it("renders all columns and the settings control by default", () => {
@@ -163,29 +171,52 @@ describe("IncomingStreams table preferences", () => {
   });
 
   it("sorts rows when a column header is clicked", () => {
-    renderTable([
+    const table = renderTable([
       makeStream({ id: "1", recipient: "Alice", deposited: 100 }),
       makeStream({ id: "2", recipient: "Bob", deposited: 300 }),
       makeStream({ id: "3", recipient: "Carol", deposited: 50 }),
     ]);
 
     fireEvent.click(sortButton("Deposited")); // ascending
+    expect(window.location.search).toContain("incomingSort=deposited");
+    expect(window.location.search).toContain("incomingDirection=asc");
+    table.rerender(<IncomingStreams streams={[
+      makeStream({ id: "1", recipient: "Alice", deposited: 100 }),
+      makeStream({ id: "2", recipient: "Bob", deposited: 300 }),
+      makeStream({ id: "3", recipient: "Carol", deposited: 50 }),
+    ]} onWithdraw={vi.fn()} />);
     expect(rowRecipients()).toEqual(["Carol", "Alice", "Bob"]);
 
     fireEvent.click(sortButton("Deposited")); // descending
+    table.rerender(<IncomingStreams streams={[
+      makeStream({ id: "1", recipient: "Alice", deposited: 100 }),
+      makeStream({ id: "2", recipient: "Bob", deposited: 300 }),
+      makeStream({ id: "3", recipient: "Carol", deposited: 50 }),
+    ]} onWithdraw={vi.fn()} />);
     expect(rowRecipients()).toEqual(["Bob", "Alice", "Carol"]);
   });
 
-  it("restores the persisted sort order on mount", async () => {
-    localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        sortBy: "deposited",
-        sortDirection: "desc",
-        visibleColumns: ["sender", "token", "deposited", "withdrawn", "claimable", "status"],
-      }),
-    );
+  it("restores filter and pagination from the URL and pushes page changes to history", () => {
+    window.history.replaceState({}, "", "/?incomingStatus=Active&incomingPage=2");
+    const streams = Array.from({ length: 12 }, (_, index) => makeStream({
+      id: String(index + 1),
+      recipient: `Recipient ${index + 1}`,
+      status: index === 0 ? "Paused" : "Active",
+    }));
+    const table = renderTable(streams);
 
+    expect(screen.getByLabelText("Filter incoming streams")).toHaveValue("Active");
+    expect(screen.getByText("Page 2 of 2 (11 streams)")).toBeInTheDocument();
+    expect(rowRecipients()).toEqual(["Recipient 12"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Previous page" }));
+    expect(window.location.search).toContain("incomingPage=1");
+    table.rerender(<IncomingStreams streams={streams} onWithdraw={vi.fn()} />);
+    expect(rowRecipients()).toHaveLength(10);
+  });
+
+  it("restores sort order from the URL on mount", async () => {
+    window.history.replaceState({}, "", "/?incomingSort=deposited&incomingDirection=desc");
     renderTable([
       makeStream({ id: "1", recipient: "Alice", deposited: 100 }),
       makeStream({ id: "2", recipient: "Bob", deposited: 300 }),

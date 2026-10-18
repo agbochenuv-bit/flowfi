@@ -3,6 +3,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { ArrowDown, ArrowUp, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import type { Stream } from '@/lib/dashboard';
 import { useStreamingAmount } from '@/hooks/useStreamingAmount';
 import { useTablePreferences } from '@/hooks/useTablePreferences';
@@ -32,6 +33,8 @@ const COLUMNS = [
 type ColumnId = (typeof COLUMNS)[number]['id'];
 
 const COLUMN_IDS: ColumnId[] = COLUMNS.map((column) => column.id);
+const PAGE_SIZE = 10;
+const FILTERS = ['All', 'Active', 'Completed', 'Paused'] as const;
 
 const STORAGE_KEY = 'flowfi.table.incoming-streams.v1';
 
@@ -242,22 +245,48 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     network = 'Unknown',
     selectedStreamId = null,
 }) => {
-    const [filter, setFilter] = useState<'All' | 'Active' | 'Completed' | 'Paused'>('All');
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const requestedFilter = searchParams.get('incomingStatus');
+    const filter = FILTERS.includes(requestedFilter as (typeof FILTERS)[number])
+        ? requestedFilter as (typeof FILTERS)[number]
+        : 'All';
+    const requestedSort = searchParams.get('incomingSort');
+    const urlSortBy = COLUMN_IDS.includes(requestedSort as ColumnId)
+        ? requestedSort as ColumnId
+        : null;
+    const requestedDirection = searchParams.get('incomingDirection');
+    const urlSortDirection = requestedDirection === 'asc' || requestedDirection === 'desc'
+        ? requestedDirection
+        : null;
+    const requestedPage = Number(searchParams.get('incomingPage') ?? '1');
+    const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
     const [reviewStream, setReviewStream] = useState<Stream | null>(null);
     const [showSettings, setShowSettings] = useState(false);
     const settingsRef = useRef<HTMLDivElement>(null);
 
     const {
-        sortBy,
-        sortDirection,
+        sortBy: _storedSortBy,
+        sortDirection: _storedSortDirection,
         isVisible,
         toggleColumn,
-        setSort,
         resetPreferences,
     } = useTablePreferences<ColumnId>({
         storageKey: STORAGE_KEY,
         defaultColumns: COLUMN_IDS,
     });
+    const sortBy = urlSortBy;
+    const sortDirection = urlSortDirection ?? 'desc';
+
+    const updateView = (changes: Record<string, string | null>, resetPage = false) => {
+        const params = new URLSearchParams(searchParams.toString());
+        for (const [key, value] of Object.entries(changes)) {
+            if (value === null) params.delete(key);
+            else params.set(key, value);
+        }
+        if (resetPage) params.set('incomingPage', '1');
+        router.push(`?${params.toString()}`);
+    };
 
     // Close the settings dropdown on outside click / Escape.
     useEffect(() => {
@@ -295,13 +324,25 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     }, [filteredStreams, sortBy, sortDirection]);
 
     const handleFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        setFilter(e.target.value as 'All' | 'Active' | 'Completed' | 'Paused');
+        updateView({ incomingStatus: e.target.value === 'All' ? null : e.target.value }, true);
+    };
+
+    const handleSort = (columnId: ColumnId) => {
+        const direction = sortBy === columnId
+            ? sortDirection === 'asc' ? 'desc' : 'asc'
+            : 'asc';
+        updateView({ incomingSort: columnId, incomingDirection: direction }, true);
     };
 
     const handleResetLayout = () => {
         resetPreferences();
+        updateView({ incomingSort: null, incomingDirection: null }, true);
         setShowSettings(false);
     };
+
+    const pageCount = Math.max(1, Math.ceil(sortedStreams.length / PAGE_SIZE));
+    const currentPage = Math.min(page, pageCount);
+    const visibleStreams = sortedStreams.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
     const handleWithdraw = async (stream: Stream) => {
         try {
@@ -370,7 +411,8 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                         Filter:
                     </label>
                     <select
-                        id="filter"
+                        id="incoming-status-filter"
+                        aria-label="Filter incoming streams"
                         value={filter}
                         onChange={handleFilterChange}
                         className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-1 text-sm focus:ring-2 focus:ring-accent outline-none"
@@ -435,7 +477,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
             {filteredStreams.length === 0 ? (
                 <FilterEmptyState
                     filter={filter}
-                    onClearFilter={() => setFilter('All')}
+                    onClearFilter={() => updateView({ incomingStatus: null }, true)}
                 />
             ) : shouldVirtualize ? (
                 /* ── Virtualized path (> 50 rows) ────────────────────────────── */
@@ -511,7 +553,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                                         <th key={column.id} className={HEADER_CELL_CLASS}>
                                             <button
                                                 type="button"
-                                                onClick={() => setSort(column.id)}
+                                                onClick={() => handleSort(column.id)}
                                                 aria-label={`Sort by ${column.label}`}
                                                 className="inline-flex items-center gap-1 uppercase tracking-wider hover:text-accent"
                                             >
@@ -531,17 +573,71 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {sortedStreams.map((stream, index) => (
-                                <StreamRow
-                                    key={stream.id}
-                                    stream={stream}
-                                    isSelected={selectedStreamId === stream.id}
-                                    isVisible={isVisible}
-                                    onWithdraw={openWithdrawalReview}
-                                    withdrawingStreamId={withdrawingStreamId}
-                                    ariaRowIndex={index + 2}
-                                />
-                            ))}
+                            {visibleStreams.map((stream) => {
+                                const isPaused = stream.status === 'Paused';
+                                const isSelected = selectedStreamId === stream.id;
+                                return (
+                                    <tr
+                                        key={stream.id}
+                                        data-stream-id={stream.id}
+                                        aria-selected={isSelected}
+                                        className={`hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${isPaused ? 'bg-gray-50/50 dark:bg-gray-800/50 opacity-75' : ''} ${isSelected ? 'bg-accent/10 ring-1 ring-inset ring-accent/50' : ''}`}
+                                    >
+                                        {isVisible('sender') && (
+                                            <td className="px-6 py-4 whitespace-nowrap">
+                                                <div className={`text-sm font-mono ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                                                    {stream.recipient}
+                                                </div>
+                                                <div className="text-xs text-gray-500 dark:text-gray-400">Stream #{stream.id}</div>
+                                            </td>
+                                        )}
+                                        {isVisible('token') && (
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                                                {stream.token}
+                                            </td>
+                                        )}
+                                        {isVisible('deposited') && (
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm tabular-nums ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                                                {formatTokenAmount(stream.deposited)} {stream.token}
+                                            </td>
+                                        )}
+                                        {isVisible('withdrawn') && (
+                                            <td className={`px-6 py-4 whitespace-nowrap text-sm font-bold tabular-nums ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                                                {formatTokenAmount(stream.withdrawn)} {stream.token}
+                                            </td>
+                                        )}
+                                        {isVisible('claimable') && (
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                                <ClaimableAmount stream={stream} />
+                                            </td>
+                                        )}
+                                        {isVisible('status') && (
+                                            <td className="px-6 py-4 whitespace-nowrap text-sm">
+                                                <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                                                    ${stream.status === 'Active' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                                                        stream.status === 'Paused' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                                            stream.status === 'Completed' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                                                                'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'}`}>
+                                                    {stream.status}
+                                                </span>
+                                            </td>
+                                        )}
+                                        <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                                            <button
+                                                disabled={stream.status !== 'Active' || withdrawingStreamId === stream.id}
+                                                onClick={() => { void handleWithdraw(stream); }}
+                                                className={`px-4 py-2 rounded-lg transition-all ${
+                                                    stream.status === 'Active'
+                                                        ? 'bg-accent text-white hover:bg-accent-hover shadow-lg'
+                                                        : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                                                }`}
+                                            >
+                                                {withdrawingStreamId === stream.id ? 'Withdrawing...' : 'Withdraw'}
+                                            </button>
+                                        </td>
+                                    </tr>
+                                );
+                            })}
                         </tbody>
                     </table>
                 </div>
@@ -558,6 +654,31 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                     onConfirm={confirmWithdrawal}
                     onClose={() => setReviewStream(null)}
                 />
+            )}
+
+            {filteredStreams.length > 0 && (
+                <div className="flex items-center justify-between border-t border-gray-200 px-6 py-3 dark:border-gray-700">
+                    <span className="text-sm text-gray-500 dark:text-gray-400">
+                        Page {currentPage} of {pageCount} ({sortedStreams.length} streams)
+                    </span>
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            aria-label="Previous page"
+                            disabled={currentPage <= 1}
+                            onClick={() => updateView({ incomingPage: String(currentPage - 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Previous</button>
+                        <button
+                            type="button"
+                            aria-label="Next page"
+                            disabled={currentPage >= pageCount}
+                            onClick={() => updateView({ incomingPage: String(currentPage + 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Next</button>
+                    </div>
+                </div>
+            )}
             )}
         </div>
     );

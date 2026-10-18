@@ -204,6 +204,49 @@ describe('signers', () => {
     expect(await signer.getPublicKey()).toBe('GFREIGHTER');
     expect(await signer.signTransaction('env')).toContain('signed:');
   });
+
+  it('CustomSigner honors abort while an external wallet is awaiting approval', async () => {
+    const controller = new AbortController();
+    let receivedSignal: AbortSignal | undefined;
+    const signer = new CustomSigner('GCUSTOM', (_xdr, options) => {
+      receivedSignal = options?.signal;
+      return new Promise<string>(() => {});
+    });
+    const signing = signer.signTransaction('env', { signal: controller.signal });
+    await Promise.resolve();
+    controller.abort();
+
+    await expect(signing).rejects.toMatchObject({ name: 'AbortError' });
+    expect(receivedSignal?.aborted).toBe(true);
+  });
+
+  it('FreighterSigner rejects an aborted wallet approval consistently', async () => {
+    const freighter = await import('@stellar/freighter-api');
+    let notifySignStarted!: () => void;
+    const signStarted = new Promise<void>((resolve) => { notifySignStarted = resolve; });
+    const sign = vi.spyOn(freighter, 'signTransaction').mockImplementationOnce(
+      () => {
+        notifySignStarted();
+        return new Promise<never>(() => {});
+      },
+    );
+    const controller = new AbortController();
+    const signing = new FreighterSigner().signTransaction('env', { signal: controller.signal });
+    await signStarted;
+    controller.abort();
+
+    await expect(signing).rejects.toMatchObject({ name: 'AbortError' });
+    expect(sign).toHaveBeenCalledOnce();
+    sign.mockRestore();
+  });
+
+  it('rejects pre-aborted KeypairSigner operations without loading the SDK', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    await expect(new KeypairSigner('SSECRET123').signTransaction('env', {
+      signal: controller.signal,
+    })).rejects.toMatchObject({ name: 'AbortError' });
+  });
 });
 
 describe('FlowFiClient', () => {
@@ -251,6 +294,43 @@ describe('FlowFiClient', () => {
     await expect(client.cancelStream(1n, signer)).resolves.toMatchObject({ transactionHash: 'hash-1' });
     await expect(client.closeStream(1n, signer)).resolves.toMatchObject({ transactionHash: 'hash-1' });
     await expect(client.topUpStream(1n, 0n, signer)).rejects.toThrow();
+  });
+
+  it('does not submit if cancellation interrupts signing', async () => {
+    const client = new FlowFiClient(CONFIG, { rpcClient });
+    const controller = new AbortController();
+    let beginSigning!: () => void;
+    const signer = new CustomSigner('GS', () => {
+      beginSigning();
+      return new Promise<string>(() => {});
+    });
+    const signingStarted = new Promise<void>((resolve) => { beginSigning = resolve; });
+    const operation = client.cancelStream(1n, signer, { signal: controller.signal });
+    await signingStarted;
+    controller.abort();
+
+    await expect(operation).rejects.toMatchObject({ name: 'AbortError' });
+    expect(rpcClient.sent).toHaveLength(0);
+  });
+
+  it('passes cancellation through to an in-flight submission transport', async () => {
+    const client = new FlowFiClient(CONFIG, { rpcClient });
+    const controller = new AbortController();
+    let submitSignal: AbortSignal | undefined;
+    let notifySubmitted!: () => void;
+    const submitted = new Promise<void>((resolve) => { notifySubmitted = resolve; });
+    rpcClient.sendTransaction = (_xdr: string, options?: { signal?: AbortSignal }) => {
+      submitSignal = options?.signal;
+      notifySubmitted();
+      return new Promise<{ transactionHash: string }>(() => {});
+    };
+    const signer = new CustomSigner('GS', async (xdr) => `signed:${xdr}`);
+    const operation = client.cancelStream(1n, signer, { signal: controller.signal });
+    await submitted;
+    controller.abort();
+
+    await expect(operation).rejects.toMatchObject({ name: 'AbortError' });
+    expect(submitSignal?.aborted).toBe(true);
   });
 
   it('reads stream + claimable without signing', async () => {

@@ -1,4 +1,4 @@
-name: PR Preview Environment
+name: PR Preview Validation
 
 on:
   pull_request:
@@ -10,9 +10,6 @@ concurrency:
 
 permissions:
   contents: read
-  pull-requests: write
-  issues: write
-  deployments: write
 
 jobs:
   preview:
@@ -36,13 +33,14 @@ jobs:
     env:
       PR_NUMBER: ${{ github.event.pull_request.number }}
       PR_SHA: ${{ github.event.pull_request.head.sha }}
-      PREVIEW_NAMESPACE: flowfi-pr-${{ github.event.pull_request.number }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: "20"
           cache: "npm"
@@ -50,17 +48,6 @@ jobs:
 
       - name: Install dependencies
         run: npm ci --include=optional
-
-      - name: Provision ephemeral database
-        run: bash scripts/deploy-preview.sh --provision-db --pr "$PR_NUMBER"
-        env:
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview
-          # Optional Neon/Supabase branching: when set, the script creates a
-          # database branch instead of a local service database.
-          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
-          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
-          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-          SUPABASE_PROJECT_REF: ${{ secrets.SUPABASE_PROJECT_REF }}
 
       - name: Run migrations + seed demo data
         run: |
@@ -74,80 +61,61 @@ jobs:
           npm run prisma:seed --workspace=backend || npx tsx prisma/seed.ts
         working-directory: backend
         env:
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview_pr_${{ github.event.pull_request.number }}
+          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview
 
       - name: Build backend preview image
-        run: docker build -f backend/Dockerfile backend -t flowfi-backend:pr-${{ github.event.pull_request.number }}
+        run: docker build -f backend/Dockerfile backend -t "flowfi-backend:pr-${PR_NUMBER}"
 
       - name: Build frontend preview
         run: npm run build --workspace=frontend
         env:
-          NEXT_PUBLIC_API_URL: https://flowfi-pr-${{ github.event.pull_request.number }}.fly.dev/v1
+          NEXT_PUBLIC_API_URL: http://localhost:3001/v1
           NEXT_PUBLIC_APP_VERSION: pr-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           NEXT_PUBLIC_STELLAR_NETWORK: TESTNET
           NEXT_PUBLIC_SOROBAN_RPC_URL: https://soroban-testnet.stellar.org
           NEXT_PUBLIC_NETWORK_PASSPHRASE: Test SDF Network ; September 2015
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview_pr_${{ github.event.pull_request.number }}
-
-      - name: Deploy backend preview (Fly.io, if configured)
-        id: backend-deploy
-        continue-on-error: true
-        uses: superfly/flyctl-actions/setup-flyctl@master
-        with:
-          version: latest
-
-      - name: Publish backend preview app
-        id: publish
-        continue-on-error: true
-        run: |
-          if [ -n "${{ secrets.FLY_API_TOKEN }}" ]; then
-            bash scripts/deploy-preview.sh --deploy-backend --pr "$PR_NUMBER" --sha "$PR_SHA"
-          else
-            echo "FLY_API_TOKEN not set — skipping live Fly deploy; using CI-validated image as preview artifact."
-            echo "preview_url=https://pr-${PR_NUMBER}.flowfi-preview.local" >> "$GITHUB_OUTPUT"
-            echo "health=pass (local docker healthcheck)" >> "$GITHUB_OUTPUT"
-          fi
-        env:
-          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview_pr_${{ github.event.pull_request.number }}
+          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview
 
       - name: Health-check preview backend
-        id: health
         run: |
-          # When a live Fly app exists the deploy script already health-checked it.
-          # Otherwise validate the preview image locally so reviewers still get a signal.
-          if [ -n "${{ steps.publish.outputs.preview_url }}" ]; then
-            echo "url=${{ steps.publish.outputs.preview_url }}" >> "$GITHUB_OUTPUT"
-          else
-            docker run -d --name "flowfi-preview-${PR_NUMBER}" \
-              -e DATABASE_URL="postgresql://postgres:password@127.0.0.1:5432/flowfi_preview" \
-              -p 3001:3001 "flowfi-backend:pr-${PR_NUMBER}" || true
-            sleep 5
-            curl --silent --fail --max-time 5 http://localhost:3001/health || echo "local health probe skipped (no live preview)"
-            docker rm -f "flowfi-preview-${PR_NUMBER}" || true
-            echo "url=https://pr-${PR_NUMBER}.flowfi-preview.local" >> "$GITHUB_OUTPUT"
-          fi
+          docker run -d --name "flowfi-preview-${PR_NUMBER}" \
+            -e DATABASE_URL="postgresql://postgres:password@127.0.0.1:5432/flowfi_preview" \
+            --network host "flowfi-backend:pr-${PR_NUMBER}"
+          for attempt in $(seq 1 30); do
+            if curl --silent --fail --max-time 2 http://localhost:3001/health; then
+              docker rm -f "flowfi-preview-${PR_NUMBER}" || true
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs "flowfi-preview-${PR_NUMBER}"
+          docker rm -f "flowfi-preview-${PR_NUMBER}" || true
+          exit 1
 
-      - name: Comment preview URL on PR
+  comment:
+    name: Report local preview validation
+    needs: preview
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Comment validation result on PR
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const pr = context.payload.pull_request.number;
             const sha = context.payload.pull_request.head.sha.slice(0, 7);
-            const backendUrl = `https://flowfi-pr-${pr}.fly.dev`;
-            const frontendUrl = process.env.FRONTEND_PREVIEW_URL || `https://flowfi-pr-${pr}.vercel.app`;
             const body = [
-              `## 🔍 Preview environment ready — PR #${pr} (\`${sha}\`)`,
+              `## Preview validation passed — PR #${pr} (\`${sha}\`)`,
               ``,
-              `| Service | URL |`,
+              `| Check | Result |`,
               `|---|---|`,
-              `| Frontend preview | ${frontendUrl} |`,
-              `| Backend preview | ${backendUrl} |`,
-              `| Backend health | ${backendUrl}/health |`,
+              `| Frontend | Build passed |`,
+              `| Backend | Local container health check passed |`,
               ``,
-              `Database: ephemeral \`flowfi_preview_pr_${pr}\` migrated + seeded with demo streams/users.`,
-              `Closing this PR deallocates all preview resources automatically.`,
+              `No live preview infrastructure or deployment credentials are used by pull request jobs.`,
             ].join('\n');
             github.rest.issues.createComment({
               owner: context.repo.owner,
@@ -155,5 +123,3 @@ jobs:
               issue_number: pr,
               body,
             });
-        env:
-          FRONTEND_PREVIEW_URL: ${{ steps.publish.outputs.preview_url }}

@@ -33,17 +33,18 @@ export default function ActivityContent() {
 
   const fetchActivity = useCallback(
     async (pageNum: number, tab: string, append: boolean = false, signal?: AbortSignal) => {
-      if (!session?.publicKey) return;
+      if (!session?.publicKey || !session.accessToken) return;
       setLoading(true);
 
       try {
         const typeFilter = tab === "PAUSED" ? "PAUSED,RESUMED" : tab;
         const typeQuery = tab === "ALL" ? "" : `&type=${encodeURIComponent(typeFilter)}`;
-        const url =
-          `${API_BASE_URL}/v1/events?address=${encodeURIComponent(session.publicKey)}` +
-          `&page=${pageNum}&limit=${PAGE_SIZE}${typeQuery}`;
+        const url = `${API_BASE_URL}/v1/events?page=${pageNum}&limit=${PAGE_SIZE}${typeQuery}`;
 
-        const response = await fetch(url, { signal });
+        const response = await fetch(url, {
+          signal,
+          headers: { Authorization: `Bearer ${session.accessToken}` },
+        });
         if (!response.ok) {
           throw new Error(`Failed to fetch activity (${response.status})`);
         }

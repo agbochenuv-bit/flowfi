@@ -6,34 +6,36 @@ import {
   MAX_DEAD_LETTER_PAGE_SIZE,
   discardDeadLetterEvent,
   listDeadLetterEvents,
+  previewDeadLetterReplay,
   replayAllDeadLetterEvents,
   replayDeadLetterEvent,
 } from '../services/indexerService.js';
+import { ApiError } from '../errors/ApiError.js';
 import logger from '../logger.js';
+import { recordAuditEvent } from '../services/audit.service.js';
+import { ApiError, sendApiError } from '../errors/index.js';
 
-/** Parse an optional positive-integer query param. */
-function parseOptionalInt(raw: unknown): number | undefined {
-  if (raw === undefined || raw === null || raw === '') return undefined;
-  const parsed = Number(raw);
-  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+/**
+ * Validated query shape for the dead-letter listing endpoint. Values are
+ * produced by the route-level Zod schema; this helper only normalizes the
+ * already-validated input into the service contract.
+ */
+export interface DeadLetterListQuery {
+  page?: number;
+  limit?: number;
+  ledgerSequence?: number;
+  startDate?: Date;
+  endDate?: Date;
+  eventType?: string;
 }
 
-/** Parse an optional ISO-8601 date query param, rejecting unparseable values. */
-function parseOptionalDate(
-  raw: unknown,
-  field: string,
-): { value?: Date; error?: string } {
-  if (raw === undefined || raw === null || raw === '') return {};
-  const value = new Date(String(raw));
-  if (Number.isNaN(value.getTime())) {
-    return { error: `${field} must be a valid ISO-8601 date` };
+function requireParamId(req: Request): string {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    throw new ApiError(400, 'id is required', 'invalid_path_param');
   }
-  return { value };
-}
-
-function readSingleQueryParam(value: unknown): string | undefined {
-  if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : undefined;
-  return typeof value === 'string' ? value : undefined;
+  return id;
 }
 
 /**
@@ -43,10 +45,12 @@ function readSingleQueryParam(value: unknown): string | undefined {
  * payload and the full error history needed to diagnose them.
  */
 export const listDeadLetterHandler = async (req: Request, res: Response) => {
-  const page = parseOptionalInt(readSingleQueryParam(req.query.page)) ?? 1;
-  const rawLimit = parseOptionalInt(readSingleQueryParam(req.query.limit));
-  const ledgerSequence = parseOptionalInt(
-    readSingleQueryParam(req.query.ledgerSequence),
+  const query = (req.validated?.query ?? {}) as DeadLetterListQuery;
+
+  const page = query.page ?? 1;
+  const limit = Math.min(
+    query.limit ?? DEFAULT_DEAD_LETTER_PAGE_SIZE,
+    MAX_DEAD_LETTER_PAGE_SIZE,
   );
 
   const startDate = parseOptionalDate(
@@ -54,7 +58,13 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
     'startDate',
   );
   if (startDate.error) {
-    return res.status(400).json({ error: startDate.error });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', startDate.error, {
+        details: [{ field: 'startDate', message: startDate.error }],
+      }),
+    );
   }
 
   const endDate = parseOptionalDate(
@@ -62,32 +72,85 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
     'endDate',
   );
   if (endDate.error) {
-    return res.status(400).json({ error: endDate.error });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', endDate.error, {
+        details: [{ field: 'endDate', message: endDate.error }],
+      }),
+    );
   }
 
   if (startDate.value && endDate.value && startDate.value > endDate.value) {
-    return res.status(400).json({ error: 'startDate must be before endDate' });
+    return sendApiError(
+      req,
+      res,
+      new ApiError('VALIDATION_FAILED', 'startDate must be before endDate', {
+        details: [
+          {
+            field: 'startDate',
+            message: 'startDate must be before endDate',
+          },
+        ],
+      }),
+    );
+  }
+
+  const result = await listDeadLetterEvents({
+    page,
+    limit,
+    ...(query.ledgerSequence !== undefined
+      ? { ledgerSequence: query.ledgerSequence }
+      : {}),
+    ...(startDate.value ? { startDate: startDate.value } : {}),
+    ...(endDate.value ? { endDate: endDate.value } : {}),
+    ...(query.eventType ? { eventType: query.eventType } : {}),
+  });
+
+  return res.status(200).json(result);
+};
+
+/**
+ * GET /api/v1/admin/indexer/dead-letter/:id/replay/preview
+ *
+ * Read-only preview of a single-record replay. Performs no writes: it reports
+ * the affected ledger range and the record changes the replay would produce so
+ * an operator can audit the mutation before triggering it.
+ */
+export const previewDeadLetterReplayHandler = async (
+  req: Request,
+  res: Response,
+) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
   }
 
   try {
-    const eventType = readSingleQueryParam(req.query.eventType);
+    const preview = await previewDeadLetterReplay(id);
 
-    const result = await listDeadLetterEvents({
-      page,
-      limit: Math.min(
-        rawLimit ?? DEFAULT_DEAD_LETTER_PAGE_SIZE,
-        MAX_DEAD_LETTER_PAGE_SIZE,
-      ),
-      ...(ledgerSequence !== undefined ? { ledgerSequence } : {}),
-      ...(startDate.value ? { startDate: startDate.value } : {}),
-      ...(endDate.value ? { endDate: endDate.value } : {}),
-      ...(eventType ? { eventType } : {}),
-    });
+    if (preview.outcome === 'not_found') {
+      return res.status(404).json({ error: 'Dead-letter event not found' });
+    }
 
-    return res.status(200).json(result);
+    if (preview.outcome === 'undecodable') {
+      return res.status(422).json({
+        error: 'Dead-letter payload could not be decoded',
+        code: 'undecodable_payload',
+        id,
+        errorMessage: preview.errorMessage,
+        preview,
+      });
+    }
+
+    return res.status(200).json({ ok: true, id, preview });
   } catch (err) {
-    logger.error('[AdminController] Failed to list dead-letter events:', err);
-    return res.status(500).json({ error: 'Failed to list dead-letter events' });
+    logger.error(
+      `[AdminController] Preview of dead-letter ${id} threw:`,
+      err,
+    );
+    return res.status(500).json({ error: 'Preview failed' });
   }
 };
 
@@ -97,19 +160,35 @@ export const listDeadLetterHandler = async (req: Request, res: Response) => {
  * Re-injects the quarantined payload through the indexer pipeline. On success
  * the row is removed and the Stream / StreamEvent records are created by the
  * worker; on failure the attempt counter and error message are updated.
+ *
+ * The response always carries a structured execution report (requestId,
+ * duration, counts, failure position) so the outcome is auditable. The live
+ * indexer cursor is preserved when a replay fails.
  */
 export const replayDeadLetterHandler = async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const id = Array.isArray(rawId) ? rawId[0] : rawId;
-  if (!id) {
-    return res.status(400).json({ error: 'id is required' });
+  const id = requireParamId(req);
+
+  const result = await replayDeadLetterEvent(id);
+
+  if (result.outcome === 'not_found') {
+    throw new ApiError(404, 'Dead-letter event not found', 'not_found');
   }
 
   try {
     const result = await replayDeadLetterEvent(id);
 
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.dead_letter.replay',
+      targetType: 'dead_letter_event',
+      targetId: id,
+      outcome: result.outcome === 'replayed' ? 'success' : 'failure',
+      after: { outcome: result.outcome },
+      metadata: { attempts: 'attempts' in result ? result.attempts : undefined },
+    });
+
     if (result.outcome === 'not_found') {
-      return res.status(404).json({ error: 'Dead-letter event not found' });
+      return sendApiError(req, res, new ApiError('NOT_FOUND'));
     }
 
     if (result.outcome === 'undecodable') {
@@ -118,6 +197,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
         code: 'undecodable_payload',
         id,
         errorMessage: result.errorMessage,
+        report: result.report,
       });
     }
 
@@ -128,6 +208,7 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
         id,
         attempts: result.attempts,
         errorMessage: result.errorMessage,
+        report: result.report,
       });
     }
 
@@ -136,11 +217,27 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
       id,
       outcome: result.outcome,
       attempts: result.attempts,
+      report: result.report,
     });
   } catch (err) {
     logger.error(`[AdminController] Replay of dead-letter ${id} threw:`, err);
-    return res.status(500).json({ error: 'Replay failed' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
+
+  if (result.outcome === 'failed') {
+    throw new ApiError(
+      422,
+      'Replay failed; the event remains quarantined',
+      'replay_failed',
+    );
+  }
+
+  return res.status(200).json({
+    ok: true,
+    id,
+    outcome: result.outcome,
+    attempts: result.attempts,
+  });
 };
 
 /**
@@ -148,13 +245,25 @@ export const replayDeadLetterHandler = async (req: Request, res: Response) => {
  *
  * Replays every pending record sequentially, oldest ledger first.
  */
-export const replayAllDeadLetterHandler = async (_req: Request, res: Response) => {
+export const replayAllDeadLetterHandler = async (req: Request, res: Response) => {
   try {
     const summary = await replayAllDeadLetterEvents();
-    return res.status(200).json({ ok: true, ...summary });
+    await recordAuditEvent({
+      actor: (req as AuthenticatedRequest).user.publicKey,
+      action: 'indexer.dead_letter.replay_all',
+      targetType: 'dead_letter_queue',
+      targetId: 'pending',
+      outcome: summary.failed === 0 ? 'success' : 'failure',
+      after: { replayed: summary.replayed, failed: summary.failed },
+    });
+    // A partial batch is reported with 207 so callers can distinguish a
+    // reproducible partial success from a clean run without breaking the
+    // existing 200 shape for full success.
+    const status = summary.failed > 0 ? 207 : 200;
+    return res.status(status).json({ ok: true, ...summary });
   } catch (err) {
     logger.error('[AdminController] Dead-letter replay-all threw:', err);
-    return res.status(500).json({ error: 'Replay-all failed' });
+    return sendApiError(req, res, new ApiError('INTERNAL_ERROR'));
   }
 };
 
@@ -165,22 +274,25 @@ export const replayAllDeadLetterHandler = async (_req: Request, res: Response) =
  * application log with the acting admin so the loss stays auditable.
  */
 export const discardDeadLetterHandler = async (req: Request, res: Response) => {
-  const rawId = req.params.id;
-  const id = Array.isArray(rawId) ? rawId[0] : rawId;
-  if (!id) {
-    return res.status(400).json({ error: 'id is required' });
-  }
+  const id = requireParamId(req);
 
   const discardedBy = (req as AuthenticatedRequest).user?.publicKey ?? 'unknown';
 
   try {
     const discarded = await discardDeadLetterEvent(id, discardedBy);
+    await recordAuditEvent({
+      actor: discardedBy,
+      action: 'indexer.dead_letter.discard',
+      targetType: 'dead_letter_event',
+      targetId: id,
+      outcome: 'success',
+      after: { discarded: true },
+    });
     return res.status(200).json({ ok: true, discarded });
   } catch (err) {
     if (err instanceof DeadLetterNotFoundError) {
-      return res.status(404).json({ error: 'Dead-letter event not found' });
+      throw new ApiError(404, 'Dead-letter event not found', 'not_found');
     }
-    logger.error(`[AdminController] Discard of dead-letter ${id} threw:`, err);
-    return res.status(500).json({ error: 'Discard failed' });
+    throw err;
   }
 };

@@ -69,8 +69,9 @@ describe('GET /v1/events/subscribe', () => {
 
   it('returns 400 with a descriptive error for a malformed (non-numeric) streamId, not a 500', async () => {
     const res = await request(app)
-      .get('/v1/events/subscribe?streams=not-a-numeric-id')
-      .set('Authorization', `Bearer ${token}`);
+      .post('/v1/events/subscribe-ticket')
+      .set('Authorization', `Bearer ${token}`)
+      .send({ streams: ['not-a-numeric-id'] });
 
     expect(res.status).toBe(400);
     expect(res.body.message).toBe('Invalid subscription parameters');
@@ -78,7 +79,7 @@ describe('GET /v1/events/subscribe', () => {
   });
 
   it('rejects requests missing authentication', async () => {
-    const res = await request(app).get('/v1/events/subscribe?streams=not-a-numeric-id');
+    const res = await request(app).get('/v1/events/subscribe?ticket=not-a-ticket');
     expect(res.status).toBe(401);
   });
 });

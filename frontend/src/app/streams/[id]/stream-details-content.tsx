@@ -129,6 +129,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
 
   const { events: streamEvents } = useStreamEvents({
     streamIds: [streamId],
+    jwtToken: session?.accessToken,
     autoReconnect: true,
   });
 

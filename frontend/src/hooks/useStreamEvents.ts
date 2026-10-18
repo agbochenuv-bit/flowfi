@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
+import { getApiBaseUrl } from '@/lib/api/_shared';
 
 interface StreamEvent {
   type: 'created' | 'topped_up' | 'withdrawn' | 'cancelled' | 'completed' | 'paused' | 'resumed';
@@ -6,7 +7,7 @@ interface StreamEvent {
   timestamp: number;
 }
 
-interface UseStreamEventsOptions {
+export interface UseStreamEventsOptions {
   streamIds?: string[];
   userPublicKeys?: string[];
   subscribeToAll?: boolean;
@@ -32,6 +33,7 @@ export function useStreamEvents(
 ): UseStreamEventsReturn {
   const {
     streamIds: rawStreamIds = [],
+    userPublicKeys: rawUserPublicKeys = [],
     subscribeToAll = false,
     autoReconnect = true,
     maxRetryDelay = 30000,
@@ -44,6 +46,7 @@ export function useStreamEvents(
   const [reconnecting, setReconnecting] = useState(false);
 
   const eventSourceRef = useRef<EventSource | null>(null);
+  const connectAttemptRef = useRef(0);
   const retryDelayRef = useRef(1000);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectAttemptsRef = useRef(0);
@@ -51,24 +54,29 @@ export function useStreamEvents(
 
   const subscriptionKey = useMemo(() => {
     const streams = [...rawStreamIds].sort().join(',');
-    return `${subscribeToAll ? 'all' : streams}|${jwtToken || ''}`;
-  }, [rawStreamIds, subscribeToAll, jwtToken]);
+    const users = [...rawUserPublicKeys].sort().join(',');
+    return `${subscribeToAll ? 'all' : streams}|${users}|${jwtToken || ''}`;
+  }, [rawStreamIds, rawUserPublicKeys, subscribeToAll, jwtToken]);
 
-  const buildUrl = useCallback(() => {
-    const params = new URLSearchParams();
-
-    if (subscribeToAll) {
-      params.append('all', 'true');
-    } else {
-      rawStreamIds.forEach(id => params.append('streams', id));
-    }
-
-    if (jwtToken) {
-      params.append('token', jwtToken);
-    }
-
-    const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-    return `${baseUrl}/v1/events/subscribe?${params}`;
+  const buildUrl = useCallback(async () => {
+    const baseUrl = getApiBaseUrl();
+    if (!jwtToken) throw new Error('Wallet authentication is required for live events');
+    const response = await fetch(`${baseUrl.replace(/\/$/, '')}/v1/events/subscribe-ticket`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${jwtToken}`,
+      },
+      body: JSON.stringify({
+        streams: rawStreamIds,
+        users: rawUserPublicKeys,
+        all: subscribeToAll,
+      }),
+    });
+    if (!response.ok) throw new Error(`Could not authorize live events (${response.status})`);
+    const result = await response.json() as { ticket?: string };
+    if (!result.ticket) throw new Error('Live event authorization returned no ticket');
+    return `${baseUrl.replace(/\/$/, '')}/v1/events/subscribe?ticket=${encodeURIComponent(result.ticket)}`;
     // subscriptionKey captures all subscription parameters as a stable string
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [subscriptionKey]);
@@ -101,17 +109,32 @@ export function useStreamEvents(
       reconnectTimeoutRef.current = null;
     }
 
-    const url = buildUrl();
-    const eventSource = new EventSource(url);
-    eventSourceRef.current = eventSource;
-
-    eventSource.onopen = () => {
-      setConnected(true);
-      setReconnecting(false);
-      setError(null);
-      retryDelayRef.current = 1000;
-      reconnectAttemptsRef.current = 0;
+    const attempt = ++connectAttemptRef.current;
+    const scheduleReconnect = () => {
+      if (!autoReconnect) return;
+      setReconnecting(true);
+      reconnectAttemptsRef.current += 1;
+      if (reconnectAttemptsRef.current <= MAX_RECONNECT_ATTEMPTS) {
+        const delay = Math.min(retryDelayRef.current, maxRetryDelay);
+        retryDelayRef.current = Math.min(retryDelayRef.current * 2, maxRetryDelay);
+        reconnectTimeoutRef.current = setTimeout(() => connectRef.current(), delay);
+      }
     };
+
+    void (async () => {
+      try {
+        const url = await buildUrl();
+        if (attempt !== connectAttemptRef.current) return;
+        const eventSource = new EventSource(url);
+        eventSourceRef.current = eventSource;
+
+        eventSource.onopen = () => {
+          setConnected(true);
+          setReconnecting(false);
+          setError(null);
+          retryDelayRef.current = 1000;
+          reconnectAttemptsRef.current = 0;
+        };
 
     const handleEvent = (type: StreamEvent['type']) => (e: MessageEvent) => {
       try {
@@ -125,41 +148,29 @@ export function useStreamEvents(
       }
     };
 
-    eventSource.addEventListener('stream.created', handleEvent('created'));
-    eventSource.addEventListener('stream.topped_up', handleEvent('topped_up'));
-    eventSource.addEventListener('stream.withdrawn', handleEvent('withdrawn'));
-    eventSource.addEventListener('stream.cancelled', handleEvent('cancelled'));
-    eventSource.addEventListener('stream.completed', handleEvent('completed'));
-    eventSource.addEventListener('stream.paused', handleEvent('paused'));
-    eventSource.addEventListener('stream.resumed', handleEvent('resumed'));
+        eventSource.addEventListener('stream.created', handleEvent('created'));
+        eventSource.addEventListener('stream.topped_up', handleEvent('topped_up'));
+        eventSource.addEventListener('stream.withdrawn', handleEvent('withdrawn'));
+        eventSource.addEventListener('stream.cancelled', handleEvent('cancelled'));
+        eventSource.addEventListener('stream.completed', handleEvent('completed'));
+        eventSource.addEventListener('stream.paused', handleEvent('paused'));
+        eventSource.addEventListener('stream.resumed', handleEvent('resumed'));
 
-    eventSource.onerror = () => {
-      setConnected(false);
-      setError(new Error('SSE connection failed'));
-      eventSource.close();
-
-      if (autoReconnect) {
-        setReconnecting(true);
-
-        if (reconnectTimeoutRef.current !== null) {
-          clearTimeout(reconnectTimeoutRef.current);
-          reconnectTimeoutRef.current = null;
-        }
-
-        reconnectAttemptsRef.current += 1;
-
-        if (reconnectAttemptsRef.current <= MAX_RECONNECT_ATTEMPTS) {
-          // Cap the delay we're about to wait on, and precompute the next
-          // (doubled, capped) delay up front so consecutive failures keep
-          // growing the backoff even if the next attempt fails immediately.
-          const delay = Math.min(retryDelayRef.current, maxRetryDelay);
-          retryDelayRef.current = Math.min(retryDelayRef.current * 2, maxRetryDelay);
-          reconnectTimeoutRef.current = setTimeout(() => {
-            connectRef.current();
-          }, delay);
-        }
+        eventSource.onerror = () => {
+          if (eventSourceRef.current !== eventSource) return;
+          setConnected(false);
+          setError(new Error('SSE connection failed'));
+          eventSource.close();
+          scheduleReconnect();
+        };
+      } catch (error) {
+        if (attempt !== connectAttemptRef.current) return;
+        setConnected(false);
+        setError(error instanceof Error ? error : new Error('SSE authorization failed'));
+        scheduleReconnect();
       }
-    };
+    })();
+
   }, [buildUrl, autoReconnect, maxRetryDelay]);
 
   useEffect(() => {
@@ -170,6 +181,7 @@ export function useStreamEvents(
     connect();
 
     return () => {
+      connectAttemptRef.current += 1;
       if (eventSourceRef.current) {
         eventSourceRef.current.close();
         eventSourceRef.current = null;
