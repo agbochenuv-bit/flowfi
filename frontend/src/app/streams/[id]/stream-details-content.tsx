@@ -26,6 +26,7 @@ import {
   toSorobanErrorMessage,
 } from "@/lib/soroban";
 import { CancelConfirmModal } from "@/components/stream-creation/CancelConfirmModal";
+import { StreamActionReviewModal } from "@/components/stream-creation/StreamActionReviewModal";
 import type { BackendStreamEvent } from "@/lib/api-types";
 import { formatAmount, streamProgressPercent, validateAmountInput } from "@/utils/amount";
 import { shortenPublicKey } from "@/lib/wallet";
@@ -88,6 +89,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
   const [topUpAmount, setTopUpAmount] = useState("");
   const [showTopUp, setShowTopUp] = useState(false);
   const [showCancelModal, setShowCancelModal] = useState(false);
+  const [reviewAction, setReviewAction] = useState<"withdraw" | "pause" | "resume" | null>(null);
   const [receiptTxHash, setReceiptTxHash] = useState<string | null>(null);
 
   // Shared, visibility-aware claimable ticking (rAF-based, pauses when the
@@ -266,6 +268,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       const message = toSorobanErrorMessage(err);
       tracker.fail(message);
       toast.error(message);
+      throw err;
     }
   };
 
@@ -316,6 +319,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       const message = toSorobanErrorMessage(err);
       tracker.fail(message);
       toast.error(message);
+      throw err;
     }
   };
 
@@ -336,6 +340,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       const message = toSorobanErrorMessage(err);
       tracker.fail(message);
       toast.error(message);
+      throw err;
     }
   };
 
@@ -357,6 +362,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       const message = toSorobanErrorMessage(err);
       tracker.fail(message);
       toast.error(message);
+      throw err;
     }
   };
 
@@ -590,7 +596,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
             <div className="flex flex-wrap gap-3">
               {isRecipient && (
                 <Button
-                  onClick={handleWithdraw}
+                  onClick={() => setReviewAction("withdraw")}
                   disabled={tracker.status !== "idle" || liveClaimable <= 0n}
                   glow
                   className="flex items-center gap-2"
@@ -615,7 +621,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                 <>
                   {!stream.isPaused ? (
                     <Button
-                      onClick={handlePause}
+                      onClick={() => setReviewAction("pause")}
                       disabled={tracker.status !== "idle"}
                       variant="outline"
                       className="flex items-center gap-2"
@@ -625,7 +631,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                     </Button>
                   ) : (
                     <Button
-                      onClick={handleResume}
+                      onClick={() => setReviewAction("resume")}
                       disabled={tracker.status !== "idle"}
                       variant="outline"
                       className="flex items-center gap-2"
@@ -730,12 +736,41 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       {showCancelModal && stream && (
         <CancelConfirmModal
           streamId={streamId}
+          network={session?.network ?? "Unknown"}
           recipient={shortenPublicKey(stream.recipient)}
           token={tokenSymbol}
           deposited={Number(formatAmount(deposited, 7))}
           withdrawn={Number(formatAmount(withdrawn, 7))}
           onConfirm={handleCancel}
           onClose={() => setShowCancelModal(false)}
+        />
+      )}
+      {reviewAction && stream && (
+        <StreamActionReviewModal
+          title={`Review ${reviewAction} action`}
+          actionLabel="Continue to wallet"
+          streamId={streamId}
+          network={session?.network ?? "Unknown"}
+          token={tokenSymbol}
+          amount={
+            reviewAction === "withdraw"
+              ? formatAmount(liveClaimable, 7)
+              : formatAmount(deposited, 7)
+          }
+          consequence={
+            reviewAction === "withdraw"
+              ? "The displayed claimable amount transfers to your wallet; the active stream continues accruing."
+              : reviewAction === "pause"
+                ? "Accrual stops while paused. Existing claimable funds stay in the stream and can still be withdrawn."
+                : "Accrual resumes from the current time. No tokens transfer as part of this action."
+          }
+          onConfirm={async () => {
+            if (reviewAction === "withdraw") await handleWithdraw();
+            else if (reviewAction === "pause") await handlePause();
+            else await handleResume();
+            setReviewAction(null);
+          }}
+          onClose={() => setReviewAction(null)}
         />
       )}
     </main>

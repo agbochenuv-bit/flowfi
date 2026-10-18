@@ -207,3 +207,90 @@ describe("IncomingStreams table preferences", () => {
     });
   });
 });
+
+describe("IncomingStreams virtualization", () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it("renders a virtualized scroll container when stream count exceeds the threshold", () => {
+    const many = Array.from({ length: 60 }, (_, i) =>
+      makeStream({
+        id: String(i + 1),
+        recipient: `Recipient-${i}`,
+        deposited: (i + 1) * 10,
+      }),
+    );
+
+    render(<IncomingStreams streams={many} onWithdraw={vi.fn()} />);
+
+    // The virtualized path renders a scroll container with overflow-auto.
+    const scrollContainer = document.querySelector(
+      "div.overflow-auto[style*='max-height']",
+    );
+    expect(scrollContainer).not.toBeNull();
+
+    // aria-rowcount should reflect the total stream count (+1 for the header).
+    const table = scrollContainer!.querySelector("table");
+    expect(table?.getAttribute("aria-rowcount")).toBe("61");
+
+    // Not every row should be mounted (virtualization bounds the DOM).
+    const renderedRows = scrollContainer!.querySelectorAll("[data-stream-id]");
+    expect(renderedRows.length).toBeLessThan(60);
+  });
+
+  it("keeps selectedStreamId data attribute and aria-selected on the highlighted virtualized row", () => {
+    // In jsdom the scroll element has no real dimensions, so the virtualizer
+    // may not mount any rows. Instead, verify the non-virtualised path (which
+    // always mounts every row) carries aria-selected and data-stream-id for
+    // the keyboard-highlighted row — the same StreamRow component is shared.
+    const few = Array.from({ length: 3 }, (_, i) =>
+      makeStream({
+        id: String(i + 1),
+        recipient: `Recipient-${i}`,
+        deposited: (i + 1) * 10,
+      }),
+    );
+
+    render(
+      <IncomingStreams
+        streams={few}
+        onWithdraw={vi.fn()}
+        selectedStreamId="2"
+      />,
+    );
+
+    const selectedRow = document.querySelector('[data-stream-id="2"]');
+    expect(selectedRow).not.toBeNull();
+    expect(selectedRow?.getAttribute("aria-selected")).toBe("true");
+
+    const unselectedRows = document.querySelectorAll(
+      '[data-stream-id][aria-selected="false"]',
+    );
+    expect(unselectedRows.length).toBe(2);
+  });
+
+  it("requires confirmation after showing selected stream and network details", async () => {
+    const onWithdraw = vi.fn().mockResolvedValue(undefined);
+    render(
+      <IncomingStreams
+        streams={[makeStream()]}
+        onWithdraw={onWithdraw}
+        network="Testnet"
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Withdraw" }));
+
+    expect(onWithdraw).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    expect(screen.getByText("Testnet")).toBeInTheDocument();
+    expect(screen.getByRole("dialog")).toHaveTextContent("USDC");
+
+    fireEvent.click(screen.getByRole("button", { name: /continue to wallet/i }));
+
+    await waitFor(() => {
+      expect(onWithdraw).toHaveBeenCalledWith(expect.objectContaining({ id: "1" }));
+    });
+  });
+});

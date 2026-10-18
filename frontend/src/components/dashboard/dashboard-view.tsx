@@ -6,6 +6,7 @@ import dynamic from "next/dynamic";
 import { useSearchParams, useRouter } from "next/navigation";
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
+import { AlertTriangle } from "lucide-react";
 
 /**
  * components/dashboard/dashboard-view.tsx
@@ -209,6 +210,51 @@ function ErrorState({
         </Button>
       </div>
     </section>
+  );
+}
+
+// ─── Stale / Partial Data Banner ─────────────────────────────────────────────
+
+/**
+ * Amber warning banner shown when the dashboard is rendered from cached data
+ * that may be out of date (a background refetch failed) or from a partial
+ * result (one of the two stream endpoints failed but the other succeeded).
+ *
+ * `variant="stale"`    — cached data + background fetch error.
+ * `variant="partial"`  — one endpoint failed, showing partial results.
+ */
+function StaleDataBanner({
+  variant,
+  onRetry,
+}: {
+  variant: "stale" | "partial";
+  onRetry: () => void;
+}) {
+  const isPartial = variant === "partial";
+  const message = isPartial
+    ? "Some streams could not be loaded. Showing partial results."
+    : "Showing cached data — the latest data could not be loaded.";
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      className="mt-4 flex items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-amber-300"
+      data-testid="stale-data-banner"
+      data-variant={variant}
+    >
+      <AlertTriangle className="h-5 w-5 shrink-0" aria-hidden="true" />
+      <p className="flex-1 text-sm">
+        {message}{" "}
+        <button
+          type="button"
+          onClick={onRetry}
+          className="font-semibold underline underline-offset-2 hover:text-amber-200"
+        >
+          Retry
+        </button>
+      </p>
+    </div>
   );
 }
 
@@ -850,13 +896,13 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
   // ── Tab content ───────────────────────────────────────────────────────────
 
   const renderContent = () => {
-    // ── Loading state ─────────────────────────────────────────────────────
-    if (isSnapshotLoading) {
+    // ── Initial loading (first fetch, no cached data at all) ──────────────
+    if (isSnapshotLoading && !snapshot) {
       return <DashboardSkeleton />;
     }
 
-    // ── Error state ───────────────────────────────────────────────────────
-    if (snapshotError) {
+    // ── Hard error with no cached data (truly first-load failure) ─────────
+    if (snapshotError && !snapshot) {
       return (
         <ErrorState
           message={snapshotError}
@@ -866,10 +912,44 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
     }
 
     // ── First-time / completely empty wallet ──────────────────────────────
+    // Only show the "start your first stream" empty state when the snapshot
+    // loaded cleanly (no partial failure). A partial failure that happens to
+    // return empty arrays should still show the stale/partial banner so the
+    // user knows data is missing rather than genuinely absent.
     const hasNoStreams =
       !snapshot ||
       (snapshot.outgoingStreams.length === 0 &&
         snapshot.incomingStreams.length === 0);
+
+    if (hasNoStreams && snapshot?.partialFailure) {
+      return (
+        <EmptyState
+          icon={<AlertTriangle className="h-10 w-10 text-amber-400" />}
+          title="Stream data is incomplete"
+          description="One or more stream sources could not be loaded. The empty result may be missing streams."
+          action={
+            <Button onClick={() => void refetchSnapshot()} variant="outline">
+              Retry
+            </Button>
+          }
+        />
+      );
+    }
+
+    if (hasNoStreams && snapshotError && snapshot) {
+      return (
+        <EmptyState
+          icon={<AlertTriangle className="h-10 w-10 text-amber-400" />}
+          title="Cached results may be out of date"
+          description="The last saved dashboard result contained no streams, but the latest refresh failed. Retry before treating this as a complete result."
+          action={
+            <Button onClick={() => void refetchSnapshot()} variant="outline">
+              Retry
+            </Button>
+          }
+        />
+      );
+    }
 
     if (hasNoStreams) {
       return (
@@ -1048,6 +1128,21 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
           </div>
         </header>
 
+        {/* Stale / partial data warning — shown above tab content so it is
+            visible across all sub-tabs (overview, incoming, outgoing, etc.). */}
+        {snapshot?.partialFailure && (
+          <StaleDataBanner
+            variant="partial"
+            onRetry={() => void refetchSnapshot()}
+          />
+        )}
+        {!snapshot?.partialFailure && snapshotError && snapshot && (
+          <StaleDataBanner
+            variant="stale"
+            onRetry={() => void refetchSnapshot()}
+          />
+        )}
+
         {renderContent()}
 
         <div className="dashboard-actions flex flex-wrap items-center justify-between gap-3">
@@ -1080,6 +1175,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
           onClose={() => setShowWizard(false)}
           onSubmit={handleCreateStream}
           walletPublicKey={session.publicKey}
+          walletNetwork={session.network}
         />
       )}
       {modal?.type === "topup" && (
@@ -1094,6 +1190,7 @@ export function DashboardView({ session, onDisconnect }: DashboardViewProps) {
       {modal?.type === "cancel" && (
         <CancelConfirmModal
           streamId={modal.stream.id}
+          network={session.network}
           recipient={modal.stream.recipient}
           token={modal.stream.token}
           deposited={modal.stream.deposited}

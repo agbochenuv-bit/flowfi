@@ -113,6 +113,16 @@ function jsonResponse(body: unknown) {
   } as Response;
 }
 
+const emptySnapshot = {
+  totalSent: 0,
+  totalReceived: 0,
+  totalValueLocked: 0,
+  activeStreamsCount: 0,
+  recentActivity: [],
+  outgoingStreams: [],
+  incomingStreams: [],
+};
+
 describe("DashboardView + useDashboard cache integration", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse([])));
@@ -216,4 +226,42 @@ describe("DashboardView + useDashboard cache integration", () => {
       callsBeforeRetry,
     );
   }, 20000);
+
+  it("does not treat an empty partial snapshot as a clean first-use state", () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { staleTime: 10_000, retry: false } },
+    });
+    queryClient.setQueryData(["dashboard", PUBLIC_KEY], {
+      ...emptySnapshot,
+      partialFailure: true,
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <DashboardView session={session} onDisconnect={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByText(/stream data is incomplete/i)).toBeInTheDocument();
+    expect(screen.queryByText(/start your first stream/i)).not.toBeInTheDocument();
+  });
+
+  it("labels an empty cached snapshot as stale when refresh fails", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network down")));
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    queryClient.setQueryData(["dashboard", PUBLIC_KEY], emptySnapshot);
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <DashboardView session={session} onDisconnect={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    expect(
+      await screen.findByText(/cached results may be out of date/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/start your first stream/i)).not.toBeInTheDocument();
+  });
 });

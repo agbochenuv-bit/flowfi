@@ -346,6 +346,9 @@ describe("StreamDetailsContent handleWithdraw", () => {
 
     const withdrawBtn = screen.getByRole("button", { name: /withdraw/i });
     await user.click(withdrawBtn);
+    expect(mockSoroban.withdrawFromStream).not.toHaveBeenCalled();
+    expect(screen.getByText("TESTNET")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.withdrawFromStream).toHaveBeenCalled();
@@ -359,6 +362,7 @@ describe("StreamDetailsContent handleWithdraw", () => {
 
     const withdrawBtn = screen.getByRole("button", { name: /withdraw/i });
     await user.click(withdrawBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();
@@ -469,6 +473,7 @@ describe("StreamDetailsContent handlePause", () => {
 
     const pauseBtn = screen.getByRole("button", { name: /pause/i });
     await user.click(pauseBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.pauseStream).toHaveBeenCalledWith(
@@ -485,6 +490,7 @@ describe("StreamDetailsContent handlePause", () => {
 
     const pauseBtn = screen.getByRole("button", { name: /pause/i });
     await user.click(pauseBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();
@@ -511,6 +517,7 @@ describe("StreamDetailsContent handleResume", () => {
 
     const resumeBtn = screen.getByRole("button", { name: /resume/i });
     await user.click(resumeBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.resumeStream).toHaveBeenCalledWith(
@@ -527,6 +534,7 @@ describe("StreamDetailsContent handleResume", () => {
 
     const resumeBtn = screen.getByRole("button", { name: /resume/i });
     await user.click(resumeBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();

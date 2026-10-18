@@ -16,6 +16,7 @@ import { transactionSuccessToast } from "@/lib/transaction-feedback";
 
 interface CancelConfirmModalProps {
   streamId: string;
+  network?: string;
   recipient: string;
   token: string;
   deposited: number;
@@ -26,6 +27,7 @@ interface CancelConfirmModalProps {
 
 export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
   streamId,
+  network = "Unknown",
   recipient,
   token,
   deposited,
@@ -99,8 +101,16 @@ export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
             <code className="text-accent font-mono text-xs">{streamId}</code>
           </div>
           <div className="flex justify-between px-4 py-3">
+            <span className="text-slate-400">Network</span>
+            <span className="font-semibold text-foreground">{network}</span>
+          </div>
+          <div className="flex justify-between px-4 py-3">
             <span className="text-slate-400">Recipient</span>
             <code className="font-mono text-xs text-foreground">{recipient}</code>
+          </div>
+          <div className="flex justify-between px-4 py-3">
+            <span className="text-slate-400">Total deposited</span>
+            <span className="font-semibold text-foreground">{deposited} {token}</span>
           </div>
           <div className="flex justify-between px-4 py-3">
             <span className="text-slate-400">Already withdrawn</span>

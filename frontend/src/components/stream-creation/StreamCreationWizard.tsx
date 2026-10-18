@@ -25,6 +25,7 @@ interface StreamCreationWizardProps {
   onClose: () => void;
   onSubmit: (data: StreamFormData) => Promise<{ txHash: string }>;
   walletPublicKey?: string;
+  walletNetwork?: string;
 }
 
 const STEPS = ["Template", "Recipient", "Token", "Amount", "Schedule"];
@@ -33,6 +34,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
   onClose,
   onSubmit,
   walletPublicKey,
+  walletNetwork,
 }) => {
   const [currentStep, setCurrentStep] = useState(1);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -62,6 +64,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
     saveCustomTemplate,
   } = useStreamForm({
     walletPublicKey,
+    walletNetwork,
     initialData: {
       token: "USDC",
       amount: "5000",
@@ -166,32 +169,25 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
   };
 
   const handleSubmit = async () => {
-    // Authoritative pre-submission wallet balance check (issue #1507): the
-    // balance may have finished loading after the user advanced past the
-    // amount step, so re-validate it here and send the user back if needed.
-    if (!validateStep(4)) {
-      setCurrentStep(4);
-      scrollToFirstError();
-      return;
+    // Recheck each step because balance or network state may have changed
+    // after the user passed it. The first failing step remains visible.
+    for (const step of [2, 3, 4, 5]) {
+      if (!validateStep(step)) {
+        setCurrentStep(step);
+        scrollToFirstError();
+        return;
+      }
     }
 
-    if (validateStep(currentStep)) {
-      setIsSubmitting(true);
-      try {
-        // Step 1: Submit transaction
-        const result = await onSubmit(formData);
-        setTxHash(result.txHash);
-        
-        // Step 2: Start Polling for Indexer
-        setIsPolling(true);
-        await startPolling(walletPublicKey || "");
-        
-      } catch (error) {
-        logger.error("Failed to create stream:", error);
-        setIsSubmitting(false);
-      }
-    } else {
-      scrollToFirstError();
+    setIsSubmitting(true);
+    try {
+      const result = await onSubmit(formData);
+      setTxHash(result.txHash);
+      setIsPolling(true);
+      await startPolling(walletPublicKey || "");
+    } catch (error) {
+      logger.error("Failed to create stream:", error);
+      setIsSubmitting(false);
     }
   };
 
@@ -232,6 +228,7 @@ export const StreamCreationWizard: React.FC<StreamCreationWizardProps> = ({
             value={formData.amount}
             onChange={(value) => updateFormData({ amount: value })}
             error={errors.amount}
+            rateError={errors.rate}
             token={formData.token}
             availableBalance={walletBalance}
             isBalanceLoading={walletBalanceLoading}

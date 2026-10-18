@@ -35,6 +35,13 @@ export interface DashboardSnapshot {
   recentActivity: ActivityItem[];
   outgoingStreams: Stream[];
   incomingStreams: Stream[];
+  /**
+   * True when one of the two stream fetches (outgoing or incoming) failed
+   * but the other succeeded. When both fail the whole query throws and the
+   * consumer sees the error state; when both succeed this stays undefined.
+   * Existing consumers that do not check this field are unaffected.
+   */
+  partialFailure?: boolean;
 }
 
 export interface DashboardAnalyticsMetric {
@@ -150,75 +157,113 @@ export function mapBackendStreamToFrontend(s: BackendStream, counterparty: strin
 
 /**
  * Fetches dashboard data for a given public key by querying both outgoing and incoming streams.
+ *
+ * Each side is fetched independently so a single endpoint failure does not throw
+ * the whole query. When one side fails but the other succeeds, the returned
+ * snapshot is populated with the successful side and `partialFailure` is set to
+ * `true`. When both sides fail, the last error is rethrown so TanStack Query
+ * transitions to the error state.
  */
 export async function fetchDashboardData(publicKey: string, signal?: AbortSignal): Promise<DashboardSnapshot> {
+  // Fetch each side independently so a single endpoint failure does not throw
+  // the whole query. If one side fails but the other succeeds, we return a
+  // partial snapshot with `partialFailure: true`. If both fail, we rethrow so
+  // the query goes into the error state.
+  let outgoing: BackendStream[] | null = null;
+  let outgoingError: unknown = null;
+  let incoming: BackendStream[] | null = null;
+  let incomingError: unknown = null;
+
   try {
-    const [outgoing, incoming] = await Promise.all([
-      fetchStreams(publicKey, "sender", signal),
-      fetchStreams(publicKey, "recipient", signal),
-    ]);
-
-    const outgoingStreams = outgoing.map((stream) =>
-      mapBackendStreamToFrontend(stream, stream.recipient),
-    );
-    const incomingStreams = incoming.map((stream) =>
-      mapBackendStreamToFrontend(stream, stream.sender),
-    );
-
-    // Aggregation logic
-    let totalSent = 0;
-    let totalValueLocked = 0;
-    let activeStreamsCount = 0;
-
-    outgoing.forEach(s => {
-      const dep = toTokenAmount(s.depositedAmount);
-      const withdr = toTokenAmount(s.withdrawnAmount);
-      totalSent += withdr;
-      if (s.isActive) {
-        totalValueLocked += (dep - withdr);
-        activeStreamsCount++;
-      }
-    });
-
-    let totalReceived = 0;
-    incoming.forEach(s => {
-      totalReceived += toTokenAmount(s.withdrawnAmount);
-    });
-
-    // Generate recent activity from streams (simplified for now)
-    const recentActivity: ActivityItem[] = [
-      ...outgoing.map(s => ({
-        id: `act-out-${s.id}`,
-        title: "Outgoing Stream",
-        description: `Stream to ${shortenAddress(s.recipient)}`,
-        amount: toTokenAmount(s.depositedAmount),
-        direction: "sent" as const,
-        timestamp: s.createdAt,
-      })),
-      ...incoming.map(s => ({
-        id: `act-in-${s.id}`,
-        title: "Incoming Stream",
-        description: `Stream from ${shortenAddress(s.sender)}`,
-        amount: toTokenAmount(s.depositedAmount),
-        direction: "received" as const,
-        timestamp: s.createdAt,
-      })),
-    ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-      .slice(0, 10);
-
-    return {
-      totalSent,
-      totalReceived,
-      totalValueLocked,
-      activeStreamsCount,
-      recentActivity,
-      outgoingStreams,
-      incomingStreams,
-    };
-  } catch (error) {
-    logger.error("Dashboard data fetch error:", error);
-    throw error;
+    outgoing = await fetchStreams(publicKey, "sender", signal);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
+    outgoingError = err;
   }
+
+  try {
+    incoming = await fetchStreams(publicKey, "recipient", signal);
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") throw err;
+    incomingError = err;
+  }
+
+  // Both sides failed: rethrow so the query transitions to the error state.
+  if (outgoingError && incomingError) {
+    logger.error("Dashboard data fetch error:", outgoingError);
+    throw outgoingError instanceof Error
+      ? outgoingError
+      : new Error("Failed to fetch dashboard data.");
+  }
+
+  // One side failed: log it and continue with a partial snapshot.
+  if (outgoingError) {
+    logger.error("Dashboard outgoing streams fetch error:", outgoingError);
+  }
+  if (incomingError) {
+    logger.error("Dashboard incoming streams fetch error:", incomingError);
+  }
+
+  const partialFailure = outgoingError !== null || incomingError !== null;
+
+  const outgoingStreams = (outgoing ?? []).map((stream) =>
+    mapBackendStreamToFrontend(stream, stream.recipient),
+  );
+  const incomingStreams = (incoming ?? []).map((stream) =>
+    mapBackendStreamToFrontend(stream, stream.sender),
+  );
+
+  // Aggregation logic
+  let totalSent = 0;
+  let totalValueLocked = 0;
+  let activeStreamsCount = 0;
+
+  (outgoing ?? []).forEach(s => {
+    const dep = toTokenAmount(s.depositedAmount);
+    const withdr = toTokenAmount(s.withdrawnAmount);
+    totalSent += withdr;
+    if (s.isActive) {
+      totalValueLocked += (dep - withdr);
+      activeStreamsCount++;
+    }
+  });
+
+  let totalReceived = 0;
+  (incoming ?? []).forEach(s => {
+    totalReceived += toTokenAmount(s.withdrawnAmount);
+  });
+
+  // Generate recent activity from streams (simplified for now)
+  const recentActivity: ActivityItem[] = [
+    ...(outgoing ?? []).map(s => ({
+      id: `act-out-${s.id}`,
+      title: "Outgoing Stream",
+      description: `Stream to ${shortenAddress(s.recipient)}`,
+      amount: toTokenAmount(s.depositedAmount),
+      direction: "sent" as const,
+      timestamp: s.createdAt,
+    })),
+    ...(incoming ?? []).map(s => ({
+      id: `act-in-${s.id}`,
+      title: "Incoming Stream",
+      description: `Stream from ${shortenAddress(s.sender)}`,
+      amount: toTokenAmount(s.depositedAmount),
+      direction: "received" as const,
+      timestamp: s.createdAt,
+    })),
+  ].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+    .slice(0, 10);
+
+  return {
+    totalSent,
+    totalReceived,
+    totalValueLocked,
+    activeStreamsCount,
+    recentActivity,
+    outgoingStreams,
+    incomingStreams,
+    partialFailure,
+  };
 }
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;

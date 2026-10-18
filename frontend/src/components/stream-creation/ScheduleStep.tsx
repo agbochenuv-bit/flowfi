@@ -67,6 +67,9 @@ export function ScheduleStep({ formData, errors, onUpdate }: ScheduleStepProps) 
           {errors.duration && (
             <p className="text-red-400 text-sm mt-1" role="alert">{errors.duration}</p>
           )}
+          {errors.rate && (
+            <p className="text-red-400 text-sm mt-1" role="alert">{errors.rate}</p>
+          )}
         </div>
 
         <div>

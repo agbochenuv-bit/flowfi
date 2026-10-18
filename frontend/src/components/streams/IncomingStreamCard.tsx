@@ -1,9 +1,10 @@
 "use client";
 
-import React from "react";
+import React, { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { LiveValue } from "@/components/ui/LiveValue";
 import { useStreamingAmount } from "@/hooks/useStreamingAmount";
+import { StreamActionReviewModal } from "@/components/stream-creation/StreamActionReviewModal";
 import type {
   IncomingStreamRecord,
   IncomingStreamStatus,
@@ -12,7 +13,8 @@ import type {
 interface IncomingStreamCardProps {
   stream: IncomingStreamRecord;
   withdrawing: boolean;
-  onWithdraw: (stream: IncomingStreamRecord) => void;
+  network?: string;
+  onWithdraw: (stream: IncomingStreamRecord) => void | Promise<void>;
 }
 
 function formatTokenAmount(value: number, maximumFractionDigits = 7): string {
@@ -37,8 +39,10 @@ function badgeClassName(status: IncomingStreamStatus): string {
 export const IncomingStreamCard = React.memo(function IncomingStreamCard({
   stream,
   withdrawing,
+  network = "Unknown",
   onWithdraw,
 }: IncomingStreamCardProps) {
+  const [reviewOpen, setReviewOpen] = useState(false);
   const claimable = useStreamingAmount({
     deposited: stream.deposited,
     withdrawn: stream.withdrawn,
@@ -117,7 +121,7 @@ export const IncomingStreamCard = React.memo(function IncomingStreamCard({
               : "Available balance updates in real time."}
         </div>
         <Button
-          onClick={() => onWithdraw(stream)}
+          onClick={() => setReviewOpen(true)}
           disabled={!canWithdraw}
           loading={withdrawing}
           glow
@@ -125,6 +129,22 @@ export const IncomingStreamCard = React.memo(function IncomingStreamCard({
           {withdrawing ? "Withdrawing..." : "Withdraw"}
         </Button>
       </div>
+      {reviewOpen && (
+        <StreamActionReviewModal
+          title="Review withdrawal"
+          actionLabel="Continue to wallet"
+          streamId={String(stream.streamId)}
+          network={network}
+          token={stream.token}
+          amount={formatTokenAmount(claimable)}
+          consequence="This withdraws the claimable amount from the stream to your wallet. The stream continues accruing afterward."
+          onConfirm={async () => {
+            await onWithdraw(stream);
+            setReviewOpen(false);
+          }}
+          onClose={() => setReviewOpen(false)}
+        />
+      )}
     </article>
   );
 }, (prevProps, nextProps) => {
@@ -138,6 +158,8 @@ export const IncomingStreamCard = React.memo(function IncomingStreamCard({
     prevProps.stream.pausedAt === nextProps.stream.pausedAt &&
     prevProps.stream.totalPausedDuration === nextProps.stream.totalPausedDuration &&
     prevProps.stream.status === nextProps.stream.status &&
-    prevProps.withdrawing === nextProps.withdrawing
+    prevProps.withdrawing === nextProps.withdrawing &&
+    prevProps.network === nextProps.network &&
+    prevProps.onWithdraw === nextProps.onWithdraw
   );
 });

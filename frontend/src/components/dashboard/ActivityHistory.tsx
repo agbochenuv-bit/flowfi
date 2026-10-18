@@ -31,6 +31,7 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
     estimateSize: () => 120,
     overscan: 5,
     enabled: shouldVirtualize,
+    getItemKey: (index) => events[index]?.id ?? index,
   });
 
   const [exportStatus, setExportStatus] = useState<"idle" | "exporting" | "complete">("idle");
@@ -154,6 +155,7 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
           ref={parentRef}
           role="list"
           aria-label="Activity timeline"
+          tabIndex={0}
           className="relative h-[600px] overflow-auto before:absolute before:inset-0 before:ml-5 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-slate-700 before:to-transparent"
         >
           <div
@@ -165,10 +167,13 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
               if (!event) return null;
               return (
                 <div
-                  key={`${event.id}-${virtualRow.index}`}
+                  key={event.id}
                   ref={virtualizer.measureElement}
                   data-index={virtualRow.index}
+                  data-event-id={event.id}
                   role="listitem"
+                  aria-posinset={virtualRow.index + 1}
+                  aria-setsize={events.length}
                   style={{
                     position: "absolute",
                     top: 0,
@@ -227,9 +232,10 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
         </div>
       ) : (
         <div role="list" aria-label="Activity timeline" className="relative space-y-4 before:absolute before:inset-0 before:ml-5 before:-translate-x-px md:before:mx-auto md:before:translate-x-0 before:h-full before:w-0.5 before:bg-gradient-to-b before:from-transparent before:via-slate-700 before:to-transparent">
-          {events.map((event, index) => (
+          {events.map((event) => (
             <div
-              key={`${event.id}-${index}`}
+              key={event.id}
+              data-event-id={event.id}
               role="listitem"
               className="relative flex items-center justify-between md:justify-normal md:odd:flex-row-reverse group"
             >

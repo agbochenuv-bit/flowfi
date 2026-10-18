@@ -24,6 +24,8 @@ export interface StreamTemplate {
 export interface UseStreamFormOptions {
   /** Wallet public key for balance lookups */
   walletPublicKey?: string;
+  /** Connected wallet network name for pre-signature network validation. */
+  walletNetwork?: string | null;
   /** Initial form data (e.g. from a restored draft or URL params) */
   initialData?: Partial<StreamFormData>;
   /**
@@ -269,6 +271,7 @@ export function useStreamForm(
 ): UseStreamFormReturn {
   const {
     walletPublicKey,
+    walletNetwork,
     initialData,
     templateStorageKey = DEFAULT_TEMPLATE_STORAGE_KEY,
     enableDraftPersistence = false,
@@ -424,20 +427,22 @@ export function useStreamForm(
       const newErrors = validateStreamForm(formData, {
         step,
         walletBalance,
+        walletNetwork,
       });
       setErrors(newErrors);
       return Object.keys(newErrors).length === 0;
     },
-    [formData, walletBalance],
+    [formData, walletBalance, walletNetwork],
   );
 
   const validateAll = useCallback((): boolean => {
     const newErrors = validateStreamForm(formData, {
       walletBalance,
+      walletNetwork,
     });
     setErrors(newErrors);
     return Object.keys(newErrors).length === 0;
-  }, [formData, walletBalance]);
+  }, [formData, walletBalance, walletNetwork]);
 
   const setMaxAmount = useCallback(() => {
     const spendable = getSpendableBalance(walletBalance, formData.token);
