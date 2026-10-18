@@ -6,9 +6,7 @@ on:
 
 permissions:
   contents: read
-  pull-requests: write
   issues: write
-  deployments: write
 
 jobs:
   cleanup:
@@ -19,7 +17,10 @@ jobs:
       PR_NUMBER: ${{ github.event.pull_request.number }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
 
       - name: Teardown preview resources
         run: bash scripts/cleanup-preview.sh --pr "$PR_NUMBER"
@@ -33,7 +34,7 @@ jobs:
 
       - name: Comment teardown notice
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const pr = context.payload.pull_request.number;

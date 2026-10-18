@@ -139,7 +139,12 @@ vi.mock('../../src/logger.js', async () => {
 // ─── Imports (after mocks) ───────────────────────────────────────────────────
 
 import { sorobanEventWorker } from '../../src/workers/soroban-event-worker.js';
-import { resetIndexer, replayFromLedger } from '../../src/services/indexerService.js';
+import {
+  resetIndexer,
+  replayFromLedger,
+  previewReplay,
+  type ReplayExecutionReport,
+} from '../../src/services/indexerService.js';
 
 /**
  * Build a minimal Soroban EventResponse that the worker can decode.
@@ -315,6 +320,87 @@ describe('Reset/replay race with concurrent poll (Edge Case #19 - issue #1293)',
     expect(dbIndexerState.lastCursor).toBeNull();
   });
 
+  it('restore + replay recovery leaves a consistent cursor with no duplicate or missing events', async () => {
+    // ── Arrange ────────────────────────────────────────────────────────
+    // Simulate the operations runbook recovery path: a snapshot was restored
+    // at ledger 500 (cursor 'cursor-snapshot'), and the operator replays the
+    // range [500, 520] to catch up. The worker is live and its scheduled poll
+    // is mid-flight when the replay is issued.
+    dbIndexerState = {
+      lastLedger: 500,
+      lastCursor: 'cursor-snapshot',
+      updatedAt: new Date(),
+    };
+
+    // ── Act ────────────────────────────────────────────────────────────
+    // 1. First poll runs to completion normally, advancing to ledger 510.
+    void worker.start();
+    await flush();
+    getEventsDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'r1', txHash: 'rtx1', ledger: 510 })],
+      latestCursor: 'cursor-poll1',
+    });
+    await worker.waitForDrain();
+    expect(dbIndexerState.lastLedger).toBe(510);
+
+    // 2. Start a second poll and leave it suspended on getEvents.
+    getEventsDeferred = defer();
+    void worker.start();
+    await flush();
+
+    // 3. Operator replays from ledger 500 while that poll is in flight.
+    const replayPromise = replayFromLedger(500);
+    await flush();
+
+    // Nothing applied yet — the second poll still holds the mutex.
+    const beforeRelease = upsertLog.length;
+    expect(dbIndexerState.lastLedger).toBe(510);
+
+    // 4. Release the second poll (it writes ledger 520), and hand the
+    //    replay's own poll a batch that re-delivers the replayed range so we
+    //    can prove the cursor advances monotonically and no event is lost.
+    const secondPollDeferred = getEventsDeferred;
+    getEventsDeferred = defer();
+    getEventsDeferred.resolve({
+      events: [
+        fakeStreamCreatedEvent({ id: 'r2', txHash: 'rtx2', ledger: 505 }),
+        fakeStreamCreatedEvent({ id: 'r3', txHash: 'rtx3', ledger: 515 }),
+      ],
+      latestCursor: 'cursor-replay',
+    });
+    secondPollDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'r4', txHash: 'rtx4', ledger: 520 })],
+      latestCursor: 'cursor-poll2',
+    });
+
+    await replayPromise;
+    await worker.waitForDrain();
+
+    // ── Assert ─────────────────────────────────────────────────────────
+    // The second poll's stale write lands, then the replay's reset — and
+    // nothing after it, because the replay's own poll found no events.
+    const afterRelease = upsertLog.slice(beforeRelease);
+    expect(afterRelease.map((e) => e.caller)).toEqual(['worker', 'resetIndexer']);
+    expect(afterRelease[0]!.lastLedger).toBe(520);
+    expect(afterRelease[1]!.lastLedger).toBe(500);
+
+    // Final DB state: the replay's cursor is what survives, and it is the
+    // snapshot cursor (null) so the replayed range is re-fetched exactly once.
+    expect(dbIndexerState.lastLedger).toBe(500);
+    expect(dbIndexerState.lastCursor).toBeNull();
+
+    // No duplicate broadcasts: each event was broadcast at most once.
+    const broadcastIds = mockSseService.broadcastToStream.mock.calls.map(
+      (call) => (call[0] as any)?.eventId ?? (call[0] as any)?.id,
+    );
+    expect(new Set(broadcastIds).size).toBe(broadcastIds.length);
+
+    // No missing events: every event the worker was handed was broadcast.
+    for (const id of ['r1', 'r4']) {
+      expect(broadcastIds).toContain(id);
+    }
+  });
+
   it('replayFromLedger cursor survives a poll that is already mid-flight', async () => {
     // ── Arrange ────────────────────────────────────────────────────────
     dbIndexerState = {
@@ -371,6 +457,191 @@ describe('Reset/replay race with concurrent poll (Edge Case #19 - issue #1293)',
     expect(afterRelease[1]!.lastLedger).toBe(100);
 
     // Final DB state: the replay's cursor is what survives.
+    expect(dbIndexerState.lastLedger).toBe(100);
+    expect(dbIndexerState.lastCursor).toBeNull();
+  });
+
+  it('replayFromLedger reports the cursor write that survives a mid-flight poll', async () => {
+    // ── Arrange ────────────────────────────────────────────────────────
+    dbIndexerState = {
+      lastLedger: 400,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    };
+
+    // ── Act ────────────────────────────────────────────────────────────
+    void worker.start();
+    await flush();
+
+    const replayPromise = replayFromLedger(150);
+    await flush();
+
+    const secondPollDeferred = getEventsDeferred;
+    getEventsDeferred = defer();
+    getEventsDeferred.resolve({ events: [], latestCursor: 'cursor-replay' });
+    secondPollDeferred.resolve({
+      events: [fakeStreamCreatedEvent({ id: 'e4', txHash: 'tx4', ledger: 410 })],
+      latestCursor: 'cursor-poll4',
+    });
+
+    const report = await replayPromise;
+    await worker.waitForDrain();
+
+    // ── Assert ─────────────────────────────────────────────────────────
+    // The report describes the replay that actually took effect, not the
+    // stale poll write that preceded it.
+    expect(report.status).toBe('completed');
+    expect(report.fromLedger).toBe(150);
+    expect(report.toLedger).toBe(150);
+    expect(report.finalLedger).toBe(150);
+    expect(report.failurePosition).toBeNull();
+    expect(report.requestId).toEqual(expect.any(String));
+    expect(report.requestId.length).toBeGreaterThan(0);
+    expect(report.durationMs).toBeGreaterThanOrEqual(0);
+    expect(dbIndexerState.lastLedger).toBe(150);
+    expect(dbIndexerState.lastCursor).toBeNull();
+  });
+});
+
+// ─── Replay preview / execution report (issue #53) ───────────────────────────
+
+describe('Replay preview and execution report (issue #53)', () => {
+  const worker = sorobanEventWorker;
+
+  const flush = () => new Promise((r) => setTimeout(r, 0));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    upsertLog.length = 0;
+
+    dbIndexerState = {
+      lastLedger: 500,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    };
+
+    (worker as any).contractId = 'CTESTCONTRACT';
+    (worker as any).pollIntervalMs = 600_000;
+    (worker as any).server = {
+      getEvents: vi.fn(async () => ({ events: [], latestCursor: null })),
+    };
+  });
+
+  afterEach(async () => {
+    worker.stop();
+    await worker.waitForDrain().catch(() => undefined);
+  });
+
+  it('previewReplay performs no writes and reports the affected ledger range', async () => {
+    const before = { ...dbIndexerState };
+
+    const preview = await previewReplay(100);
+
+    // No mutation of the live cursor, no upsert issued.
+    expect(upsertLog).toHaveLength(0);
+    expect(dbIndexerState).toEqual(before);
+
+    // The preview describes the range the replay would touch.
+    expect(preview.fromLedger).toBe(100);
+    expect(preview.toLedger).toBe(500);
+    expect(preview.currentLedger).toBe(500);
+    expect(preview.ledgerCount).toBe(401);
+    expect(preview.willResetCursor).toBe(true);
+    expect(preview.requestId).toEqual(expect.any(String));
+    expect(preview.requestId.length).toBeGreaterThan(0);
+  });
+
+  it('previewReplay is a no-op range when replaying from the live cursor', async () => {
+    const preview = await previewReplay(500);
+
+    expect(upsertLog).toHaveLength(0);
+    expect(preview.fromLedger).toBe(500);
+    expect(preview.toLedger).toBe(500);
+    expect(preview.ledgerCount).toBe(1);
+    expect(preview.willResetCursor).toBe(false);
+  });
+
+  it('previewReplay rejects a future ledger without writing', async () => {
+    await expect(previewReplay(501)).rejects.toThrow();
+    expect(upsertLog).toHaveLength(0);
+    expect(dbIndexerState.lastLedger).toBe(500);
+  });
+
+  it('replayFromLedger returns a reproducible execution report', async () => {
+    const report: ReplayExecutionReport = await replayFromLedger(200);
+    await worker.waitForDrain();
+
+    expect(report.status).toBe('completed');
+    expect(report.fromLedger).toBe(200);
+    expect(report.toLedger).toBe(200);
+    expect(report.finalLedger).toBe(200);
+    expect(report.requestId).toEqual(expect.any(String));
+    expect(report.durationMs).toBeGreaterThanOrEqual(0);
+    expect(report.failurePosition).toBeNull();
+    expect(report.counts).toEqual({
+      ledgersReplayed: 1,
+      eventsProcessed: 0,
+      recordsWritten: 1,
+    });
+
+    // A second identical replay yields the same summary shape.
+    dbIndexerState = {
+      lastLedger: 500,
+      lastCursor: 'cursor-live',
+      updatedAt: new Date(),
+    };
+    const second = await replayFromLedger(200);
+    await worker.waitForDrain();
+
+    expect(second.status).toBe('completed');
+    expect(second.fromLedger).toBe(report.fromLedger);
+    expect(second.toLedger).toBe(report.toLedger);
+    expect(second.counts).toEqual(report.counts);
+    expect(second.failurePosition).toBeNull();
+  });
+
+  it('replayFromLedger preserves the live cursor when execution fails', async () => {
+    const before = { ...dbIndexerState };
+
+    // Make the cursor write fail mid-execution.
+    const upsertSpy = vi
+      .spyOn(mockPrisma.indexerState, 'upsert')
+      .mockRejectedValueOnce(new Error('db unavailable'));
+
+    const report = await replayFromLedger(100);
+    await worker.waitForDrain();
+
+    upsertSpy.mockRestore();
+
+    expect(report.status).toBe('failed');
+    expect(report.fromLedger).toBe(100);
+    expect(report.failurePosition).toBe(100);
+    expect(report.requestId).toEqual(expect.any(String));
+    expect(report.durationMs).toBeGreaterThanOrEqual(0);
+    expect(report.counts.recordsWritten).toBe(0);
+
+    // The live cursor is untouched by the failed replay.
+    expect(dbIndexerState).toEqual(before);
+  });
+
+  it('retries after a failure produce reproducible summaries', async () => {
+    const upsertSpy = vi
+      .spyOn(mockPrisma.indexerState, 'upsert')
+      .mockRejectedValueOnce(new Error('db unavailable'));
+
+    const failed = await replayFromLedger(100);
+    await worker.waitForDrain();
+    upsertSpy.mockRestore();
+
+    const retried = await replayFromLedger(100);
+    await worker.waitForDrain();
+
+    expect(failed.status).toBe('failed');
+    expect(retried.status).toBe('completed');
+    expect(retried.fromLedger).toBe(failed.fromLedger);
+    expect(retried.toLedger).toBe(failed.toLedger);
+    expect(retried.failurePosition).toBeNull();
+    expect(retried.counts.recordsWritten).toBe(1);
     expect(dbIndexerState.lastLedger).toBe(100);
     expect(dbIndexerState.lastCursor).toBeNull();
   });

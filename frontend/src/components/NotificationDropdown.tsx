@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useStreamEvents } from "@/hooks/useStreamEvents";
 import { formatAmount } from "@/utils/amount";
 import { Button } from "./ui/Button";
+import { useWallet } from "@/context/wallet-context";
 
 interface NotificationDropdownProps {
     publicKey: string;
@@ -20,6 +21,7 @@ interface NotificationItem {
 }
 
 export const NotificationDropdown: React.FC<NotificationDropdownProps> = ({ publicKey }) => {
+    const { session } = useWallet();
     const router = useRouter();
     const [isOpen, setIsOpen] = useState(false);
     const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -28,6 +30,7 @@ export const NotificationDropdown: React.FC<NotificationDropdownProps> = ({ publ
 
     const { events: streamEvents, connected } = useStreamEvents({
         userPublicKeys: [publicKey],
+        jwtToken: session?.accessToken,
         autoReconnect: true,
     });
 

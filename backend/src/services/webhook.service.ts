@@ -26,6 +26,26 @@ export interface WebhookPayload {
 
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [0, 60000, 300000, 900000, 3600000]; // 0, 1m, 5m, 15m, 1h
+const WEBHOOK_DELIVERY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const ALERT_HISTORY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+export async function purgeExpiredWebhookDeliveries(
+  now = new Date(),
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - WEBHOOK_DELIVERY_RETENTION_MS);
+  const result = await prisma.webhookDelivery.deleteMany({
+    where: { createdAt: { lt: cutoff } },
+  });
+  return result.count;
+}
+
+export async function purgeExpiredAlertHistory(now = new Date()): Promise<number> {
+  const cutoff = new Date(now.getTime() - ALERT_HISTORY_RETENTION_MS);
+  const result = await prisma.alertHistory.deleteMany({
+    where: { sentAt: { lt: cutoff } },
+  });
+  return result.count;
+}
 
 type ResolvedAddress = { address: string; family: number };
 type AddressResolver = (hostname: string) => Promise<ResolvedAddress[]>;
@@ -261,13 +281,10 @@ export async function deleteWebhookSubscription(
   id: string,
   userAddress: string,
 ): Promise<void> {
-  await prisma.webhookSubscription.updateMany({
+  await prisma.webhookSubscription.deleteMany({
     where: {
       id,
       userAddress, // Ensure user owns this webhook
-    },
-    data: {
-      isActive: false,
     },
   });
 }
@@ -413,7 +430,7 @@ export async function deliverWebhook(
 
       if (lastStatus >= 200 && lastStatus < 300) {
         logger.info(
-          `[Webhook] Successfully delivered ${payload.eventType} to ${webhookOrigin(subscription.targetUrl)} (attempt ${attempt + 1})`,
+          `[Webhook] Delivered ${payload.eventType} with status ${lastStatus} (attempt ${attempt + 1})`,
         );
         return { success: true, status: lastStatus };
       }
@@ -422,10 +439,10 @@ export async function deliverWebhook(
       logger.warn(
         `[Webhook] Delivery failed with status ${lastStatus} (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
-    } catch (error: any) {
-      lastError = error.message || "Network error";
+    } catch {
+      lastError = "Network error";
       logger.warn(
-        `[Webhook] Delivery error: ${lastError} (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
+        `[Webhook] Delivery failed with a network error (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
 
       await prisma.webhookDelivery.update({
@@ -513,13 +530,11 @@ export async function dispatchWebhookEvent(
   const deliveries = subscriptions.map((subscription) =>
     deliverWebhook(subscription as WebhookSubscription, payload).catch(
       (error) => {
-        logger.error(
-          `[Webhook] Failed to deliver to ${webhookOrigin(subscription.targetUrl)}:`,
-          error,
-        );
+        logger.error(`[Webhook] Dispatch failed for ${payload.eventType}`);
       },
     ),
   );
 
   await Promise.all(deliveries);
 }
+

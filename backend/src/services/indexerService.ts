@@ -3,7 +3,12 @@ import { rpc, xdr, Contract } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma.js';
 import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
-import { setIndexerLedgers } from '../lib/metrics.js';
+import {
+  setIndexerLedgers,
+  recordIndexerLastSuccess,
+  recordIndexerEventLatency,
+  recordIndexerRetry,
+} from '../lib/metrics.js';
 import { withSpan } from '../lib/tracing.js';
 import {
   getLatestCheckpoint,
@@ -78,6 +83,11 @@ export async function previewReset(targetLedger: number): Promise<ResetPreview> 
  * Preview what a replay from a given ledger would do without mutating state.
  * Returns the event count, ledger range, and current cursor so operators can
  * sanity-check before committing a destructive replay.
+ *
+ * This function performs ZERO writes: it only reads `IndexerState` and
+ * aggregates `StreamEvent` rows. The `expectedRecordChanges` field summarises
+ * the record deltas an execution would attempt so operators can audit the
+ * blast radius before committing.
  */
 export interface ReplayPreview {
   fromLedger: number;
@@ -86,6 +96,13 @@ export interface ReplayPreview {
   eventCount: number;
   minLedgerInReplayRange: number | null;
   maxLedgerInReplayRange: number | null;
+  /** Ledger range that would be re-processed, inclusive. */
+  affectedLedgerRange: { from: number; to: number };
+  /** Expected record deltas an execution would attempt. */
+  expectedRecordChanges: {
+    streamEvents: number;
+    deadLetterEvents: number;
+  };
 }
 
 export async function previewReplay(fromLedger: number): Promise<ReplayPreview> {
@@ -99,23 +116,61 @@ export async function previewReplay(fromLedger: number): Promise<ReplayPreview> 
       ? { ledgerSequence: { gte: fromLedger, lte: currentLastLedger } }
       : { ledgerSequence: { gte: fromLedger } };
 
-  const [eventCount, aggregate] = await Promise.all([
+  const [eventCount, aggregate, deadLetterCount] = await Promise.all([
     prisma.streamEvent.count({ where: rangeFilter }),
     prisma.streamEvent.aggregate({
       where: rangeFilter,
       _min: { ledgerSequence: true },
       _max: { ledgerSequence: true },
     }),
+    prisma.indexerDeadLetterEvent.count({
+      where:
+        currentLastLedger > 0
+          ? { ledgerSequence: { gte: fromLedger, lte: currentLastLedger } }
+          : { ledgerSequence: { gte: fromLedger } },
+    }),
   ]);
+
+  const minLedger = aggregate._min.ledgerSequence;
+  const maxLedger = aggregate._max.ledgerSequence;
 
   return {
     fromLedger,
     currentLastLedger,
     currentLastCursor: state?.lastCursor ?? null,
     eventCount,
-    minLedgerInReplayRange: aggregate._min.ledgerSequence,
-    maxLedgerInReplayRange: aggregate._max.ledgerSequence,
+    minLedgerInReplayRange: minLedger,
+    maxLedgerInReplayRange: maxLedger,
+    affectedLedgerRange: {
+      from: minLedger ?? fromLedger,
+      to: maxLedger ?? currentLastLedger,
+    },
+    expectedRecordChanges: {
+      streamEvents: eventCount,
+      deadLetterEvents: deadLetterCount,
+    },
   };
+}
+
+export type ReplayStatus = 'completed' | 'failed';
+
+/**
+ * Structured, auditable report describing the outcome of a replay execution.
+ *
+ * `failurePosition` is the ledger at which processing stopped on failure (or
+ * `null` on success). The live cursor is preserved on failure so operators can
+ * retry from the same point.
+ */
+export interface ReplayReport {
+  requestId: string;
+  status: ReplayStatus;
+  fromLedger: number;
+  toLedger: number;
+  durationMs: number;
+  eventsProcessed: number;
+  eventsQuarantined: number;
+  failurePosition: number | null;
+  errorMessage?: string;
 }
 
 /**
@@ -127,19 +182,109 @@ export async function previewReplay(fromLedger: number): Promise<ReplayPreview> 
  * Stream.withdrawnAmount (handleTokensWithdrawn, soroban-event-worker.ts:635)
  * is incremented unconditionally on every replay, so replay is NOT fully
  * idempotent. See issue #808 for the withdrawnAmount idempotency fix.
+ *
+ * Returns the request ID for backwards compatibility. Use `executeReplay` when
+ * a structured `ReplayReport` is required.
  */
 export async function replayFromLedger(
   fromLedger: number,
   customRequestId?: string,
 ): Promise<string> {
+  const report = await executeReplay(fromLedger, customRequestId);
+  return report.requestId;
+}
+
+/**
+ * Execute a replay and return a structured, auditable `ReplayReport`.
+ *
+ * On failure the live cursor is preserved (the reset is rolled back to the
+ * pre-replay state) so operators can retry from the same point without losing
+ * progress. The report captures the request ID, duration, counts, and the
+ * ledger at which processing stopped.
+ */
+export async function executeReplay(
+  fromLedger: number,
+  customRequestId?: string,
+): Promise<ReplayReport> {
   const requestId = customRequestId || requestContext.getStore()?.requestId || randomUUID();
-  await requestContext.run({ requestId }, async () => {
-    await resetIndexer(fromLedger);
-    // Kick off an immediate poll cycle without waiting for the next interval.
-    await sorobanEventWorker.triggerPoll(requestId);
-    logger.info(`[IndexerService] Replay triggered from ledger ${fromLedger}`);
-  });
-  return requestId;
+  const startedAt = Date.now();
+
+  // Snapshot the live cursor so we can restore it if the replay fails.
+  const before = await prisma.indexerState.findUnique({ where: { id: INDEXER_STATE_ID } });
+  const previousLastLedger = before?.lastLedger ?? 0;
+  const previousLastCursor = before?.lastCursor ?? null;
+
+  let eventsProcessed = 0;
+  let eventsQuarantined = 0;
+  let toLedger = fromLedger;
+  let failurePosition: number | null = null;
+  let errorMessage: string | undefined;
+
+  try {
+    await requestContext.run({ requestId }, async () => {
+      await resetIndexer(fromLedger);
+      // Kick off an immediate poll cycle without waiting for the next interval.
+      await sorobanEventWorker.triggerPoll(requestId);
+    });
+
+    const after = await prisma.indexerState.findUnique({ where: { id: INDEXER_STATE_ID } });
+    toLedger = after?.lastLedger ?? fromLedger;
+
+    // Count events processed within the replayed range for the report.
+    eventsProcessed = await prisma.streamEvent.count({
+      where: { ledgerSequence: { gte: fromLedger, lte: toLedger } },
+    });
+    eventsQuarantined = await prisma.indexerDeadLetterEvent.count({
+      where: { ledgerSequence: { gte: fromLedger, lte: toLedger } },
+    });
+
+    recordIndexerLastSuccess();
+    logger.info(
+      `[IndexerService] Replay ${requestId} completed from ledger ${fromLedger} to ${toLedger}`,
+    );
+  } catch (err) {
+    errorMessage = err instanceof Error ? err.message : String(err);
+    failurePosition = fromLedger;
+    recordIndexerRetry('replay');
+
+    // Preserve the live cursor: restore the pre-replay state so operators can
+    // retry from the same point without losing progress.
+    try {
+      await sorobanEventWorker.runExclusive(async () => {
+        await prisma.indexerState.upsert({
+          where: { id: INDEXER_STATE_ID },
+          create: {
+            id: INDEXER_STATE_ID,
+            lastLedger: previousLastLedger,
+            lastCursor: previousLastCursor,
+          },
+          update: { lastLedger: previousLastLedger, lastCursor: previousLastCursor },
+        });
+      });
+      setIndexerLedgers(previousLastLedger, 0);
+    } catch (restoreErr) {
+      logger.error(
+        `[IndexerService] Failed to restore cursor after replay ${requestId} failure:`,
+        restoreErr,
+      );
+    }
+
+    logger.error(
+      `[IndexerService] Replay ${requestId} failed from ledger ${fromLedger}: ${errorMessage}`,
+    );
+  }
+
+  return {
+    requestId,
+    status: failurePosition === null ? 'completed' : 'failed',
+    fromLedger,
+    toLedger,
+    durationMs: Date.now() - startedAt,
+    eventsProcessed,
+    eventsQuarantined,
+    failurePosition,
+    ...(errorMessage ? { errorMessage } : {}),
+  };
 }
 
 /**
@@ -148,6 +293,34 @@ export async function replayFromLedger(
  */
 export function publishIndexerLag(currentLedger: number, networkLedger: number): void {
   setIndexerLedgers(currentLedger, networkLedger);
+}
+
+/**
+ * Record a successful poll cycle: updates the last-success timestamp gauge and
+ * the indexed-ledger lag gauges. Called by the poll loop after a batch commits.
+ */
+export function recordPollSuccess(currentLedger: number, networkLedger: number): void {
+  setIndexerLedgers(currentLedger, networkLedger);
+  recordIndexerLastSuccess();
+}
+
+/**
+ * Record decode/persist latency for a single event. `phase` distinguishes the
+ * decode step from the persistence step so operators can attribute slowness.
+ */
+export function recordEventLatency(
+  phase: 'decode' | 'persist',
+  durationSeconds: number,
+): void {
+  recordIndexerEventLatency(phase, durationSeconds);
+}
+
+/**
+ * Increment the retry counter for a given retry path (e.g. 'poll', 'replay',
+ * 'dead_letter'). Kept label-bounded to avoid high-cardinality series.
+ */
+export function recordRetry(reason: string): void {
+  recordIndexerRetry(reason);
 }
 
 // ─── Ledger reorg / fork recovery (issue #1468) ──────────────────────────────

@@ -238,3 +238,160 @@ export async function disconnectRedis(): Promise<void> {
   _subscriber = null;
   _available = false;
 }
+
+// --- Shared Counter / Key-Value Store with In-Memory Fallback ---
+// Used by the principal-aware rate limiters (Issue #72) and the idempotency
+// layer (Issue #74). When Redis is available, counters and values are shared
+// across horizontally scaled instances. When Redis is unavailable (not
+// configured, disconnected, or erroring), operations transparently fall back
+// to a per-process Map with TTL eviction. The fallback is logged once so
+// operators can detect degraded multi-instance behavior.
+
+interface FallbackEntry {
+  value: string;
+  expiresAt: number;
+}
+
+const fallbackStore = new Map<string, FallbackEntry>();
+let fallbackLogged = false;
+
+function logFallbackOnce(reason: string): void {
+  if (fallbackLogged) return;
+  fallbackLogged = true;
+  logger.warn(
+    `[Redis] Shared store unavailable (${reason}) — falling back to per-instance in-memory store. ` +
+      'Rate limits and idempotency keys will NOT be shared across instances.'
+  );
+}
+
+function pruneFallback(now: number): void {
+  for (const [key, entry] of fallbackStore.entries()) {
+    if (now >= entry.expiresAt) {
+      fallbackStore.delete(key);
+    }
+  }
+}
+
+function fallbackGet(key: string): string | null {
+  const entry = fallbackStore.get(key);
+  if (!entry) return null;
+  if (Date.now() >= entry.expiresAt) {
+    fallbackStore.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function fallbackSet(key: string, value: string, ttlMs: number): void {
+  const now = Date.now();
+  pruneFallback(now);
+  fallbackStore.set(key, { value, expiresAt: now + ttlMs });
+}
+
+function fallbackDelete(key: string): void {
+  fallbackStore.delete(key);
+}
+
+function fallbackIncrement(key: string, windowMs: number): number {
+  const now = Date.now();
+  const existing = fallbackStore.get(key);
+  if (!existing || now >= existing.expiresAt) {
+    fallbackStore.set(key, { value: '1', expiresAt: now + windowMs });
+    return 1;
+  }
+  const next = Number.parseInt(existing.value, 10) + 1;
+  existing.value = String(next);
+  return next;
+}
+
+/**
+ * Atomically increments a counter key and ensures it expires after `windowMs`.
+ * Returns the new counter value. Uses Redis INCR + PEXPIRE when available,
+ * otherwise a per-process in-memory counter with TTL eviction.
+ */
+export async function incrementWithTtl(
+  key: string,
+  windowMs: number
+): Promise<number> {
+  if (_available && _publisher) {
+    try {
+      const results = await _publisher
+        .multi()
+        .incr(key)
+        .pexpire(key, windowMs, 'NX')
+        .exec();
+      const incrResult = results?.[0];
+      if (incrResult && incrResult[0] === null) {
+        return Number(incrResult[1]);
+      }
+      throw new Error('Unexpected Redis INCR result');
+    } catch (err) {
+      logFallbackOnce(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    logFallbackOnce('not connected');
+  }
+  return fallbackIncrement(key, windowMs);
+}
+
+/**
+ * Reads a string value. Returns null when the key is missing or expired.
+ */
+export async function get(key: string): Promise<string | null> {
+  if (_available && _publisher) {
+    try {
+      return await _publisher.get(key);
+    } catch (err) {
+      logFallbackOnce(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    logFallbackOnce('not connected');
+  }
+  return fallbackGet(key);
+}
+
+/**
+ * Writes a string value with a TTL in milliseconds.
+ */
+export async function setWithTtl(
+  key: string,
+  value: string,
+  ttlMs: number
+): Promise<void> {
+  if (_available && _publisher) {
+    try {
+      await _publisher.set(key, value, 'PX', ttlMs);
+      return;
+    } catch (err) {
+      logFallbackOnce(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    logFallbackOnce('not connected');
+  }
+  fallbackSet(key, value, ttlMs);
+}
+
+/**
+ * Deletes a key. Safe to call when the key does not exist.
+ */
+export async function deleteKey(key: string): Promise<void> {
+  if (_available && _publisher) {
+    try {
+      await _publisher.del(key);
+      return;
+    } catch (err) {
+      logFallbackOnce(err instanceof Error ? err.message : String(err));
+    }
+  } else {
+    logFallbackOnce('not connected');
+  }
+  fallbackDelete(key);
+}
+
+/**
+ * Clears the in-memory fallback store. Intended for tests only.
+ */
+export function clearFallbackStore(): void {
+  fallbackStore.clear();
+  fallbackLogged = false;
+}

@@ -6,8 +6,15 @@ export default defineConfig({
         globals: true,
         setupFiles: [],
         // Provide a stable JWT_SECRET so verifyJwt is deterministic in tests.
+        // Challenge TTL / audience / network env vars keep wallet-challenge
+        // tests deterministic across the forks pool.
         env: {
           JWT_SECRET: 'flowfi-test-secret-do-not-use-in-production',
+          WALLET_CHALLENGE_TTL_SECONDS: '300',
+          WALLET_CHALLENGE_AUDIENCE: 'flowfi-test',
+          WALLET_CHALLENGE_NETWORK: 'testnet',
+          // OpenAPI parity tests read the committed spec from this path.
+          OPENAPI_SPEC_PATH: 'swagger/flowfi.openapi.json',
         },
         include: ['tests/**/*.{test,spec}.ts'],
         coverage: {

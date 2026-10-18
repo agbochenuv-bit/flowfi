@@ -55,6 +55,17 @@ model Stream {
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+  // Deterministic cursor pagination (Issue #73): stable ordering across equal
+  // timestamps and concurrent inserts. `id` is the tiebreaker.
+  @@index([createdAt, id])
+  @@index([sender, createdAt, id])
+  @@index([recipient, createdAt, id])
+
+  // Query-plan-backed composite indexes for list/history/analytics reads.
+  // See docs/indexes.md for the EXPLAIN ANALYZE before/after evidence.
+  @@index([isActive, isPaused, startTime])
+  @@index([sender, startTime])
+  @@index([recipient, startTime])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker
@@ -63,6 +74,21 @@ model IndexerState {
   lastLedger  Int      @default(0)
   lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
   updatedAt   DateTime @updatedAt
+}
+
+// IndexerLease model - single-row (id = "singleton") renewable lease that
+// coordinates poll ownership across backend replicas. Only the replica whose
+// ownerId matches and whose expiresAt is in the future may advance the cursor.
+// fencingToken is monotonically incremented on every acquisition so stale
+// owners can be rejected when they attempt to write after a lease turnover.
+model IndexerLease {
+  id           String   @id @default("singleton")
+  ownerId      String?  // Identity of the current poll owner (null when free)
+  expiresAt    DateTime? // Lease expiry; owner must renew before this instant
+  fencingToken BigInt   @default(0) // Incremented on each acquisition; guards stale writes
+  updatedAt    DateTime @updatedAt
+
+  @@index([expiresAt])
 }
 
 // LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
@@ -104,31 +130,72 @@ model StreamEvent {
   @@index([transactionHash])
   @@index([createdAt])
   @@index([streamId, timestamp])
+  // Deterministic cursor pagination (Issue #73): stable ordering across equal
+  // timestamps and concurrent inserts. `id` is the tiebreaker.
+  @@index([timestamp, id])
+  @@index([streamId, timestamp, id])
+  // Query-plan-backed composite indexes for event history/cursor reads.
+  // See docs/indexes.md for the EXPLAIN ANALYZE before/after evidence.
+  @@index([streamId, ledgerSequence])
+  @@index([ledgerSequence, timestamp])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
+// Lifecycle (Issue #59): endpoints are soft-deleted via deletedAt so delivery
+// history and replay audit records survive deletion. Disabling is recorded with
+// disabledAt/disabledReason and is distinct from deletion.
 model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id                      String    @id @default(uuid())
+  userAddress             String    // Stellar public key of the owner
+  targetUrl               String    // Destination webhook URL (must be HTTPS)
+  secretKey               String    // AES-256-GCM envelope encrypted
+  previousSecretKey       String?   // Encrypted prior key during bounded rotation overlap
+  previousSecretExpiresAt DateTime?
+  eventTypes              String[]  // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
+  isActive                Boolean   @default(true)
+  disabledAt              DateTime? // When the endpoint was disabled (null when enabled)
+  disabledReason          String?   // Operator/user supplied reason for disabling
+  deletedAt               DateTime? // Soft-delete marker; non-null endpoints are treated as gone
+  createdAt               DateTime  @default(now())
+  updatedAt               DateTime  @updatedAt
 
   deliveries  WebhookDelivery[]
+  replays     WebhookDeliveryReplay[]
 
   @@index([userAddress])
   @@index([isActive])
+  @@index([deletedAt])
+  @@index([userAddress, deletedAt])
+}
+
+// Append-only record for security-sensitive operational changes.
+model AuditEvent {
+  id         String   @id @default(uuid())
+  occurredAt DateTime @default(now())
+  actor      String
+  requestId  String?
+  action     String
+  targetType String
+  targetId   String
+  outcome    String
+  before     Json?    @db.JsonB
+  after      Json?    @db.JsonB
+  metadata   Json?    @db.JsonB
+
+  @@index([occurredAt])
+  @@index([targetType, targetId])
+  @@index([actor, occurredAt])
 }
 
 // WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
+// status (Issue #59) lets scoped replay select only FAILED deliveries, so
+// successful deliveries are never resent.
 model WebhookDelivery {
   id             String   @id @default(uuid())
   subscriptionId String
   eventType      String
   payload        String   // JSON
+  status         String   @default("PENDING") // "PENDING" | "SUCCESS" | "FAILED"
   responseStatus Int?
   attempts       Int      @default(0)
   deliveredAt    DateTime?
@@ -139,18 +206,117 @@ model WebhookDelivery {
 
   @@index([subscriptionId])
   @@index([createdAt])
+  @@index([subscriptionId, createdAt])
+  @@index([status])
+  @@index([subscriptionId, status, createdAt])
+}
+
+// WebhookDeliveryReplay model - Audit record for scoped replay requests (Issue #59)
+// One row per replay request; deliveryIds is the bounded set of failed
+// deliveries that were re-enqueued. outcome is "SUCCEEDED", "PARTIAL", or
+// "FAILED" and is updated as the replay progresses.
+model WebhookDeliveryReplay {
+  id             String   @id @default(uuid())
+  replayId       String   @unique // Client/operator supplied idempotency key for the replay
+  subscriptionId String
+  deliveryIds    String[] // Bounded set of delivery ids selected for replay
+  requestedBy    String   // Stellar public key of the requester (ownership checked)
+  requestedAt    DateTime @default(now())
+  outcome        String   @default("PENDING") // "PENDING" | "SUCCEEDED" | "PARTIAL" | "FAILED"
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@index([subscriptionId])
+  @@index([subscriptionId, requestedAt])
+  @@index([requestedBy])
+  @@index([outcome])
+  @@index([requestedAt])
 }
 
 // AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)
+//
+// Idempotency contract (Issue #55): a runway notification is identified by the
+// deterministic tuple (streamId, alertType, windowStart) where `windowStart` is
+// the start of the notification window the alert belongs to (e.g. the 48h or
+// 24h runway boundary, truncated to the policy's window granularity). The unique
+// constraint guarantees that restarts, clock skew within a window, and parallel
+// worker replicas can insert a given window at most once; concurrent inserts
+// surface as a unique-violation (P2002) which the worker treats as "already
+// notified". `sentAt` is retained for observability but is no longer part of the
+// uniqueness key.
 model AlertHistory {
-  id        String   @id @default(uuid())
-  streamId  BigInt
-  alertType String   // "WARNING_48H" or "CRITICAL_24H"
-  sentAt    DateTime @default(now())
+  id          String   @id @default(uuid())
+  streamId    BigInt
+  alertType   String   // "WARNING_48H" or "CRITICAL_24H"
+  windowStart DateTime // Deterministic start of the notification window
+  sentAt      DateTime @default(now())
 
-  @@unique([streamId, alertType, sentAt])
+  @@unique([streamId, alertType, windowStart])
   @@index([streamId])
   @@index([sentAt])
+  @@index([windowStart])
+}
+
+// WebhookOutbox model - Transactional outbox for webhook delivery (Issue #57)
+//
+// Outbox rows are written in the same database transaction as the business
+// change (stream event / state change) that produces them, so a committed
+// change always has a deliverable event. A separate dispatcher polls rows in
+// `PENDING`/`FAILED` state whose `nextAttemptAt` has elapsed and delivers them
+// with bounded retries, persisting attempt state durably. `dedupeKey` is unique
+// so retries or re-emission of the same logical event never create duplicate
+// outbox records.
+model WebhookOutbox {
+  id             String    @id @default(uuid())
+  subscriptionId String
+  eventType      String
+  payload        String    // JSON
+  dedupeKey      String    @unique // e.g. `${eventType}:${txHash}:${subscriptionId}`
+  status         String    @default("PENDING") // "PENDING" | "DELIVERED" | "FAILED" | "DEAD"
+  attempts       Int       @default(0)
+  nextAttemptAt  DateTime  @default(now())
+  lastError      String?
+  createdAt      DateTime  @default(now())
+  deliveredAt    DateTime?
+
+  @@index([status, nextAttemptAt])
+  @@index([subscriptionId])
+  @@index([createdAt])
+}
+
+// OperationalAlertState model - Deduplication and recovery state for
+// operator-facing alerts (Issue #56). One row per logical alert condition
+// (`alertKey`); `state` transitions between "firing" and "resolved" so a
+// sustained condition notifies once and a recovery emits exactly one
+// resolution notification. `metadata` holds non-secret context only.
+model OperationalAlertState {
+  id             String    @id @default(uuid())
+  alertKey       String    @unique
+  condition      String    // e.g. "DEAD_LETTER_GROWTH", "INDEXER_LAG", "RPC_FAILURE"
+  state          String    @default("firing") // "firing" | "resolved"
+  firstFiredAt   DateTime  @default(now())
+  lastNotifiedAt DateTime?
+  resolvedAt     DateTime?
+  metadata       String?   // JSON, must not contain secrets or raw event payloads
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([condition])
+  @@index([state])
+}
+
+// WebhookReplayNonce model - Replay prevention for signed webhook payloads
+// (Issue #58). Each accepted signed request records its nonce with an expiry;
+// a nonce seen again before `expiresAt` is rejected as a replay. Expired rows
+// are pruned by a maintenance job.
+model WebhookReplayNonce {
+  nonce     String   @id
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
 }
 
 // IndexerDeadLetterEvent model - quarantines Soroban events whose processing
@@ -176,4 +342,26 @@ model IndexerDeadLetterEvent {
   @@index([createdAt])
   @@index([attempts])
   @@index([eventType])
+}
+
+// IdempotencyRecord model - durable idempotency contract for retryable stream
+// commands that submit on-chain transactions (Issue #74). A key is bound to the
+// wallet, operation, and request hash so a retry with identical input replays the
+// original result, while key reuse with different input is rejected. Records are
+// retained for a bounded window and purged via `expiresAt`.
+model IdempotencyRecord {
+  id             String   @id @default(uuid())
+  wallet         String   // Stellar public key of the caller
+  operation      String   // Command identifier, e.g. "stream.create"
+  idempotencyKey String   // Client-supplied key
+  requestHash    String   // Hash of the canonical request payload
+  status         String   @default("IN_FLIGHT") // "IN_FLIGHT" | "SUCCEEDED" | "FAILED"
+  response       String?  // Serialized result payload (JSON)
+  expiresAt      DateTime // Bounded retention; rows past this are purgeable
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([wallet, operation, idempotencyKey])
+  @@index([expiresAt])
+  @@index([wallet, operation])
 }

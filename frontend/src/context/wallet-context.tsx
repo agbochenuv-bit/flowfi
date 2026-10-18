@@ -11,6 +11,7 @@ import {
 import {
   SUPPORTED_WALLETS,
   connectWallet,
+  authenticateWallet,
   toWalletErrorMessage,
   type WalletDescriptor,
   type WalletId,
@@ -165,7 +166,8 @@ function storeSession(session: WalletSession): void {
     return;
   }
 
-  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(session));
+  const { accessToken: _accessToken, ...persistable } = session;
+  window.localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
 }
 
 function removeStoredSession(): void {
@@ -182,6 +184,14 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     const existingSession = readStoredSession();
     dispatch({ type: "hydrate", session: existingSession });
+    if (existingSession) {
+      void authenticateWallet(existingSession.publicKey, existingSession.walletId)
+        .then((accessToken) => dispatch({
+          type: "connect:success",
+          session: { ...existingSession, accessToken },
+        }))
+        .catch(() => dispatch({ type: "connect:error", message: "Reconnect your wallet to authenticate." }));
+    }
   }, []);
 
   const clearError = useCallback(() => {
@@ -192,7 +202,9 @@ export function WalletProvider({ children }: { children: React.ReactNode }) {
     dispatch({ type: "connect:start", walletId });
 
     try {
-      const nextSession = await connectWallet(walletId);
+      const walletSession = await connectWallet(walletId);
+      const accessToken = await authenticateWallet(walletSession.publicKey, walletId);
+      const nextSession = { ...walletSession, accessToken };
       dispatch({ type: "connect:success", session: nextSession });
       storeSession(nextSession);
     } catch (error) {

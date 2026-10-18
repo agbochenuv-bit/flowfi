@@ -47,6 +47,18 @@
     {
       "name": "Observability",
       "description": "Prometheus metrics scrape endpoint"
+    },
+    {
+      "name": "Webhooks",
+      "description": "Webhook subscription management endpoints"
+    },
+    {
+      "name": "Tokens",
+      "description": "Verified token metadata endpoints"
+    },
+    {
+      "name": "Auth",
+      "description": "SEP-10 wallet authentication endpoints"
     }
   ],
   "components": {
@@ -859,6 +871,202 @@
         "required": [
           "error"
         ]
+      },
+      "ValidationError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "VALIDATION_ERROR"
+              },
+              "message": {
+                "type": "string",
+                "example": "Invalid request parameters"
+              },
+              "details": {
+                "type": "array",
+                "description": "One entry per invalid field",
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "path",
+                    "message"
+                  ],
+                  "properties": {
+                    "path": {
+                      "type": "string",
+                      "example": "query.limit"
+                    },
+                    "message": {
+                      "type": "string",
+                      "example": "must be <= 200"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "UnauthorizedError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "UNAUTHORIZED"
+              },
+              "message": {
+                "type": "string",
+                "example": "Missing or invalid authentication token"
+              }
+            }
+          }
+        }
+      },
+      "ForbiddenError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "FORBIDDEN"
+              },
+              "message": {
+                "type": "string",
+                "example": "Caller is not allowed to perform this action"
+              }
+            }
+          }
+        }
+      },
+      "NotFoundError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "NOT_FOUND"
+              },
+              "message": {
+                "type": "string",
+                "example": "Resource not found"
+              }
+            }
+          }
+        }
+      },
+      "ConflictError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "CONFLICT"
+              },
+              "message": {
+                "type": "string",
+                "example": "Resource is in a conflicting state"
+              }
+            }
+          }
+        }
+      },
+      "RateLimitError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "RATE_LIMITED"
+              },
+              "message": {
+                "type": "string",
+                "example": "Too many requests"
+              }
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "object",
+            "required": [
+              "code",
+              "message"
+            ],
+            "properties": {
+              "code": {
+                "type": "string",
+                "example": "INTERNAL_ERROR"
+              },
+              "message": {
+                "type": "string",
+                "example": "Internal server error"
+              }
+            }
+          }
+        }
       }
     }
   },
@@ -872,7 +1080,33 @@
         "description": "Returns a simple message to verify the API is running",
         "responses": {
           "200": {
-            "description": "API is running successfully"
+            "description": "API is running successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "message"
+                  ],
+                  "properties": {
+                    "message": {
+                      "type": "string",
+                      "example": "FlowFi API is running"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalError"
+                }
+              }
+            }
           }
         }
       }
@@ -913,13 +1147,34 @@
         "description": "Returns liveness and readiness information. Liveness (200 vs 503) is\ndetermined by DB reachability alone. Indexer lag is reported in the\nbody for observability but only forces a 503 when the indexer is\nactually enabled (`STREAM_CONTRACT_ID` env var set) and its state row\nis stale (lag > 60 s), or when recent event-processing failures spike.\nResponse is cached in-memory for 2 s so consecutive rapid requests do\nnot re-execute the DB and Redis probes (issue #1511).\n",
         "responses": {
           "200": {
-            "description": "Service is healthy"
+            "description": "Service is healthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
           },
           "429": {
-            "description": "Rate limited"
+            "description": "Rate limited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitError"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Service is degraded or unhealthy"
+            "description": "Service is degraded or unhealthy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
           }
         }
       }
@@ -1000,7 +1255,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - missing or invalid authentication token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedError"
                 }
               }
             }
@@ -1010,7 +1275,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1056,7 +1321,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - missing or invalid authentication token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedError"
                 }
               }
             }
@@ -1066,7 +1341,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1107,7 +1382,27 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - missing or invalid authentication token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Webhook subscription not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -1117,7 +1412,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1185,7 +1480,27 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - missing or invalid authentication token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Webhook subscription not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -1195,7 +1510,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1256,7 +1571,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1266,7 +1581,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1308,7 +1623,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -1318,7 +1633,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1354,7 +1669,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/UnauthorizedError"
                 }
               }
             }
@@ -1364,7 +1679,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1406,7 +1721,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1416,7 +1731,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1477,7 +1792,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1487,7 +1802,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -1497,7 +1812,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1598,7 +1913,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1608,7 +1923,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -1618,7 +1933,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1671,6 +1986,16 @@
           },
           "304": {
             "description": "Not Modified - the caller's cached copy is still current"
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalError"
+                }
+              }
+            }
           }
         }
       }
@@ -1759,7 +2084,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1769,7 +2094,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/UnauthorizedError"
                 }
               }
             }
@@ -1779,7 +2104,17 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ForbiddenError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict - stream already exists with different ownership",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictError"
                 }
               }
             }
@@ -1789,7 +2124,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/RateLimitError"
                 }
               }
             }
@@ -1799,7 +2134,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -1918,7 +2253,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -1928,7 +2263,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -2065,10 +2400,54 @@
             }
           },
           "400": {
-            "description": "Invalid parameters or a reverted simulation"
+            "description": "Invalid parameters or a reverted simulation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ValidationError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - missing or invalid authentication token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedError"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests - rate limit exceeded",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RateLimitError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalError"
+                }
+              }
+            }
           },
           "503": {
-            "description": "Stream contract is not configured"
+            "description": "Stream contract is not configured",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
           }
         }
       }
@@ -2107,7 +2486,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -2117,7 +2496,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -2159,7 +2538,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -2169,7 +2548,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -2179,7 +2558,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -2293,7 +2672,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -2303,7 +2682,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -2313,7 +2692,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }
@@ -2364,7 +2743,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/ValidationError"
                 }
               }
             }
@@ -2374,7 +2753,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/NotFoundError"
                 }
               }
             }
@@ -2384,7 +2763,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "$ref": "#/components/schemas/InternalError"
                 }
               }
             }

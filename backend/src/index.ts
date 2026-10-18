@@ -32,6 +32,9 @@ const startServer = async () => {
     await prisma.$queryRaw`SELECT 1`;
     logger.info("Database connection established successfully");
 
+    const { encryptExistingWebhookSecrets } = await import("./services/webhook.service.js");
+    await encryptExistingWebhookSecrets();
+
     // Connect Redis (graceful fallback to single-instance mode when absent)
     await connectRedis();
     await sseService.initRedisSubscription();
