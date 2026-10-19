@@ -11,7 +11,7 @@ export interface VersionedRequest extends Request {
 /**
  * Supported API versions
  */
-export const SUPPORTED_VERSIONS = ['v1', 'v2'] as const;
+export const SUPPORTED_VERSIONS = ['v1'] as const;
 export type ApiVersion = typeof SUPPORTED_VERSIONS[number];
 
 /**
@@ -44,8 +44,9 @@ export const API_VERSION_QUERY_PARAM = 'api-version';
 
 /**
  * Versions that enable cursor pagination by default.
+ * Reserved for future use when additional API versions are introduced.
  */
-export const CURSOR_PAGINATION_VERSIONS: readonly ApiVersion[] = ['v2'];
+export const CURSOR_PAGINATION_VERSIONS: readonly ApiVersion[] = [];
 
 export interface VersionedRequest extends Request {
   apiVersion?: ApiVersion;

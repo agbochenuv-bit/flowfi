@@ -104,6 +104,10 @@ model StreamEvent {
   @@index([transactionHash])
   @@index([createdAt])
   @@index([streamId, timestamp])
+  // Canonical ordering index: (streamId, ledgerSequence) gives deterministic
+  // blockchain-ordered event listings. ledger_sequence is the total order on
+  // Stellar — no two events in different ledgers share a sequence number.
+  @@index([streamId, ledgerSequence])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)

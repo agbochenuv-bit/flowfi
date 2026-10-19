@@ -735,15 +735,31 @@ export class SorobanEventWorker {
       Array<{ ledgerSequence: number; transactionHash: string; eventType: string }>
     >();
 
-    // Sort events so that 'stream_created' events are processed first in the batch.
-    // This ensures that subsequent events (like 'fee_collected') that depend on
-    // the stream existing in the DB can find it.
+    // Sort events into canonical blockchain order before processing.
+    //
+    // Primary sort: ledger sequence ASC — events in earlier ledgers are always
+    // applied before events in later ledgers, matching on-chain finality order.
+    //
+    // Secondary sort within the same ledger: stream_created comes first so that
+    // the Stream row exists before any subsequent event (e.g. fee_collected,
+    // topped_up) tries to reference it via the foreign key.
+    //
+    // Tertiary sort: event id (Soroban paging token) ASC — within the same
+    // ledger and event-type group, paging tokens are lexicographically ordered
+    // by (ledger, tx index, event index), which preserves transaction ordering.
     const sortedEvents = [...response.events].sort((a, b) => {
+      // 1. Ledger sequence (ascending)
+      if (a.ledger !== b.ledger) return a.ledger - b.ledger;
+
+      // 2. stream_created before everything else within the same ledger
       const aType = a.topic[0] ? decodeSymbol(a.topic[0]) : "";
       const bType = b.topic[0] ? decodeSymbol(b.topic[0]) : "";
-      if (aType === "stream_created" && bType !== "stream_created") return -1;
-      if (bType === "stream_created" && aType !== "stream_created") return 1;
-      return 0;
+      const aIsCreated = aType === "stream_created" ? 0 : 1;
+      const bIsCreated = bType === "stream_created" ? 0 : 1;
+      if (aIsCreated !== bIsCreated) return aIsCreated - bIsCreated;
+
+      // 3. Soroban paging token (lexicographic order preserves tx/event index)
+      return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
     });
 
     // Accumulate events into bounded batches. Each batch is persisted in a
@@ -1329,6 +1345,15 @@ export class SorobanEventWorker {
       startTime,
       transactionHash: event.txHash,
       ledger: event.ledger,
+      // Ordering metadata — clients use these fields to detect and
+      // re-sequence out-of-order delivery. The canonical order is
+      // (ledgerSequence ASC, eventId ASC). eventId is the Soroban paging
+      // token: "<ledger>-<txIndex>-<eventIndex>".
+      _ordering: {
+        ledgerSequence: event.ledger,
+        eventId: event.id,
+        eventType: "CREATED",
+      },
     });
   }
 
@@ -1422,6 +1447,11 @@ export class SorobanEventWorker {
       transactionHash: event.txHash,
       ledger: event.ledger,
       timestamp,
+      _ordering: {
+        ledgerSequence: event.ledger,
+        eventId: event.id,
+        eventType: "TOPPED_UP",
+      },
     });
   }
 
@@ -1506,6 +1536,11 @@ export class SorobanEventWorker {
       transactionHash: event.txHash,
       ledger: event.ledger,
       timestamp,
+      _ordering: {
+        ledgerSequence: event.ledger,
+        eventId: event.id,
+        eventType: "WITHDRAWN",
+      },
     });
   }
 
@@ -1583,6 +1618,11 @@ export class SorobanEventWorker {
         transactionHash: event.txHash,
         ledger: event.ledger,
         timestamp,
+        _ordering: {
+          ledgerSequence: event.ledger,
+          eventId: event.id,
+          eventType: "CANCELLED",
+        },
       });
     }
   }
@@ -1661,6 +1701,11 @@ export class SorobanEventWorker {
         transactionHash: event.txHash,
         ledger: event.ledger,
         timestamp,
+        _ordering: {
+          ledgerSequence: event.ledger,
+          eventId: event.id,
+          eventType: "COMPLETED",
+        },
       });
     }
   }
@@ -1730,6 +1775,15 @@ export class SorobanEventWorker {
         transactionHash: event.txHash,
         ledger: event.ledger,
         timestamp,
+        // Ordering metadata — clients use these fields to detect and
+        // re-sequence out-of-order delivery. The canonical order is
+        // (ledgerSequence ASC, eventId ASC). eventId is the Soroban paging
+        // token: "<ledger>-<txIndex>-<eventIndex>".
+        _ordering: {
+          ledgerSequence: event.ledger,
+          eventId: event.id,
+          eventType: "FEE_COLLECTED",
+        },
       });
     }
   }
@@ -1806,6 +1860,11 @@ export class SorobanEventWorker {
         transactionHash: event.txHash,
         ledger: event.ledger,
         timestamp,
+        _ordering: {
+          ledgerSequence: event.ledger,
+          eventId: event.id,
+          eventType: "PAUSED",
+        },
       });
     }
   }
@@ -1905,6 +1964,11 @@ export class SorobanEventWorker {
         transactionHash: event.txHash,
         ledger: event.ledger,
         timestamp,
+        _ordering: {
+          ledgerSequence: event.ledger,
+          eventId: event.id,
+          eventType: "RESUMED",
+        },
       });
     }
   }

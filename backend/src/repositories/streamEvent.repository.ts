@@ -149,10 +149,16 @@ export async function listEventsForWallet(
     where.eventType = { in: types };
   }
 
+  // Deterministic ordering: ledgerSequence is the canonical blockchain total
+  // order (no two events in different ledgers share a sequence number). Within
+  // the same ledger, id (UUID v4) provides a stable tiebreaker. This replaces
+  // the old (timestamp, id) ordering — timestamp is wall-clock time set at
+  // indexing time and can collide or be slightly skewed for events in the same
+  // ledger, making the sort non-deterministic under concurrent indexer replicas.
   const [queriedEvents, total] = await Promise.all([
     prisma.streamEvent.findMany({
       where,
-      orderBy: [{ timestamp: order }, { id: order }],
+      orderBy: [{ ledgerSequence: order }, { id: order }],
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
       take: cursor ? limit + 1 : limit,
       ...(includeStream ? { include: { stream: true } } : {}),
