@@ -639,6 +639,47 @@ rely on \`error.requestId\` for correlation and \`error.details\` for structured
           description: 'Deprecated alias of ErrorEnvelope, retained for backward compatibility.',
           allOf: [{ $ref: '#/components/schemas/ErrorEnvelope' }],
         },
+        CreateStreamRequest: {
+          type: 'object',
+          required: ['streamId', 'sender', 'recipient', 'tokenAddress', 'ratePerSecond', 'depositedAmount', 'startTime'],
+          properties: {
+            streamId: {
+              oneOf: [{ type: 'integer' }, { type: 'string' }],
+              description: 'On-chain stream ID (non-negative integer)',
+              example: 1,
+            },
+            sender: {
+              type: 'string',
+              description: 'Sender Stellar public key',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            recipient: {
+              type: 'string',
+              description: 'Recipient Stellar public key',
+              example: 'GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD',
+            },
+            tokenAddress: {
+              type: 'string',
+              description: 'Token contract address',
+              example: 'CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE',
+            },
+            ratePerSecond: {
+              type: 'string',
+              description: 'Payment rate per second (positive integer as string, i128)',
+              example: '100',
+            },
+            depositedAmount: {
+              type: 'string',
+              description: 'Initial deposited amount (positive integer as string, i128)',
+              example: '10000',
+            },
+            startTime: {
+              oneOf: [{ type: 'integer' }, { type: 'string' }],
+              description: 'Stream start time (Unix timestamp)',
+              example: 1708531200,
+            },
+          },
+        },
       },
     },
   },

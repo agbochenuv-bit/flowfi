@@ -14,6 +14,7 @@ contributors, enterprise payroll clients, and security auditors can understand
 | [0002](0002-keeper-key-deprecation-client-side-signing.md) | Keeper-key deprecation & client-side signing | Accepted |
 | [0003](0003-event-indexer-cursor-pagination-and-dead-letter.md) | Event indexer cursor pagination & dead-letter handling | Accepted |
 | [0004](0004-realtime-transport-sse-and-websocket-coexistence.md) | Realtime transport: SSE + WebSocket coexistence | Accepted |
+| [0005](0005-event-ordering-guarantees.md) | Event ordering guarantees | Accepted |
 
 ## Process
 

@@ -41,63 +41,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/metrics": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Prometheus metrics
-         * @description Returns the registry in the standard Prometheus exposition format.
-         *     Restricted to the internal cluster network (`METRICS_ALLOWED_CIDRS`)
-         *     and/or a shared bearer token (`METRICS_BEARER_TOKEN`); when both are
-         *     configured the request must satisfy both. Disabled by default in
-         *     production when neither is configured.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Metrics in Prometheus text exposition format */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "text/plain": string;
-                    };
-                };
-                /** @description Forbidden - request did not originate from an allowed network or present a valid token */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description Metrics endpoint is disabled in this environment */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/health": {
         parameters: {
             query?: never;
@@ -155,698 +98,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/webhooks": {
+    "/metrics": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** List all webhooks for authenticated user */
-        get: {
-            parameters: {
-                query: {
-                    userAddress: string;
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description List of webhook subscriptions */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            subscriptions?: components["schemas"]["WebhookSubscription"][];
-                        };
-                    };
-                };
-                /** @description Missing userAddress */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
         /**
-         * Register a new webhook subscription
-         * @description Creates a webhook subscription. The returned `secretKey` is only shown once.
+         * Prometheus metrics
+         * @description Returns the registry in the standard Prometheus exposition format.
+         *     Restricted to the internal cluster network (`METRICS_ALLOWED_CIDRS`)
+         *     and/or a shared bearer token (`METRICS_BEARER_TOKEN`); when both are
+         *     configured the request must satisfy both. Disabled by default in
+         *     production when neither is configured.
          */
-        post: {
+        get: {
             parameters: {
                 query?: never;
                 header?: never;
                 path?: never;
                 cookie?: never;
             };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /** @description Stellar public key */
-                        userAddress: string;
-                        /** Format: uri */
-                        targetUrl: string;
-                        eventTypes: ("CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED")[];
-                    };
-                };
-            };
-            responses: {
-                /** @description Webhook created successfully */
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            subscription?: components["schemas"]["WebhookSubscription"];
-                            /** @description Webhook signing secret (returned only once) */
-                            secretKey?: string;
-                            message?: string;
-                        };
-                    };
-                };
-                /** @description Missing required fields */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/webhooks/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /** Delete a webhook subscription */
-        delete: {
-            parameters: {
-                query: {
-                    userAddress: string;
-                };
-                header?: never;
-                path: {
-                    id: string;
-                };
-                cookie?: never;
-            };
             requestBody?: never;
             responses: {
-                /** @description Webhook deleted successfully */
-                204: {
+                /** @description Metrics in Prometheus text exposition format */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "text/plain": string;
+                    };
+                };
+                /** @description Forbidden - request did not originate from an allowed network or present a valid token */
+                403: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content?: never;
                 };
-                /** @description Invalid id or missing userAddress */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/webhooks/{id}/test": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Send a test ping to a webhook */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    id: string;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        userAddress: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description Test webhook sent */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @example Test webhook sent */
-                            message?: string;
-                            result?: {
-                                [key: string]: unknown;
-                            };
-                        };
-                    };
-                };
-                /** @description Missing id or userAddress */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Register a wallet public key
-         * @description Registers a new Stellar wallet public key or returns the existing user if already registered.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /**
-                         * @description Stellar public key (G...)
-                         * @example GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA
-                         */
-                        publicKey: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description User already exists */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["User"];
-                    };
-                };
-                /** @description User registered successfully */
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["User"];
-                    };
-                };
-                /** @description Invalid request body */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users/{publicKey}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Fetch a user by public key
-         * @description Returns user details along with recent sent and received streams.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Stellar public key */
-                    publicKey: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description User found */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["User"];
-                    };
-                };
-                /** @description User not found */
+                /** @description Metrics endpoint is disabled in this environment */
                 404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users/me": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get current authenticated user
-         * @description Returns the currently authenticated user's details (protected endpoint)
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Current user details */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["User"];
-                    };
-                };
-                /** @description Unauthorized - invalid or missing token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users/{address}/summary": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get aggregate stream summary for a user
-         * @description Returns dashboard/profile summary data for a wallet address:
-         *     total created streams, total streamed out/in, current claimable across
-         *     active incoming streams, and active stream counts.
-         *
-         *     Response is cached for 30 seconds to reduce DB load.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Stellar public key address */
-                    address: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description User stream summary */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["UserStreamSummary"];
-                    };
-                };
-                /** @description Address is required */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users/{publicKey}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Fetch user activity history
-         * @description Returns a paginated chronological history of all stream events associated with the user.
-         */
-        get: {
-            parameters: {
-                query?: {
-                    /** @description Maximum number of events to return */
-                    limit?: number;
-                    /** @description Number of events to skip for pagination */
-                    offset?: number;
-                };
-                header?: never;
-                path: {
-                    /** @description Stellar public key */
-                    publicKey: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Paginated list of user events */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["UserEventListResponse"];
-                    };
-                };
-                /** @description Invalid pagination parameters */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description User not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/users/{address}/export": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Export transaction history for tax and accounting
-         * @description Generates CSV or JSON export of stream transactions for QuickBooks, Xero, CoinTracker, etc.
-         */
-        get: {
-            parameters: {
-                query?: {
-                    /** @description Export format */
-                    format?: "csv" | "json";
-                    /** @description Filter by transaction direction */
-                    direction?: "incoming" | "outgoing" | "all";
-                    /** @description Start date (ISO 8601 or Unix timestamp) */
-                    startDate?: string;
-                    /** @description End date (ISO 8601 or Unix timestamp) */
-                    endDate?: string;
-                    /** @description Filter by specific token contract */
-                    tokenAddress?: string;
-                };
-                header?: never;
-                path: {
-                    /** @description Stellar public key */
-                    address: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Transaction export file */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "text/csv": string;
-                        "application/json": Record<string, never>;
-                    };
-                };
-                /** @description Invalid parameters */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description User not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/tokens": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List verified token metadata
-         * @description Returns symbol, name, decimals, contract address and icon for every
-         *     verified Stellar asset. The response carries an `ETag` and a
-         *     `Cache-Control` header; clients should revalidate with
-         *     `If-None-Match` and accept a `304 Not Modified` while the metadata is
-         *     unchanged.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Verified token metadata */
-                200: {
-                    headers: {
-                        /** @description public, max-age=3600, stale-while-revalidate=86400 */
-                        "Cache-Control"?: string;
-                        ETag?: string;
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            tokens?: Record<string, never>[];
-                            /** Format: date-time */
-                            updatedAt?: string;
-                        };
-                    };
-                };
-                /** @description Not Modified - the caller's cached copy is still current */
-                304: {
                     headers: {
                         [name: string]: unknown;
                     };
@@ -862,7 +155,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/streams": {
+    "/v1/admin/indexer/backfill": {
         parameters: {
             query?: never;
             header?: never;
@@ -870,1115 +163,16 @@ export interface paths {
             cookie?: never;
         };
         /**
-         * List payment streams
-         * @description Retrieve a list of payment streams with optional filtering, sorting, and pagination.
+         * List backfill jobs
+         * @description Returns a paginated list of backfill jobs, optionally filtered by status.
          */
         get: {
             parameters: {
                 query?: {
-                    /** @description Filter by sender public key */
-                    sender?: string;
-                    /** @description Filter by recipient public key */
-                    recipient?: string;
-                    /** @description Filter by stream status */
-                    status?: "active" | "cancelled" | "completed" | "paused";
-                    /** @description Filter by token contract address */
-                    token?: string;
-                    /** @description Sort field */
-                    sort?: "createdAt" | "startTime" | "lastUpdateTime" | "depositedAmount" | "endTime";
-                    /** @description Sort order */
-                    order?: "asc" | "desc";
-                    /** @description Max results per page (capped at 100) */
-                    limit?: number;
-                    /** @description Number of results to skip */
-                    offset?: number;
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Paginated list of streams */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["StreamListResponse"];
-                    };
-                };
-                /** @description Invalid status or pagination parameters */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        /**
-         * Create a new payment stream
-         * @description Creates or reactivates a payment stream record for the authenticated wallet. The authenticated wallet must be the stream sender.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /**
-                         * @description On-chain stream ID
-                         * @example 1
-                         */
-                        streamId: number;
-                        /**
-                         * @description Sender Stellar public key — must match the authenticated wallet
-                         * @example GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA
-                         */
-                        sender: string;
-                        /**
-                         * @description Recipient Stellar public key
-                         * @example GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD
-                         */
-                        recipient: string;
-                        /**
-                         * @description Token contract address
-                         * @example CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE
-                         */
-                        tokenAddress: string;
-                        /**
-                         * @description Payment rate per second (i128 as string)
-                         * @example 100
-                         */
-                        ratePerSecond: string;
-                        /**
-                         * @description Total deposited amount (i128 as string)
-                         * @example 10000
-                         */
-                        depositedAmount: string;
-                        /**
-                         * @description Stream start time (Unix timestamp)
-                         * @example 1708531200
-                         */
-                        startTime: number;
-                    };
-                };
-            };
-            responses: {
-                /** @description Stream created successfully */
-                201: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Stream"];
-                    };
-                };
-                /** @description Invalid input data */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - sender does not match the authenticated wallet, or stream is owned by another wallet */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Too Many Requests - rate limit exceeded (10 requests per minute) */
-                429: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/simulate": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Simulate a stream contract call
-         * @description Runs a Soroban `simulateTransaction` for the requested action and
-         *     returns an unsigned transaction with the ledger footprint, resource
-         *     limits and a padded resource fee already applied — ready for a
-         *     browser wallet (Freighter, Lobstr, xBull) to sign.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /**
-                         * @example create
-                         * @enum {string}
-                         */
-                        action: "create" | "withdraw" | "cancel" | "top_up" | "batch_withdraw";
-                        /**
-                         * @description Stellar account that will sign the transaction
-                         * @example GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
-                         */
-                        senderPublicKey: string;
-                        /**
-                         * @description Action-specific arguments. `create` needs `recipient`,
-                         *     `amount`, `duration` and `tokenAddress`; `withdraw` and
-                         *     `cancel` need `streamId`; `top_up` needs `streamId` and
-                         *     `amount`; `batch_withdraw` needs `streamIds`.
-                         */
-                        params?: {
-                            /** @example 123 */
-                            streamId?: string;
-                            streamIds?: string[];
-                            /** @example GBBJ6H3FJN34VLIGNU2QZJ4T6NMY4B2LKCVYGCXK5HO3JFXKHTGSHRQ */
-                            recipient?: string;
-                            /**
-                             * @description Amount in the token's smallest unit (i128 as string)
-                             * @example 1000000000
-                             */
-                            amount?: string;
-                            /**
-                             * @description Stream duration in seconds
-                             * @example 2592000
-                             */
-                            duration?: number;
-                            /** @description Token contract address — required for `create` */
-                            tokenAddress?: string;
-                        };
-                    };
-                };
-            };
-            responses: {
-                /** @description Simulation succeeded */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @example true */
-                            success?: boolean;
-                            data?: {
-                                /**
-                                 * @description Base64-encoded unsigned transaction XDR
-                                 * @example AAAAAB...
-                                 */
-                                unsignedXdr?: string;
-                                /**
-                                 * @description Simulated minimum resource fee in stroops
-                                 * @example 15000
-                                 */
-                                minResourceFee?: string;
-                                /**
-                                 * @description minResourceFee plus a 15% safety buffer
-                                 * @example 17250
-                                 */
-                                recommendedFee?: string;
-                                /** @example 1420500 */
-                                cpuInstructions?: number;
-                                /** @example 524000 */
-                                memoryBytes?: number;
-                                /**
-                                 * @description Last ledger the returned footprint is valid against
-                                 * @example 482910
-                                 */
-                                expiresAtLedger?: number;
-                                /**
-                                 * @description Decoded contract return value (empty string for void returns)
-                                 * @example 100000000
-                                 */
-                                simulatedReturn?: string;
-                            };
-                        };
-                    };
-                };
-                /** @description Invalid parameters or a reverted simulation */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description Stream contract is not configured */
-                503: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/summary/{address}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get user stream summary
-         * @description Aggregate dashboard/profile summary for a wallet address. Cached for 30 seconds.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description Stellar public key */
-                    address: string;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description User stream summary */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["UserStreamSummary"];
-                    };
-                };
-                /** @description Address is required */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get stream details
-         * @description Returns a single stream. Falls back to live on-chain data when the DB record is missing or stale.
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Stream details */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Stream"];
-                    };
-                };
-                /** @description Invalid streamId parameter */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get stream events
-         * @description Retrieve events for a specific stream with pagination, filtering, and sorting.
-         */
-        get: {
-            parameters: {
-                query?: {
-                    /** @description Number of events to return per page (default: 50, max: 200) */
-                    limit?: number;
-                    /** @description Number of events to skip (default: 0) */
-                    offset?: number;
-                    /** @description Filter events by type */
-                    eventType?: "CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED" | "FEE_CONFIG_UPDATED" | "ADMIN_TRANSFERRED";
-                    /** @description 1-based page index (offset based). Ignored when `cursor` is set. */
-                    page?: number;
-                    /** @description Event id cursor for stable pagination (hasMore-aware). Ignored when `offset` is set. */
-                    cursor?: string;
-                    /** @description Sort order by timestamp (default: desc) */
-                    order?: "asc" | "desc";
-                };
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Paginated stream events */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["StreamEventListResponse"];
-                    };
-                };
-                /** @description Invalid request parameters */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/claimable": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get actionable claimable amount for a stream
-         * @description Returns the amount claimable right now (or at an optional timestamp). Uses a 5s-cached computation, with an on-chain fallback when the record is missing or stale.
-         */
-        get: {
-            parameters: {
-                query?: {
-                    /** @description Optional Unix timestamp (seconds) to compute the claimable amount at */
-                    at?: number;
-                };
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Claimable amount */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["ClaimableResponse"];
-                    };
-                };
-                /** @description Invalid streamId or `at` parameter */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/pause": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Pause a payment stream
-         * @description Pause an active stream. Only the sender can pause their own stream.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Stream paused successfully */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PauseResumeResponse"];
-                    };
-                };
-                /** @description Invalid streamId, or on-chain pause simulation failed */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - caller is not the stream sender */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Conflict - stream already paused or inactive */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/resume": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Resume a paused payment stream
-         * @description Resume a paused stream. Only the sender can resume their own stream.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Stream resumed successfully */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["PauseResumeResponse"];
-                    };
-                };
-                /** @description Invalid streamId, or on-chain resume simulation failed */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - caller is not the stream sender */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Conflict - stream not paused or inactive */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/withdraw": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Withdraw claimable balance from a payment stream
-         * @description Withdraws the currently claimable amount. Only the recipient can withdraw.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Withdrawal submitted successfully */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["WithdrawResponse"];
-                    };
-                };
-                /** @description Invalid streamId or contract revert */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - caller is not the stream recipient */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Conflict - no claimable balance available */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/top-up": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Top up a payment stream
-         * @description Adds additional funds to an existing active stream. Only the original sender can top up.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /**
-                         * @description Amount to add to the stream deposit (i128 as string)
-                         * @example 5000
-                         */
-                        amount: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description Stream topped up successfully */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["TopUpResponse"];
-                    };
-                };
-                /** @description Invalid request — amount missing or not a positive integer string */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - caller is not the stream sender */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Conflict - stream inactive or paused */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/streams/{streamId}/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Cancel an active payment stream
-         * @description Cancels an active payment stream on the Stellar network.
-         *     Only the original sender can cancel the stream.
-         *     Accrued tokens are sent to the recipient, and the remainder is refunded to the sender.
-         */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path: {
-                    /** @description On-chain stream ID */
-                    streamId: number;
-                };
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Stream cancelled successfully */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["CancelResponse"];
-                    };
-                };
-                /** @description Invalid streamId or transaction simulation failed */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - only sender can cancel */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream not found */
-                404: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Stream already cancelled or completed */
-                409: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/events": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * List stream events for a wallet (paginated, filterable)
-         * @description Returns a reverse-chronological list of stream events where the wallet
-         *     was either the sender or recipient. Supports event-type filtering and
-         *     limit/offset pagination — used by the frontend activity timeline.
-         */
-        get: {
-            parameters: {
-                query: {
-                    /** @description Stellar public key (G...) */
-                    address: string;
-                    /**
-                     * @description Comma-separated list of event types to include. Allowed values:
-                     *     CREATED, TOPPED_UP, WITHDRAWN, CANCELLED, COMPLETED, PAUSED,
-                     *     RESUMED, FEE_COLLECTED, FEE_CONFIG_UPDATED, ADMIN_TRANSFERRED.
-                     */
-                    type?: string;
+                    /** @description Filter by job status */
+                    status?: "PENDING" | "RUNNING" | "PAUSED" | "COMPLETED" | "FAILED" | "CANCELLED";
                     limit?: number;
                     offset?: number;
-                    /** @description Optional 1-based page index. Ignored when offset is set. */
-                    page?: number;
-                    /** @description When true, each event includes its related `stream`. */
-                    includeStream?: boolean;
                 };
                 header?: never;
                 path?: never;
@@ -1986,551 +180,71 @@ export interface paths {
             };
             requestBody?: never;
             responses: {
-                /** @description Paginated event list */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["EventListResponse"];
-                    };
-                };
-                /** @description Missing/invalid `address` or invalid `type` filter */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - `address` must match the authenticated wallet */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/events/subscribe": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Subscribe to real-time stream events
-         * @description Establishes a Server-Sent Events (SSE) connection for real-time updates.
-         *
-         *     **Reconnection Strategy:**
-         *     - Browser automatically reconnects with exponential backoff
-         *     - Initial retry: 1s, max: 30s
-         *     - Client should implement custom reconnection logic for production
-         *
-         *     **Event Types:**
-         *     - `stream.created` - New stream created
-         *     - `stream.topped_up` - Stream received additional funds
-         *     - `stream.withdrawn` - Funds withdrawn from stream
-         *     - `stream.cancelled` - Stream cancelled
-         *     - `stream.completed` - Stream completed
-         *
-         *     **Sandbox Mode:**
-         *     - Add header `X-Sandbox-Mode: true` or query parameter `?sandbox=true`
-         *     - Sandbox events are clearly marked with `_sandbox` metadata
-         *     - Sandbox events are isolated from production events
-         */
-        get: {
-            parameters: {
-                query?: {
-                    /** @description Enable sandbox mode via query parameter */
-                    sandbox?: "true" | "1";
-                    /**
-                     * @description Array of stream IDs to subscribe to
-                     * @example [
-                     *       "1",
-                     *       "2"
-                     *     ]
-                     */
-                    streams?: string[];
-                    /**
-                     * @description Array of user public keys to subscribe to
-                     * @example [
-                     *       "GABC...",
-                     *       "GDEF..."
-                     *     ]
-                     */
-                    users?: string[];
-                    /**
-                     * @description Subscribe to all events
-                     * @example false
-                     */
-                    all?: boolean;
-                };
-                header?: {
-                    /** @description Enable sandbox mode for testing */
-                    "X-Sandbox-Mode"?: "true" | "1";
-                };
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description SSE connection established. Events are emitted as `data:` frames of type stream.created, stream.topped_up, stream.withdrawn, stream.cancelled, stream.completed, stream.paused, stream.resumed, fee.collected. */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "text/event-stream": string;
-                    };
-                };
-                /** @description Invalid subscription parameters */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/events/stats": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Get SSE connection statistics
-         * @description Returns current SSE connection metrics for monitoring (admin only)
-         */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Connection statistics */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["SseStats"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - admin access required */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/auth/challenge": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Request a sign challenge for wallet authentication */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        /** @example GABC... */
-                        publicKey: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description Challenge nonce issued */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AuthChallengeResponse"];
-                    };
-                };
-                /** @description Invalid publicKey */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Too many requests */
-                429: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/auth/verify": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Verify signed challenge and receive JWT */
-        post: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody: {
-                content: {
-                    "application/json": {
-                        publicKey: string;
-                        /** @description Base64-encoded XDR signed transaction containing the nonce */
-                        signedTransaction: string;
-                    };
-                };
-            };
-            responses: {
-                /** @description JWT token */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["AuthVerifyResponse"];
-                    };
-                };
-                /** @description Missing publicKey or signedTransaction */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Invalid signature or expired challenge */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Too many requests */
-                429: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/admin/metrics": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Protocol health metrics */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Protocol health metrics */
+                /** @description Paginated list of backfill jobs */
                 200: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
                         "application/json": {
-                            total_streams?: number;
-                            active_streams?: number;
-                            paused_streams?: number;
-                            completed_streams?: number;
-                            cancelled_streams?: number;
-                            /** @description Sum of withdrawn amounts (i128 as string) */
-                            total_volume_streamed?: string;
-                            streams?: {
-                                active?: number;
-                                paused?: number;
-                                total?: number;
-                                byStatus?: {
-                                    [key: string]: number;
-                                };
-                            };
-                            events?: {
-                                last24h?: number;
-                            };
-                            fees?: {
-                                totalFeesCollectedByToken?: {
-                                    [key: string]: string;
-                                };
-                                feesLast24h?: {
-                                    [key: string]: string;
-                                };
-                            };
-                            sse?: {
-                                activeConnections?: number;
-                            };
-                            indexer?: {
-                                lastLedger?: number;
-                                lagSeconds?: number | null;
+                            jobs?: {
                                 /** Format: date-time */
-                                lastUpdated?: string | null;
-                                eventsProcessed?: number;
+                                completedAt?: string | null;
+                                /** Format: date-time */
+                                createdAt?: string;
+                                currentLedger?: number;
+                                errorMessage?: string | null;
                                 eventsFailed?: number;
-                                lastErrorAt?: string | null;
-                                degraded?: boolean;
-                            };
-                            cache?: {
-                                [key: string]: unknown;
-                            };
-                            pgPool?: {
-                                [key: string]: unknown;
-                            };
-                            uptime?: number;
-                            /** Format: date-time */
-                            timestamp?: string;
-                            /** Format: date-time */
-                            calculatedAt?: string;
+                                eventsProcessed?: number;
+                                fromLedger?: number;
+                                id?: string;
+                                name?: string | null;
+                                /** Format: date-time */
+                                startedAt?: string | null;
+                                status?: string;
+                                toLedger?: number;
+                                /** Format: date-time */
+                                updatedAt?: string;
+                            }[];
+                            limit?: number;
+                            offset?: number;
+                            total?: number;
                         };
                     };
                 };
-                /** @description Unauthorized - missing or invalid authentication token */
+                /** @description Unauthorized */
                 401: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
+                    content?: never;
                 };
                 /** @description Forbidden - admin access required */
                 403: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
+                    content?: never;
                 };
             };
         };
         put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/admin/indexer/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Get indexer status */
-        get: {
-            parameters: {
-                query?: never;
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Indexer status */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            [key: string]: unknown;
-                        };
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - admin access required */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/admin/indexer/reset": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Reset indexer lastProcessedLedger (supports dry-run preview) */
+        /**
+         * Start a new bounded historical backfill job
+         * @description Creates and starts a backfill job that processes events in the ledger range
+         *     [fromLedger, toLedger] independently of the live indexer cursor. The job runs
+         *     asynchronously and its progress can be tracked via GET /backfill/:id.
+         *
+         *     Duplicate protection: The same unique constraint on StreamEvent
+         *     (transactionHash + eventType) that protects the live indexer also protects
+         *     backfill jobs. Events already indexed will be skipped without error.
+         *
+         *     Concurrency: Only one running/pending backfill job per overlapping ledger
+         *     range is allowed. Returns 409 if an overlapping job exists.
+         */
         post: {
             parameters: {
-                query?: {
-                    /** @description If true, return the projected reset scope without mutating state. */
-                    dryRun?: boolean;
-                };
+                query?: never;
                 header?: never;
                 path?: never;
                 cookie?: never;
@@ -2538,147 +252,383 @@ export interface paths {
             requestBody: {
                 content: {
                     "application/json": {
-                        ledger: number;
+                        /** @description Inclusive start ledger sequence */
+                        fromLedger: number;
+                        /** @description Optional human-readable name for the backfill job */
+                        name?: string;
+                        /** @description Inclusive end ledger sequence */
+                        toLedger: number;
                     };
                 };
             };
             responses: {
-                /** @description Reset successful */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": {
-                            /** @example true */
-                            ok?: boolean;
-                            lastLedger?: number;
-                        };
-                    };
-                };
-                /** @description Invalid ledger value */
-                400: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Unauthorized - missing or invalid authentication token */
-                401: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Forbidden - admin access required */
-                403: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-                /** @description Internal server error */
-                500: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
-                };
-            };
-        };
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/v1/admin/indexer/replay": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Replay events from a given ledger (supports dry-run preview) */
-        post: {
-            parameters: {
-                query: {
-                    from_ledger: number;
-                    /** @description If true, return the projected replay scope without mutating state. */
-                    dryRun?: boolean;
-                };
-                header?: never;
-                path?: never;
-                cookie?: never;
-            };
-            requestBody?: never;
-            responses: {
-                /** @description Dry-run preview of the replay scope */
-                200: {
-                    headers: {
-                        [name: string]: unknown;
-                    };
-                    content?: never;
-                };
-                /** @description Replay started */
+                /** @description Backfill job created and started */
                 202: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content: {
                         "application/json": {
+                            id?: string;
+                            message?: string;
                             /** @example true */
                             ok?: boolean;
-                            replayingFrom?: number;
-                            requestId?: string;
+                            /** @enum {string} */
+                            status?: "PENDING" | "RUNNING" | "PAUSED" | "COMPLETED" | "FAILED" | "CANCELLED";
                         };
                     };
                 };
-                /** @description Invalid from_ledger value */
+                /** @description Invalid ledger range */
                 400: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
+                    content?: never;
                 };
-                /** @description Unauthorized - missing or invalid authentication token */
+                /** @description Unauthorized */
                 401: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
-                    };
+                    content?: never;
                 };
                 /** @description Forbidden - admin access required */
                 403: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
+                    content?: never;
+                };
+                /** @description Overlapping backfill job already running */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
                     };
+                    content?: never;
                 };
                 /** @description Internal server error */
                 500: {
                     headers: {
                         [name: string]: unknown;
                     };
-                    content: {
-                        "application/json": components["schemas"]["Error"];
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/backfill/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get backfill job status and progress
+         * @description Returns detailed progress information for a backfill job, including
+         *     percentage complete, ledgers remaining, and estimated completion time.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Backfill job progress */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
                     };
+                    content: {
+                        "application/json": {
+                            /** Format: date-time */
+                            estimatedCompletionAt?: string | null;
+                            job?: {
+                                /** Format: date-time */
+                                completedAt?: string | null;
+                                /** Format: date-time */
+                                createdAt?: string;
+                                currentLedger?: number;
+                                errorMessage?: string | null;
+                                eventsFailed?: number;
+                                eventsProcessed?: number;
+                                fromLedger?: number;
+                                id?: string;
+                                name?: string | null;
+                                /** Format: date-time */
+                                startedAt?: string | null;
+                                status?: string;
+                                toLedger?: number;
+                                /** Format: date-time */
+                                updatedAt?: string;
+                            };
+                            ledgersRemaining?: number;
+                            percentComplete?: number;
+                        };
+                    };
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Backfill job not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/backfill/{id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel a backfill job
+         * @description Cancels a pending, running, or paused backfill job. Cannot cancel a
+         *     completed or already cancelled job.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Job cancelled */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            job?: {
+                                id?: string;
+                                status?: string;
+                            };
+                            /** @example true */
+                            ok?: boolean;
+                        };
+                    };
+                };
+                /** @description Job cannot be cancelled (already completed/cancelled) */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Backfill job not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/backfill/{id}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Pause a running backfill job
+         * @description Pauses a running backfill job. The job will finish processing the current
+         *     batch before pausing. Progress is preserved and can be resumed later.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Job paused */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            job?: {
+                                id?: string;
+                                status?: string;
+                            };
+                            /** @example true */
+                            ok?: boolean;
+                        };
+                    };
+                };
+                /** @description Job cannot be paused (not in RUNNING state) */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Backfill job not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/backfill/{id}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resume a paused backfill job
+         * @description Resumes a paused backfill job from where it left off.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Job resumed */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            job?: {
+                                id?: string;
+                                status?: string;
+                            };
+                            /** @example true */
+                            ok?: boolean;
+                        };
+                    };
+                };
+                /** @description Job cannot be resumed (not in PAUSED state) */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Backfill job not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
                 };
             };
         };
@@ -2794,6 +744,68 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/v1/admin/indexer/dead-letter/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Permanently discard a quarantined event
+         * @description Deletes an unrecoverable record. The discard is written to the
+         *     application log with the acting admin key so the loss of an on-chain
+         *     event remains auditable.
+         */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Record discarded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Dead-letter event not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/admin/indexer/dead-letter/{id}/replay": {
         parameters: {
             query?: never;
@@ -2864,7 +876,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/v1/admin/indexer/dead-letter/{id}": {
+    "/v1/admin/indexer/replay": {
         parameters: {
             query?: never;
             header?: never;
@@ -2873,25 +885,1580 @@ export interface paths {
         };
         get?: never;
         put?: never;
+        /** Replay events from a given ledger (supports dry-run preview) */
+        post: {
+            parameters: {
+                query: {
+                    from_ledger: number;
+                    /** @description If true, return the projected replay scope without mutating state. */
+                    dryRun?: boolean;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Dry-run preview of the replay scope */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Replay started */
+                202: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @example true */
+                            ok?: boolean;
+                            replayingFrom?: number;
+                            requestId?: string;
+                        };
+                    };
+                };
+                /** @description Invalid from_ledger value */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Unauthorized - missing or invalid authentication token */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset indexer lastProcessedLedger (supports dry-run preview) */
+        post: {
+            parameters: {
+                query?: {
+                    /** @description If true, return the projected reset scope without mutating state. */
+                    dryRun?: boolean;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        ledger: number;
+                    };
+                };
+            };
+            responses: {
+                /** @description Reset successful */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            lastLedger?: number;
+                            /** @example true */
+                            ok?: boolean;
+                        };
+                    };
+                };
+                /** @description Invalid ledger value */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Unauthorized - missing or invalid authentication token */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/indexer/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get indexer status */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Indexer status */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+                /** @description Unauthorized - missing or invalid authentication token */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/admin/metrics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Protocol health metrics */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Protocol health metrics */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            active_streams?: number;
+                            cache?: {
+                                [key: string]: unknown;
+                            };
+                            /** Format: date-time */
+                            calculatedAt?: string;
+                            cancelled_streams?: number;
+                            completed_streams?: number;
+                            events?: {
+                                last24h?: number;
+                            };
+                            fees?: {
+                                feesLast24h?: {
+                                    [key: string]: string;
+                                };
+                                totalFeesCollectedByToken?: {
+                                    [key: string]: string;
+                                };
+                            };
+                            indexer?: {
+                                degraded?: boolean;
+                                eventsFailed?: number;
+                                eventsProcessed?: number;
+                                lagSeconds?: number | null;
+                                lastErrorAt?: string | null;
+                                lastLedger?: number;
+                                /** Format: date-time */
+                                lastUpdated?: string | null;
+                            };
+                            paused_streams?: number;
+                            pgPool?: {
+                                [key: string]: unknown;
+                            };
+                            sse?: {
+                                activeConnections?: number;
+                            };
+                            streams?: {
+                                active?: number;
+                                byStatus?: {
+                                    [key: string]: number;
+                                };
+                                paused?: number;
+                                total?: number;
+                            };
+                            /** Format: date-time */
+                            timestamp?: string;
+                            total_streams?: number;
+                            /** @description Sum of withdrawn amounts (i128 as string) */
+                            total_volume_streamed?: string;
+                            uptime?: number;
+                        };
+                    };
+                };
+                /** @description Unauthorized - missing or invalid authentication token */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Forbidden - admin access required */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/defillama": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
         /**
-         * Permanently discard a quarantined event
-         * @description Deletes an unrecoverable record. The discard is written to the
-         *     application log with the acting admin key so the loss of an on-chain
-         *     event remains auditable.
+         * DefiLlama protocol-TVL adapter response
+         * @description Returns a standardised DefiLlama TVL adapter object. Cache metadata
+         *     is attached additively under `meta` so existing DefiLlama consumers
+         *     are unaffected.
          */
-        delete: {
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Stellar network scope (omit for default) */
+                    network?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description DefiLlama adapter response */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid network parameter */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Analytics unavailable */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/historical": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Pre-aggregated time-series data for frontend charts */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Lookback window */
+                    period?: "7d" | "30d" | "90d" | "1y";
+                    /** @description Bucket size */
+                    interval?: "1h" | "1d";
+                    /** @description Stellar network scope (omit for default) */
+                    network?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Time-series analytics data */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            data?: Record<string, never>[];
+                            meta?: Record<string, never>;
+                            success?: boolean;
+                        };
+                    };
+                };
+                /** @description Invalid period, interval, or network parameter */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Analytics unavailable */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/analytics/tvl": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Current protocol TVL partitioned by token asset
+         * @description Returns the current Total Value Locked (TVL) for the FlowFi protocol,
+         *     broken down by token asset. Responses include cache metadata so clients
+         *     can observe the staleness contract.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Stellar network scope (omit for default) */
+                    network?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Current TVL snapshot */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            data?: Record<string, never>;
+                            meta?: {
+                                cached?: boolean;
+                                /** Format: date-time */
+                                generatedAt?: string;
+                                source?: string;
+                            };
+                            success?: boolean;
+                        };
+                    };
+                };
+                /** @description Invalid network parameter */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Analytics unavailable */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/challenge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Request a sign challenge for wallet authentication */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /**
+                         * @description Optional intended audience for the challenge. Defaults to the server-configured audience when omitted.
+                         * @example app.example.com
+                         */
+                        audience?: string;
+                        /**
+                         * @description Optional Stellar network binding (e.g. "testnet", "public"). Defaults to the server-configured network when omitted.
+                         * @example testnet
+                         */
+                        network?: string;
+                        /** @example GABC... */
+                        publicKey: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Challenge nonce issued. The response echoes the effective audience and network the challenge is bound to. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AuthChallengeResponse"];
+                    };
+                };
+                /** @description Invalid publicKey, audience, or network */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Too many requests */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/auth/verify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Verify signed challenge and receive JWT */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @description Optional audience the challenge was requested for. Must match the audience bound at challenge issuance. */
+                        audience?: string;
+                        /** @description Optional network the challenge was requested for. Must match the network bound at challenge issuance. */
+                        network?: string;
+                        publicKey: string;
+                        /** @description Base64-encoded XDR signed transaction containing the nonce */
+                        signedTransaction: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description JWT token */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["AuthVerifyResponse"];
+                    };
+                };
+                /** @description Missing or malformed publicKey, signedTransaction, audience, or network */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Invalid signature, expired challenge, reused (already consumed) challenge, or challenge bound to a different wallet, audience, or network than the one presented. */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+                /** @description Too many requests */
+                429: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Error"];
+                    };
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/events/subscribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Open an SSE stream for real-time payment events
+         * @description Opens a persistent Server-Sent Events (SSE) connection. Requires a
+         *     valid ticket obtained from `POST /v1/events/ticket`. The connection
+         *     streams events for the subscriptions encoded in the ticket.
+         *
+         *     **Note:** This endpoint keeps the connection open; use
+         *     `curl -N --no-buffer` or a browser `EventSource` to consume it.
+         */
+        get: {
+            parameters: {
+                query: {
+                    /** @description Signed SSE ticket from POST /v1/events/ticket */
+                    ticket: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description SSE stream opened (text/event-stream) */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "text/event-stream": string;
+                    };
+                };
+                /** @description Missing, invalid, or expired ticket */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Server is shutting down */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/events/ticket": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue a short-lived SSE subscription ticket
+         * @description Issues a signed, short-lived ticket (60 s) that authorises the holder
+         *     to open one SSE connection via `GET /v1/events/subscribe`. The ticket
+         *     is scoped to the streams and users the authenticated wallet owns.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: {
+                content: {
+                    "application/json": {
+                        /** @description Subscribe to all streams owned by the authenticated wallet */
+                        all?: boolean;
+                        /** @description Specific stream IDs to subscribe to (max 500) */
+                        streams?: string[];
+                        /** @description Wallet public keys to subscribe to (max 500) */
+                        users?: string[];
+                    };
+                };
+            };
+            responses: {
+                /** @description Signed SSE ticket */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            ticket?: string;
+                        };
+                    };
+                };
+                /** @description Invalid subscription parameters */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List streams
+         * @description Returns a paginated list of streams optionally filtered by sender,
+         *     recipient, status, or token address.
+         */
+        get: {
+            parameters: {
+                query?: {
+                    sender?: string;
+                    recipient?: string;
+                    status?: "active" | "cancelled" | "completed" | "paused";
+                    token?: string;
+                    sort?: string;
+                    order?: "asc" | "desc";
+                    limit?: number;
+                    offset?: number;
+                    cursor?: string;
+                };
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Paginated stream list */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["StreamListResponse"];
+                    };
+                };
+                /** @description Invalid query parameters */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        /**
+         * Register an on-chain stream in the backend index
+         * @description Creates a DB projection for a stream that has already been confirmed
+         *     on-chain. Rejects requests where the provided parameters do not match
+         *     the on-chain state.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": components["schemas"]["CreateStreamRequest"];
+                };
+            };
+            responses: {
+                /** @description Stream registered */
+                201: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Validation error */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description On-chain state mismatch */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/simulate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Simulate a stream contract call
+         * @description Runs a Soroban `simulateTransaction` for the requested action and
+         *     returns an unsigned transaction with the ledger footprint, resource
+         *     limits and a padded resource fee already applied — ready for a
+         *     browser wallet (Freighter, Lobstr, xBull) to sign.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: {
+                    /**
+                     * @description Optional client-generated key. Retries carrying the same key and an
+                     *     identical body replay the original response instead of re-running
+                     *     the simulation. Reusing a key with a different body is rejected
+                     *     with 409 `idempotency_key_reuse`.
+                     */
+                    "Idempotency-Key"?: string;
+                };
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        action: "create" | "withdraw" | "cancel" | "top_up" | "batch_withdraw";
+                        params?: Record<string, never>;
+                        senderPublicKey: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Simulation succeeded */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid parameters or a reverted simulation */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Idempotency key reused with a different request payload */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream contract is not configured */
+                503: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/users/{address}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get aggregate stream statistics for a wallet address */
+        get: {
             parameters: {
                 query?: never;
                 header?: never;
                 path: {
-                    id: string;
+                    address: string;
                 };
                 cookie?: never;
             };
             requestBody?: never;
             responses: {
-                /** @description Record discarded */
+                /** @description User stream summary */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid address */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a single stream by ID */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    streamId: number;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Stream record */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["Stream"];
+                    };
+                };
+                /** @description Invalid streamId */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel an active payment stream
+         * @description Cancels an active payment stream on the Stellar network.
+         *     Only the original sender can cancel the stream.
+         *     Accrued tokens are sent to the recipient, and the remainder is refunded to the sender.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description On-chain stream ID */
+                    streamId: number;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Stream cancelled successfully */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            /** @example CANCELLED */
+                            status?: string;
+                            txHash?: string;
+                        };
+                    };
+                };
+                /** @description Forbidden - only sender can cancel */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream already cancelled or completed */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/claimable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get claimable balance for a stream */
+        get: {
+            parameters: {
+                query?: {
+                    /** @description Unix timestamp to calculate claimable amount at */
+                    at?: number;
+                };
+                header?: never;
+                path: {
+                    streamId: number;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Claimable amount */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid parameters */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List events for a stream */
+        get: {
+            parameters: {
+                query?: {
+                    limit?: number;
+                    offset?: number;
+                    cursor?: string;
+                    order?: "asc" | "desc";
+                    eventType?: string;
+                };
+                header?: never;
+                path: {
+                    streamId: number;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Paginated event list */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid parameters */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/pause": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Pause a running stream */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: never;
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/resume": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume a paused stream */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: never;
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/top-up": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Add tokens to a running stream */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: never;
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/streams/{streamId}/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Withdraw claimable balance from a payment stream
+         * @description Withdraws the currently claimable amount. Only the recipient can withdraw.
+         */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description On-chain stream ID */
+                    streamId: number;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Withdrawal submitted successfully */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["WithdrawResponse"];
+                    };
+                };
+                /** @description Invalid streamId or contract revert */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized - missing or invalid authentication */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Forbidden - caller is not the stream recipient */
+                403: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Stream not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Conflict - no claimable balance available */
+                409: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Internal server error */
+                500: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List verified token metadata
+         * @description Returns symbol, name, decimals, contract address and icon for every
+         *     verified Stellar asset. The response carries an `ETag` and a
+         *     `Cache-Control` header; clients should revalidate with
+         *     `If-None-Match` and accept a `304 Not Modified` while the metadata is
+         *     unchanged.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Verified token metadata */
+                200: {
+                    headers: {
+                        /** @description public, max-age=3600, stale-while-revalidate=86400 */
+                        "Cache-Control"?: string;
+                        ETag?: string;
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            tokens?: Record<string, never>[];
+                            /** Format: date-time */
+                            updatedAt?: string;
+                        };
+                    };
+                };
+                /** @description Not Modified - the caller's cached copy is still current */
+                304: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/users/{address}/streams/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Aggregate stream statistics for a wallet address
+         * @description Returns counts, totals, and claimable balance aggregated across all
+         *     streams where the address is sender or recipient. Results are cached
+         *     for 30 seconds. When a wallet has more than 500 streams in either
+         *     direction the response includes `truncated: true`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    /** @description Stellar wallet public key (G...) */
+                    address: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description User stream summary */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": {
+                            activeIncomingCount?: number;
+                            activeOutgoingCount?: number;
+                            address?: string;
+                            /** @description Currently claimable balance across all incoming streams (i128 as string) */
+                            currentClaimable?: string;
+                            /** @description Total amount received from incoming streams (i128 as string) */
+                            totalStreamedIn?: string;
+                            /** @description Total amount withdrawn from outgoing streams (i128 as string) */
+                            totalStreamedOut?: string;
+                            totalStreamsCreated?: number;
+                            /** @description Present and true when the stream cap (500) was reached */
+                            truncated?: boolean;
+                        };
+                    };
+                };
+                /** @description Invalid address */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List webhook subscriptions */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description List of webhook subscriptions for the authenticated wallet */
                 200: {
                     headers: {
                         [name: string]: unknown;
@@ -2905,14 +2472,93 @@ export interface paths {
                     };
                     content?: never;
                 };
-                /** @description Forbidden - admin access required */
-                403: {
+            };
+        };
+        put?: never;
+        /** Create a webhook subscription */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody: {
+                content: {
+                    "application/json": {
+                        eventTypes: string[];
+                        /** Format: uri */
+                        targetUrl: string;
+                    };
+                };
+            };
+            responses: {
+                /** @description Webhook subscription created; secret key returned once */
+                201: {
                     headers: {
                         [name: string]: unknown;
                     };
                     content?: never;
                 };
-                /** @description Dead-letter event not found */
+                /** @description Missing required fields */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete a webhook subscription */
+        delete: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Webhook deleted */
+                204: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Webhook not found */
                 404: {
                     headers: {
                         [name: string]: unknown;
@@ -2923,6 +2569,200 @@ export interface paths {
         };
         options?: never;
         head?: never;
+        /** Update a webhook subscription */
+        patch: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Updated webhook subscription */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Invalid request */
+                400: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Webhook not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/deliveries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List delivery attempts for a webhook */
+        get: {
+            parameters: {
+                query?: {
+                    page?: number;
+                    limit?: number;
+                };
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Delivery history */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Webhook not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Regenerate the signing secret for a webhook */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description New secret key */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Webhook not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/webhooks/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Send a test payload to a webhook */
+        post: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path: {
+                    id: string;
+                };
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Test webhook sent */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Unauthorized */
+                401: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+                /** @description Webhook not found */
+                404: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content?: never;
+                };
+            };
+        };
+        delete?: never;
+        options?: never;
+        head?: never;
         patch?: never;
         trace?: never;
     };
@@ -2930,7 +2770,386 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AuthChallengeResponse: {
+            /** @description Unix timestamp (ms) when the challenge expires (60s) */
+            expiresAt: number;
+            /** @description Hex-encoded nonce to sign via a Stellar manage_data operation */
+            nonce: string;
+        };
+        AuthVerifyResponse: {
+            /** @description Token lifetime in seconds (3600) */
+            expiresIn: number;
+            /** @description JWT to use in the Authorization: Bearer header */
+            token: string;
+        };
+        CancelResponse: {
+            /**
+             * @example CANCELLED
+             * @enum {string}
+             */
+            status: "CANCELLED";
+            /** @description Stellar transaction hash of the cancel */
+            txHash: string;
+        };
+        ClaimableResponse: {
+            /** @description Whether the claimable amount is positive */
+            actionable: boolean;
+            /** @description Whether the value came from cache or a fresh computation */
+            cached?: boolean;
+            /** @description Unix timestamp of the calculation */
+            calculatedAt: number;
+            /** @description Amount claimable at the requested time (i128 as string) */
+            claimableAmount: string;
+            /** @description Total deposited amount (i128 as string) */
+            depositedAmount?: string;
+            /** @description Last state update time (Unix timestamp) */
+            lastUpdateTime?: number;
+            /** @description Payment rate per second (i128 as string) */
+            ratePerSecond?: string;
+            /**
+             * @description Where the value was computed from
+             * @enum {string}
+             */
+            source?: "db" | "chain";
+            /** @description Stream start time (Unix timestamp) */
+            startTime?: number;
+            /** @description On-chain stream ID */
+            streamId?: number;
+            /** @description Total withdrawn amount (i128 as string) */
+            withdrawnAmount?: string;
+        };
+        CreateStreamRequest: {
+            /**
+             * @description Initial deposited amount (positive integer as string, i128)
+             * @example 10000
+             */
+            depositedAmount: string;
+            /**
+             * @description Payment rate per second (positive integer as string, i128)
+             * @example 100
+             */
+            ratePerSecond: string;
+            /**
+             * @description Recipient Stellar public key
+             * @example GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD
+             */
+            recipient: string;
+            /**
+             * @description Sender Stellar public key
+             * @example GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA
+             */
+            sender: string;
+            /**
+             * @description Stream start time (Unix timestamp)
+             * @example 1708531200
+             */
+            startTime: number | string;
+            /**
+             * @description On-chain stream ID (non-negative integer)
+             * @example 1
+             */
+            streamId: number | string;
+            /**
+             * @description Token contract address
+             * @example CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE
+             */
+            tokenAddress: string;
+        };
+        /** @description Deprecated alias of ErrorEnvelope, retained for backward compatibility. */
+        Error: components["schemas"]["ErrorEnvelope"];
+        /**
+         * @description Stable, versioned error envelope returned by every REST endpoint on failure.
+         *
+         *     **Version:** `1` (see `error.version`). The envelope is additive and backward compatible:
+         *     existing clients that read `error.code` and `error.message` keep working, while new clients can
+         *     rely on `error.requestId` for correlation and `error.details` for structured validation issues.
+         *
+         *     **Guarantees:**
+         *     - `error.code` is a stable, machine-readable identifier (see `ErrorCode`). It never changes meaning within a major version.
+         *     - `error.message` is a safe, human-readable summary. Internal exception text, stack traces, SQL, and
+         *       upstream provider payloads are never exposed.
+         *     - `error.requestId` echoes the `X-Request-Id` response header for log correlation.
+         *     - `error.details` is present for validation failures and lists field-level issues.
+         *
+         *     **Migration:** No breaking change. Clients should switch on `error.code` rather than parsing
+         *     `error.message`. Unknown codes must be treated as generic failures.
+         */
+        ErrorEnvelope: {
+            error: {
+                /**
+                 * @description Stable machine-readable error code
+                 * @example NOT_FOUND
+                 * @enum {string}
+                 */
+                code: "VALIDATION_ERROR" | "UNAUTHORIZED" | "FORBIDDEN" | "NOT_FOUND" | "CONFLICT" | "RATE_LIMITED" | "PAYLOAD_TOO_LARGE" | "UNSUPPORTED_MEDIA_TYPE" | "UPSTREAM_UNAVAILABLE" | "INTERNAL_ERROR";
+                /** @description Structured validation issues when applicable */
+                details?: {
+                    /**
+                     * @description Optional field-level issue code
+                     * @example INVALID_FORMAT
+                     */
+                    code?: string;
+                    /**
+                     * @description Dot-path of the offending field
+                     * @example recipient
+                     */
+                    field: string;
+                    /**
+                     * @description Safe description of the issue
+                     * @example must be a valid Stellar public key
+                     */
+                    message: string;
+                }[];
+                /**
+                 * @description Safe human-readable message; never contains internal exception text
+                 * @example Resource not found
+                 */
+                message: string;
+                /**
+                 * @description Correlation id, also returned in the X-Request-Id response header
+                 * @example 3f1c2b9e-8a4d-4c6e-9f2a-1b7d5e0c9a83
+                 */
+                requestId: string;
+                /**
+                 * @description Error envelope contract version
+                 * @example 1
+                 * @enum {integer}
+                 */
+                version: 1;
+            };
+        };
+        EventListResponse: {
+            /** @description Reverse-chronological stream events for the wallet */
+            events: components["schemas"]["StreamEvent"][];
+            /** @description Whether more results are available past this page */
+            hasMore: boolean;
+            /** @description Page size applied (capped at 200) */
+            limit: number;
+            /** @description Number of events skipped */
+            offset: number;
+            /** @description Total number of matching events */
+            total: number;
+        };
+        HealthResponse: {
+            /** @description Per-subsystem status breakdown */
+            checks: {
+                database?: {
+                    /** @enum {string} */
+                    status?: "ok" | "down";
+                };
+                indexer?: {
+                    enabled?: boolean;
+                    lagSeconds?: number | null;
+                    /** @enum {string} */
+                    status?: "ok" | "degraded" | "disabled";
+                };
+                redis?: {
+                    /** @enum {string} */
+                    status?: "ok" | "unavailable" | "not_configured";
+                };
+                sorobanRpc?: {
+                    /** @enum {string} */
+                    status?: "ok" | "down";
+                };
+            };
+            /**
+             * @example connected
+             * @enum {string}
+             */
+            db: "connected" | "disconnected";
+            /** @description Lifetime count of indexer events that threw during processing */
+            eventsFailed?: number;
+            /** @description Lifetime count of successfully processed indexer events */
+            eventsProcessed?: number;
+            /** @description True when recent event-processing failure rate spikes */
+            indexerDegraded?: boolean;
+            /** @description Whether the event indexer is configured */
+            indexerEnabled: boolean;
+            /** @description Seconds since last indexer update, or null when no state row exists yet */
+            indexerLag?: number | null;
+            /**
+             * Format: date-time
+             * @description Most recent per-event processing failure
+             */
+            lastErrorAt?: string | null;
+            /**
+             * @example ok
+             * @enum {string}
+             */
+            status: "ok" | "degraded";
+            /** @description Server uptime in seconds */
+            uptime: number;
+        };
+        PauseResumeResponse: {
+            stream?: components["schemas"]["Stream"];
+            streamId: number;
+            /** @example true */
+            success: boolean;
+            /** @description Stellar transaction hash of the pause/resume simulation */
+            txHash: string;
+        };
+        SseStats: {
+            /** @example 42 */
+            activeConnections: number;
+            /** @example 8 */
+            activeIps: number;
+            /** @example 10000 */
+            maxConnections: number;
+            /** @example 5 */
+            perIpPeakConnections: number;
+            /** Format: date-time */
+            timestamp: string;
+        };
+        Stream: {
+            /** Format: date-time */
+            createdAt?: string;
+            /**
+             * @description Total deposited amount (i128 as string)
+             * @example 10000
+             */
+            depositedAmount?: string;
+            /**
+             * @description Ledger timestamp when the stream ended (Unix), null if still active
+             * @example null
+             */
+            endTime?: number | null;
+            /**
+             * Format: uuid
+             * @description Database UUID
+             */
+            id: string;
+            /**
+             * @description Stream active status
+             * @example true
+             */
+            isActive?: boolean;
+            /**
+             * @description Whether the stream is currently paused
+             * @example false
+             */
+            isPaused?: boolean;
+            /**
+             * @description Last update time (Unix timestamp)
+             * @example 1708534800
+             */
+            lastUpdateTime?: number;
+            /**
+             * @description Ledger timestamp when the stream was last paused (Unix), null if not paused
+             * @example null
+             */
+            pausedAt?: number | null;
+            /**
+             * @description Payment rate per second (i128 as string)
+             * @example 100
+             */
+            ratePerSecond: string;
+            /**
+             * @description Recipient Stellar public key
+             * @example GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD
+             */
+            recipient: string;
+            /**
+             * @description Sender Stellar public key
+             * @example GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA
+             */
+            sender: string;
+            /**
+             * @description Stream start time (Unix timestamp)
+             * @example 1708531200
+             */
+            startTime?: number;
+            /**
+             * @description On-chain stream ID
+             * @example 1
+             */
+            streamId: number;
+            /**
+             * @description Token contract address
+             * @example CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE
+             */
+            tokenAddress: string;
+            /**
+             * @description Cumulative seconds the stream has spent paused
+             * @example 0
+             */
+            totalPausedDuration?: number;
+            /** Format: date-time */
+            updatedAt?: string;
+            /**
+             * @description Total withdrawn amount (i128 as string)
+             * @example 2500
+             */
+            withdrawnAmount?: string;
+        };
+        StreamEvent: {
+            /**
+             * @description Amount involved in event (i128 as string)
+             * @example 5000
+             */
+            amount?: string | null;
+            /** Format: date-time */
+            createdAt?: string;
+            /**
+             * @description Type of stream event
+             * @example TOPPED_UP
+             * @enum {string}
+             */
+            eventType: "CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED";
+            /** Format: uuid */
+            id: string;
+            /**
+             * @description Ledger sequence number
+             * @example 12345678
+             */
+            ledgerSequence: number;
+            /** @description Additional event data (JSON string) */
+            metadata?: string | null;
+            /** @description Reference to stream ID */
+            streamId: number;
+            /**
+             * @description Event timestamp (Unix)
+             * @example 1708531200
+             */
+            timestamp: number;
+            /**
+             * @description Stellar transaction hash
+             * @example a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6
+             */
+            transactionHash: string;
+        };
+        StreamEventListResponse: {
+            /** @description Events for the stream, sorted by timestamp (tie-broken by id) */
+            data: components["schemas"]["StreamEvent"][];
+            /** @description Whether more results are available past this page */
+            hasMore: boolean;
+            /** @description Total number of events matching the filter */
+            total: number;
+        };
+        StreamListResponse: {
+            /** @description Streams matching the filter, sorted and paginated */
+            data: components["schemas"]["Stream"][];
+            /** @description Whether more results are available past this page */
+            hasMore: boolean;
+            /** @description Page size applied (capped at MAX_STREAM_PAGE_SIZE) */
+            limit: number;
+            /** @description Number of results skipped */
+            offset: number;
+            /** @description Total number of streams matching the filter */
+            total: number;
+        };
+        TopUpResponse: {
+            /** @description New total deposited amount after the top-up (i128 as string) */
+            depositedAmount: string;
+            streamId: number;
+            /** @description Stellar transaction hash */
+            txHash: string;
+        };
         User: {
+            /**
+             * Format: date-time
+             * @description User creation timestamp
+             */
+            createdAt?: string;
             /**
              * Format: uuid
              * @description Unique identifier for the user
@@ -2944,354 +3163,129 @@ export interface components {
             publicKey: string;
             /**
              * Format: date-time
-             * @description User creation timestamp
-             */
-            createdAt?: string;
-            /**
-             * Format: date-time
              * @description Last update timestamp
              */
             updatedAt?: string;
         };
-        Stream: {
-            /**
-             * Format: uuid
-             * @description Database UUID
-             */
-            id: string;
-            /**
-             * @description On-chain stream ID
-             * @example 1
-             */
-            streamId: number;
-            /**
-             * @description Sender Stellar public key
-             * @example GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA
-             */
-            sender: string;
-            /**
-             * @description Recipient Stellar public key
-             * @example GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD
-             */
-            recipient: string;
-            /**
-             * @description Token contract address
-             * @example CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE
-             */
-            tokenAddress: string;
-            /**
-             * @description Payment rate per second (i128 as string)
-             * @example 100
-             */
-            ratePerSecond: string;
-            /**
-             * @description Total deposited amount (i128 as string)
-             * @example 10000
-             */
-            depositedAmount?: string;
-            /**
-             * @description Total withdrawn amount (i128 as string)
-             * @example 2500
-             */
-            withdrawnAmount?: string;
-            /**
-             * @description Stream start time (Unix timestamp)
-             * @example 1708531200
-             */
-            startTime?: number;
-            /**
-             * @description Last update time (Unix timestamp)
-             * @example 1708534800
-             */
-            lastUpdateTime?: number;
-            /**
-             * @description Stream active status
-             * @example true
-             */
-            isActive?: boolean;
-            /**
-             * @description Whether the stream is currently paused
-             * @example false
-             */
-            isPaused?: boolean;
-            /**
-             * @description Ledger timestamp when the stream was last paused (Unix), null if not paused
-             * @example null
-             */
-            pausedAt?: number | null;
-            /**
-             * @description Cumulative seconds the stream has spent paused
-             * @example 0
-             */
-            totalPausedDuration?: number;
-            /**
-             * @description Ledger timestamp when the stream ended (Unix), null if still active
-             * @example null
-             */
-            endTime?: number | null;
-            /** Format: date-time */
-            createdAt?: string;
-            /** Format: date-time */
-            updatedAt?: string;
-        };
-        StreamEvent: {
-            /** Format: uuid */
-            id: string;
-            /** @description Reference to stream ID */
-            streamId: number;
-            /**
-             * @description Type of stream event
-             * @example TOPPED_UP
-             * @enum {string}
-             */
-            eventType: "CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED";
-            /**
-             * @description Amount involved in event (i128 as string)
-             * @example 5000
-             */
-            amount?: string | null;
-            /**
-             * @description Stellar transaction hash
-             * @example a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0u1v2w3x4y5z6
-             */
-            transactionHash: string;
-            /**
-             * @description Ledger sequence number
-             * @example 12345678
-             */
-            ledgerSequence: number;
-            /**
-             * @description Event timestamp (Unix)
-             * @example 1708531200
-             */
-            timestamp: number;
-            /** @description Additional event data (JSON string) */
-            metadata?: string | null;
-            /** Format: date-time */
-            createdAt?: string;
-        };
-        StreamListResponse: {
-            /** @description Streams matching the filter, sorted and paginated */
-            data: components["schemas"]["Stream"][];
-            /** @description Total number of streams matching the filter */
-            total: number;
-            /** @description Whether more results are available past this page */
-            hasMore: boolean;
-            /** @description Page size applied (capped at MAX_STREAM_PAGE_SIZE) */
-            limit: number;
-            /** @description Number of results skipped */
-            offset: number;
-        };
-        StreamEventListResponse: {
-            /** @description Events for the stream, sorted by timestamp (tie-broken by id) */
-            data: components["schemas"]["StreamEvent"][];
-            /** @description Total number of events matching the filter */
-            total: number;
-            /** @description Whether more results are available past this page */
-            hasMore: boolean;
-        };
-        EventListResponse: {
-            /** @description Reverse-chronological stream events for the wallet */
-            events: components["schemas"]["StreamEvent"][];
-            /** @description Total number of matching events */
-            total: number;
-            /** @description Page size applied (capped at 200) */
-            limit: number;
-            /** @description Number of events skipped */
-            offset: number;
-            /** @description Whether more results are available past this page */
-            hasMore: boolean;
-        };
         UserEventListResponse: {
             /** @description Events associated with the user, newest first */
             data: components["schemas"]["StreamEvent"][];
-            /** @description Total number of matching events */
-            total: number;
             /** @description Whether more results are available past this page */
             hasMore: boolean;
             /** @description Page size applied (capped at 200) */
             limit: number;
             /** @description Number of events skipped */
             offset: number;
+            /** @description Total number of matching events */
+            total: number;
         };
         UserStreamSummary: {
+            activeIncomingCount: number;
+            activeOutgoingCount: number;
             /** @description Stellar public key */
             address: string;
-            /** @description Number of streams this wallet sent */
-            totalStreamsCreated: number;
-            /** @description Sum of withdrawn amounts on outgoing streams (i128 as string) */
-            totalStreamedOut: string;
-            /** @description Sum of withdrawn amounts on incoming streams (i128 as string) */
-            totalStreamedIn: string;
             /** @description Total currently claimable across active incoming streams (i128 as string) */
             currentClaimable: string;
-            activeOutgoingCount: number;
-            activeIncomingCount: number;
+            /** @description Sum of withdrawn amounts on incoming streams (i128 as string) */
+            totalStreamedIn: string;
+            /** @description Sum of withdrawn amounts on outgoing streams (i128 as string) */
+            totalStreamedOut: string;
+            /** @description Number of streams this wallet sent */
+            totalStreamsCreated: number;
             /**
              * @description True when the number of streams was capped at MAX_USER_STREAMS per direction
              * @example false
              */
             truncated?: boolean;
         };
-        ClaimableResponse: {
-            /** @description On-chain stream ID */
-            streamId?: number;
-            /** @description Payment rate per second (i128 as string) */
-            ratePerSecond?: string;
-            /** @description Total deposited amount (i128 as string) */
-            depositedAmount?: string;
-            /** @description Total withdrawn amount (i128 as string) */
-            withdrawnAmount?: string;
-            /** @description Stream start time (Unix timestamp) */
-            startTime?: number;
-            /** @description Last state update time (Unix timestamp) */
-            lastUpdateTime?: number;
-            /** @description Amount claimable at the requested time (i128 as string) */
-            claimableAmount: string;
-            /** @description Whether the claimable amount is positive */
-            actionable: boolean;
-            /** @description Unix timestamp of the calculation */
-            calculatedAt: number;
-            /** @description Whether the value came from cache or a fresh computation */
-            cached?: boolean;
-            /**
-             * @description Where the value was computed from
-             * @enum {string}
-             */
-            source?: "db" | "chain";
-        };
-        PauseResumeResponse: {
-            /** @example true */
-            success: boolean;
-            streamId: number;
-            /** @description Stellar transaction hash of the pause/resume simulation */
-            txHash: string;
-            stream?: components["schemas"]["Stream"];
-        };
-        TopUpResponse: {
-            streamId: number;
-            /** @description Stellar transaction hash */
-            txHash: string;
-            /** @description New total deposited amount after the top-up (i128 as string) */
-            depositedAmount: string;
-        };
-        WithdrawResponse: {
-            /** @example true */
-            success: boolean;
-            streamId: number;
-            /** @description Stellar transaction hash of the withdrawal */
-            txHash: string;
-            /** @description Amount withdrawn (i128 as string) */
-            amount: string;
-            stream?: components["schemas"]["Stream"];
-        };
-        CancelResponse: {
-            /** @description Stellar transaction hash of the cancel */
-            txHash: string;
-            /**
-             * @example CANCELLED
-             * @enum {string}
-             */
-            status: "CANCELLED";
-        };
-        AuthChallengeResponse: {
-            /** @description Hex-encoded nonce to sign via a Stellar manage_data operation */
-            nonce: string;
-            /** @description Unix timestamp (ms) when the challenge expires (60s) */
-            expiresAt: number;
-        };
-        AuthVerifyResponse: {
-            /** @description JWT to use in the Authorization: Bearer header */
-            token: string;
-            /** @description Token lifetime in seconds (3600) */
-            expiresIn: number;
-        };
-        SseStats: {
-            /** @example 42 */
-            activeConnections: number;
-            /** @example 8 */
-            activeIps: number;
-            /** @example 5 */
-            perIpPeakConnections: number;
-            /** @example 10000 */
-            maxConnections: number;
-            /** Format: date-time */
-            timestamp: string;
-        };
         WebhookSubscription: {
-            /** @description Webhook subscription id */
-            id: string;
-            /** @description Stellar public key the subscription belongs to */
-            userAddress: string;
-            /** @description HTTPS endpoint receiving the events */
-            targetUrl: string;
-            eventTypes: ("CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED")[];
             active: boolean;
             /** Format: date-time */
             createdAt: string;
+            eventTypes: ("CREATED" | "TOPPED_UP" | "WITHDRAWN" | "CANCELLED" | "COMPLETED" | "PAUSED" | "RESUMED" | "FEE_COLLECTED")[];
+            /** @description Webhook subscription id */
+            id: string;
+            /** @description HTTPS endpoint receiving the events */
+            targetUrl: string;
+            /** @description Stellar public key the subscription belongs to */
+            userAddress: string;
         };
-        HealthResponse: {
-            /**
-             * @example ok
-             * @enum {string}
-             */
-            status: "ok" | "degraded";
-            /**
-             * @example connected
-             * @enum {string}
-             */
-            db: "connected" | "disconnected";
-            /** @description Whether the event indexer is configured */
-            indexerEnabled: boolean;
-            /** @description Seconds since last indexer update, or null when no state row exists yet */
-            indexerLag?: number | null;
-            /** @description Lifetime count of successfully processed indexer events */
-            eventsProcessed?: number;
-            /** @description Lifetime count of indexer events that threw during processing */
-            eventsFailed?: number;
-            /**
-             * Format: date-time
-             * @description Most recent per-event processing failure
-             */
-            lastErrorAt?: string | null;
-            /** @description True when recent event-processing failure rate spikes */
-            indexerDegraded?: boolean;
-            /** @description Server uptime in seconds */
-            uptime: number;
-            /** @description Per-subsystem status breakdown */
-            checks: {
-                database?: {
-                    /** @enum {string} */
-                    status?: "ok" | "down";
-                };
-                indexer?: {
-                    /** @enum {string} */
-                    status?: "ok" | "degraded" | "disabled";
-                    enabled?: boolean;
-                    lagSeconds?: number | null;
-                };
-                redis?: {
-                    /** @enum {string} */
-                    status?: "ok" | "unavailable" | "not_configured";
-                };
-                sorobanRpc?: {
-                    /** @enum {string} */
-                    status?: "ok" | "down";
-                };
+        WithdrawResponse: {
+            /** @description Amount withdrawn (i128 as string) */
+            amount: string;
+            stream?: components["schemas"]["Stream"];
+            streamId: number;
+            /** @example true */
+            success: boolean;
+            /** @description Stellar transaction hash of the withdrawal */
+            txHash: string;
+        };
+    };
+    responses: {
+        /** @description Malformed request (invalid JSON, query or path parameters) */
+        BadRequest: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
             };
         };
-        Error: {
-            error: {
-                /** @example NOT_FOUND */
-                code: string;
-                /** @example Resource not found */
-                message: string;
-                /** @description Structured validation issues when applicable */
-                details?: Record<string, never>[];
+        /** @description Request conflicts with the current state of the resource */
+        Conflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Authenticated but not permitted to perform this action */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Unexpected server error */
+        InternalServerError: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Requested resource does not exist */
+        NotFound: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Rate limit exceeded */
+        TooManyRequests: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
+        /** @description Missing, malformed or expired bearer token */
+        Unauthorized: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
             };
         };
     };
-    responses: never;
     parameters: never;
     requestBodies: never;
     headers: never;

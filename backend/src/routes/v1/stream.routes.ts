@@ -57,6 +57,10 @@ const router = Router();
  *     responses:
  *       200:
  *         description: Paginated stream list
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamListResponse'
  *       400:
  *         description: Invalid query parameters
  */
@@ -136,6 +140,10 @@ router.get('/users/:address/summary', getUserStreamSummary);
  *     responses:
  *       200:
  *         description: Stream record
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Stream'
  *       400:
  *         description: Invalid streamId
  *       404:
