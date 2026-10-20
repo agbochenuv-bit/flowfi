@@ -271,6 +271,62 @@ export async function writeCursorWithFence(
 }
 
 /**
+ * Commit stream events and advance the indexer cursor atomically inside a single database transaction.
+ * Enforces fencing token verification to ensure stale leases cannot write.
+ * (Issue #42)
+ */
+export async function commitEventsAndCursorAtomic(
+  fencingToken: number,
+  lastLedger: number,
+  lastCursor: string | null,
+  events: Array<{
+    streamId: bigint;
+    eventType: string;
+    contractAddress: string;
+    blockNumber: number;
+    transactionHash: string;
+    timestamp: Date;
+    data: any;
+  }>
+): Promise<{ committed: boolean; eventsWritten: number; lastCursor: string | null }> {
+  return await prisma.$transaction(async (tx) => {
+    const state = await tx.indexerState.findUnique({
+      where: { id: INDEXER_STATE_ID },
+      select: { leaseToken: true },
+    });
+    if (!state || state.leaseToken !== fencingToken) {
+      throw new StaleLeaseError(fencingToken, state?.leaseToken ?? null);
+    }
+
+    let eventsWritten = 0;
+    for (const evt of events) {
+      await tx.streamEvent.create({
+        data: {
+          streamId: evt.streamId,
+          eventType: evt.eventType,
+          contractAddress: evt.contractAddress,
+          blockNumber: evt.blockNumber,
+          transactionHash: evt.transactionHash,
+          timestamp: evt.timestamp,
+          data: evt.data,
+        },
+      });
+      eventsWritten++;
+    }
+
+    await tx.$executeRaw`
+      UPDATE "indexer_state"
+      SET "last_ledger" = ${lastLedger},
+          "last_cursor" = ${lastCursor}
+      WHERE "id" = ${INDEXER_STATE_ID}
+        AND "lease_token" = ${fencingToken}
+    `;
+
+    return { committed: true, eventsWritten, lastCursor };
+  });
+}
+
+/**
  * Ensure the singleton indexer_state row exists.
  * Uses a catch-and-retry pattern to handle the race condition where two
  * concurrent callers attempt the first insert simultaneously. If the

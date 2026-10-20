@@ -7129,3 +7129,69 @@ fn test_fee_stream_balances_consistent_across_create_and_topup() {
     let t2: i128 = token::Client::new(&env, &token).balance(&treasury);
     assert_eq!(t2, 200, "treasury received two 100-unit fees");
 }
+
+#[test]
+fn test_cancel_midpoint_precliff_and_remainder_accounting() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (token, _) = create_token(&env);
+    let client = create_contract(&env);
+    let admin = Address::generate(&env);
+    let treasury = Address::generate(&env);
+    let sender = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    client.initialize(&admin, &treasury, &0); // 0% fee
+
+    mint(&env, &token, &sender, 10_000);
+
+    // 1. Cancel at midpoint: total 1,000 over 100 seconds
+    let id = client.create_stream(&sender, &recipient, &token, &1_000, &100);
+    advance(&env, 50); // midpoint (50s / 100s)
+
+    // Calculate claimable (streamed) amount before cancel
+    let streamed_mid = client.get_claimable_amount(&id).unwrap();
+    assert_eq!(streamed_mid, 500);
+
+    // Cancel stream
+    client.cancel_stream(&sender, &id);
+    let s_cancelled = client.get_stream(&id).unwrap();
+    assert_eq!(s_cancelled.status, StreamStatus::Cancelled);
+
+    // 2. Check streamed_now + remainder == total_amount
+    let token_client = token::Client::new(&env, &token);
+    let refunded = token_client.balance(&sender);
+    let remainder = refunded - 9_000;
+    assert_eq!(streamed_mid + remainder, 1_000);
+
+    // Pre-cliff variant asserting streamed_now == 0
+    let cliff_id = client.create_stream_with_cliff(&sender, &recipient, &token, &1_000, &100, &30);
+    advance(&env, 15); // before cliff (30s)
+    let streamed_pre_cliff = client.get_claimable_amount(&cliff_id).unwrap();
+    assert_eq!(streamed_pre_cliff, 0);
+
+    // 3. Create stream with END = START + 1 and assert streamed_amount at both ledgers
+    let short_id = client.create_stream(&sender, &recipient, &token, &500, &1);
+    let start_streamed = client.get_claimable_amount(&short_id).unwrap();
+    assert_eq!(start_streamed, 0);
+
+    advance(&env, 1);
+    let end_streamed = client.get_claimable_amount(&short_id).unwrap();
+    assert_eq!(end_streamed, 500);
+
+    // 4. Withdraw everything at the end ledger
+    client.withdraw(&recipient, &short_id);
+    let s_completed = client.get_stream(&short_id).unwrap();
+    assert_eq!(s_completed.status, StreamStatus::Completed);
+    assert_eq!(s_completed.remaining_balance, 0);
+
+    // 5. Assert the call fails and get_admin is unchanged; then authorize both and assert it succeeds
+    let attacker = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    let fail_res = client.try_transfer_admin(&attacker, &new_admin);
+    assert_stream_error!(fail_res, StreamError::NotAdmin);
+    assert_eq!(client.get_fee_config().unwrap().admin, admin);
+
+    client.transfer_admin(&admin, &new_admin);
+    assert_eq!(client.get_fee_config().unwrap().admin, new_admin);
+}
+
