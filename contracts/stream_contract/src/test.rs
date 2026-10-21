@@ -6315,3 +6315,729 @@ mod emit_helpers {
         assert_eq!(payload.refunded_amount, 2_500);
     }
 }
+
+// ─── Issue #30 — Exact final withdrawal and completion behavior ───────────────
+//
+// Verifies that total payouts never exceed net deposited funds, that
+// `stream_completed` is emitted exactly once, that the final withdrawal is
+// capped at remaining balance, and that time beyond end_time does not let the
+// stream overdraw.
+
+#[cfg(test)]
+mod completion_behavior {
+    use super::*;
+
+    /// Multiple withdrawals stepping time forward must sum to exactly the
+    /// deposited amount and never exceed it.
+    #[test]
+    fn test_repeated_withdrawals_never_exceed_deposited() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        let mut total_withdrawn: i128 = 0;
+
+        // Withdraw in four equal slices.
+        for _ in 0..4 {
+            advance(&env, 250);
+            let amount = client.withdraw(&recipient, &id);
+            total_withdrawn += amount;
+        }
+
+        // All deposited funds claimed.
+        assert_eq!(total_withdrawn, 1_000);
+
+        // Further advancement and a fifth call must not produce more.
+        advance(&env, 1_000);
+        let result = client.try_withdraw(&recipient, &id);
+        // The stream is now Completed / inactive — any further call is rejected.
+        assert!(result.is_err());
+
+        // Token balance at recipient equals exactly deposited amount.
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 1_000);
+        assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    /// After a complete drain the `stream_completed` event appears exactly once
+    /// and a subsequent withdrawal attempt is rejected (not double-completed).
+    #[test]
+    fn test_completion_emitted_exactly_once() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        mint(&env, &token, &sender, 500);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &500, &100);
+
+        // Advance past the end time and drain.
+        advance(&env, 200);
+        let claimed = client.withdraw(&recipient, &id);
+        assert_eq!(claimed, 500);
+
+        // Exactly one `stream_completed` event in the log.
+        let events = env.events().all();
+        let completed_count = events
+            .iter()
+            .filter(|e| {
+                Symbol::try_from_val(&env, &e.1.get(0).unwrap()).unwrap()
+                    == Symbol::new(&env, "stream_completed")
+            })
+            .count();
+        assert_eq!(completed_count, 1, "stream_completed must fire exactly once");
+
+        // Stream reports as completed.
+        assert!(client.is_stream_completed(&id));
+
+        // A second withdrawal attempt must not trigger another completion.
+        let result = client.try_withdraw(&recipient, &id);
+        assert!(result.is_err(), "second withdrawal after completion must fail");
+
+        // Event count is still 1 (no spurious second event).
+        let events_after = env.events().all();
+        let completed_count_after = events_after
+            .iter()
+            .filter(|e| {
+                Symbol::try_from_val(&env, &e.1.get(0).unwrap()).unwrap()
+                    == Symbol::new(&env, "stream_completed")
+            })
+            .count();
+        assert_eq!(
+            completed_count_after, 1,
+            "stream_completed must not fire a second time"
+        );
+    }
+
+    /// At the very last withdrawal the claimable amount is capped to the
+    /// remaining balance — the stream must not over-pay.
+    #[test]
+    fn test_final_withdrawal_cannot_overdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 300 tokens / 300 s = 1 token/s
+        mint(&env, &token, &sender, 300);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &300, &300);
+
+        // Claim two partial amounts first.
+        advance(&env, 100);
+        let first = client.withdraw(&recipient, &id);
+        assert_eq!(first, 100);
+
+        advance(&env, 100);
+        let second = client.withdraw(&recipient, &id);
+        assert_eq!(second, 100);
+
+        // Advance far beyond the end time; the remaining balance is exactly 100.
+        advance(&env, 10_000);
+        let final_payout = client.withdraw(&recipient, &id);
+        assert_eq!(final_payout, 100);
+
+        // No overdraw.
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 300);
+        assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    /// Advancing the ledger past end time then calling withdraw must mark the
+    /// stream Completed with a zero contract balance.
+    #[test]
+    fn test_withdraw_after_stream_end_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 600 tokens / 60 s = 10 tokens/s
+        mint(&env, &token, &sender, 600);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &600, &60);
+
+        // Jump well past the end time.
+        advance(&env, 9_999);
+        let payout = client.withdraw(&recipient, &id);
+        assert_eq!(payout, 600);
+
+        let stream = client.get_stream(&id).unwrap();
+        assert_eq!(stream.status, StreamStatus::Completed);
+        assert!(!stream.is_active);
+        assert_eq!(stream.withdrawn_amount, 600);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&client.address), 0);
+        assert_eq!(token_client.balance(&recipient), 600);
+    }
+}
+
+// ─── Issue #29 — Cancellation refund and accrued-claim accounting ─────────────
+//
+// Verifies token conservation across all cancel scenarios: at start, midpoint,
+// after pause/resume, after a partial withdrawal, and at expiry.
+
+#[cfg(test)]
+mod cancellation_accounting {
+    use super::*;
+
+    /// Cancel immediately after creation: sender gets full refund, recipient
+    /// receives nothing.
+    #[test]
+    fn test_cancel_at_start_full_refund() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        let token_client = token::Client::new(&env, &token);
+
+        // No time has passed — cancel immediately.
+        client.cancel_stream(&sender, &id);
+
+        let sender_balance = token_client.balance(&sender);
+        let recipient_balance = token_client.balance(&recipient);
+        let contract_balance = token_client.balance(&client.address);
+
+        assert_eq!(recipient_balance, 0, "recipient gets nothing at t=0");
+        assert_eq!(sender_balance, 1_000, "sender receives full refund");
+        assert_eq!(contract_balance, 0, "contract fully drained");
+    }
+
+    /// Advance to midpoint, cancel: recipient_received + sender_refund ==
+    /// deposited_amount (token conservation).
+    #[test]
+    fn test_cancel_mid_stream_conservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        let token_client = token::Client::new(&env, &token);
+
+        // Advance to midpoint.
+        advance(&env, 500);
+        client.cancel_stream(&sender, &id);
+
+        let sender_refund = token_client.balance(&sender);
+        let recipient_received = token_client.balance(&recipient);
+        let contract_balance = token_client.balance(&client.address);
+
+        assert_eq!(contract_balance, 0, "contract fully drained after cancel");
+        assert_eq!(
+            recipient_received + sender_refund,
+            1_000,
+            "token conservation: recipient + refund == deposited"
+        );
+        assert_eq!(recipient_received, 500, "half accrued to recipient");
+        assert_eq!(sender_refund, 500, "other half refunded to sender");
+    }
+
+    /// Create → pause → advance → resume → advance more → cancel: token
+    /// conservation must hold regardless of the pause gap.
+    #[test]
+    fn test_cancel_after_pause_resume_conservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        let token_client = token::Client::new(&env, &token);
+
+        // Accrue 200 s, then pause.
+        advance(&env, 200);
+        client.pause_stream(&sender, &id);
+
+        // Dead time: 400 s while paused.
+        advance(&env, 400);
+
+        // Resume and accrue another 150 s.
+        client.resume_stream(&sender, &id);
+        advance(&env, 150);
+
+        // Cancel: accrued == 200 + 150 = 350.
+        client.cancel_stream(&sender, &id);
+
+        let sender_refund = token_client.balance(&sender);
+        let recipient_received = token_client.balance(&recipient);
+        let contract_balance = token_client.balance(&client.address);
+
+        assert_eq!(contract_balance, 0, "contract fully drained after cancel");
+        assert_eq!(
+            recipient_received + sender_refund,
+            1_000,
+            "token conservation must hold after pause/resume"
+        );
+        assert_eq!(recipient_received, 350, "only unpaused seconds count");
+        assert_eq!(sender_refund, 650, "unaccrued portion refunded");
+    }
+
+    /// Withdraw some, then cancel: recipient_total + refund == deposited.
+    #[test]
+    fn test_cancel_after_partial_withdrawal_conservation() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        let token_client = token::Client::new(&env, &token);
+
+        // Advance and withdraw.
+        advance(&env, 300);
+        let withdrawn = client.withdraw(&recipient, &id);
+        assert_eq!(withdrawn, 300);
+
+        // Advance again then cancel.
+        advance(&env, 200);
+        client.cancel_stream(&sender, &id);
+
+        let sender_refund = token_client.balance(&sender);
+        let recipient_total = token_client.balance(&recipient);
+        let contract_balance = token_client.balance(&client.address);
+
+        assert_eq!(contract_balance, 0, "contract fully drained after cancel");
+        assert_eq!(
+            recipient_total + sender_refund,
+            1_000,
+            "token conservation: recipient_total + refund == deposited"
+        );
+        // Recipient holds 300 (from withdraw) + 200 (from cancel) = 500.
+        assert_eq!(recipient_total, 500);
+        assert_eq!(sender_refund, 500);
+    }
+
+    /// Advance past end time, then cancel: sender refund is 0, recipient gets
+    /// full deposited amount.
+    #[test]
+    fn test_cancel_at_expiry_full_payout() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 500 tokens / 500 s = 1 token/s
+        mint(&env, &token, &sender, 500);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &500, &500);
+
+        let token_client = token::Client::new(&env, &token);
+
+        // Advance well past stream end.
+        advance(&env, 9_999);
+        client.cancel_stream(&sender, &id);
+
+        let sender_refund = token_client.balance(&sender);
+        let recipient_received = token_client.balance(&recipient);
+        let contract_balance = token_client.balance(&client.address);
+
+        assert_eq!(contract_balance, 0, "contract fully drained");
+        assert_eq!(
+            recipient_received + sender_refund,
+            500,
+            "token conservation at expiry"
+        );
+        // At expiry, all tokens have accrued to recipient; sender gets 0 (or at
+        // most integer-division dust which still satisfies conservation).
+        assert_eq!(
+            recipient_received, 500,
+            "recipient gets full deposit at expiry"
+        );
+        assert_eq!(sender_refund, 0, "no refund after full accrual");
+    }
+}
+
+// ─── Issue #31 — Adversarial token integration coverage ──────────────────────
+//
+// Validates CEI ordering, per-stream state isolation in batch_withdraw,
+// double-withdrawal blocking, and invalid-token-address rejection.
+
+#[cfg(test)]
+mod adversarial_token {
+    use super::*;
+
+    /// After withdraw, the stream's `withdrawn_amount` must be updated and
+    /// `is_active` must reflect the correct active/completed state.
+    #[test]
+    fn test_withdraw_state_consistent_after_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        advance(&env, 400);
+        let amount = client.withdraw(&recipient, &id);
+        assert_eq!(amount, 400);
+
+        let stream = client.get_stream(&id).unwrap();
+        // State updated before transfer completes (CEI).
+        assert_eq!(stream.withdrawn_amount, 400);
+        assert!(stream.is_active, "stream still active after partial withdrawal");
+        assert_eq!(stream.status, StreamStatus::Active);
+
+        // Full drain.
+        advance(&env, 10_000);
+        client.withdraw(&recipient, &id);
+
+        let stream_after = client.get_stream(&id).unwrap();
+        assert_eq!(stream_after.withdrawn_amount, 1_000);
+        assert!(!stream_after.is_active, "stream inactive after full drain");
+        assert_eq!(stream_after.status, StreamStatus::Completed);
+    }
+
+    /// Batch withdraw across two independent streams: each stream's state is
+    /// updated correctly and independently.
+    #[test]
+    fn test_batch_withdraw_state_per_stream() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // Two streams: 1 000 tokens / 1 000 s each.
+        mint(&env, &token, &sender, 2_000);
+        let client = create_contract(&env);
+
+        let id1 = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+        let id2 = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        advance(&env, 300);
+
+        let ids = vec![&env, id1, id2];
+        let results = client.batch_withdraw(&recipient, &ids);
+
+        // Both streams should return 300.
+        assert_eq!(results.len(), 2);
+        let (_, amt1) = results.get(0).unwrap();
+        let (_, amt2) = results.get(1).unwrap();
+        assert_eq!(amt1, 300);
+        assert_eq!(amt2, 300);
+
+        // Each stream state updated independently.
+        let s1 = client.get_stream(&id1).unwrap();
+        let s2 = client.get_stream(&id2).unwrap();
+        assert_eq!(s1.withdrawn_amount, 300);
+        assert_eq!(s2.withdrawn_amount, 300);
+        assert!(s1.is_active);
+        assert!(s2.is_active);
+    }
+
+    /// After cancel_stream, the stream must be stored as Cancelled before any
+    /// token transfers could logically complete. We verify this by reading state
+    /// immediately after the call and attempting a re-cancel.
+    #[test]
+    fn test_cancel_state_before_transfer() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        advance(&env, 250);
+        client.cancel_stream(&sender, &id);
+
+        // State must be Cancelled + inactive immediately (state written before
+        // transfers in CEI order).
+        let stream = client.get_stream(&id).unwrap();
+        assert_eq!(stream.status, StreamStatus::Cancelled);
+        assert!(!stream.is_active);
+
+        // Attempting a second cancel must fail (stream already inactive).
+        let result = client.try_cancel_stream(&sender, &id);
+        assert_stream_error!(
+            result,
+            StreamError::StreamInactive,
+            "second cancel must fail: state already committed to Cancelled"
+        );
+    }
+
+    /// Attempting to create a stream with a plain account address (not a token
+    /// contract) must be rejected with InvalidTokenAddress.
+    #[test]
+    fn test_create_stream_validates_token_address() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let client = create_contract(&env);
+
+        // A freshly generated address is not a token contract.
+        let not_a_token = Address::generate(&env);
+        let result = client.try_create_stream(
+            &Address::generate(&env),
+            &Address::generate(&env),
+            &not_a_token,
+            &500,
+            &100,
+        );
+        assert_stream_error!(
+            result,
+            StreamError::InvalidTokenAddress,
+            "plain account address must not be accepted as token"
+        );
+    }
+
+    /// Calling withdraw twice at the same ledger timestamp must fail on the
+    /// second call because no new tokens have accrued (CEI: state committed on
+    /// first call blocks same-timestamp re-entry).
+    #[test]
+    fn test_double_withdrawal_blocked() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        advance(&env, 200);
+
+        // First withdrawal succeeds.
+        let first = client.withdraw(&recipient, &id);
+        assert_eq!(first, 200);
+
+        // Second call at the same timestamp: nothing new has accrued.
+        let result = client.try_withdraw(&recipient, &id);
+        assert_stream_error!(
+            result,
+            StreamError::InvalidAmount,
+            "double withdrawal at same timestamp must fail"
+        );
+
+        // Exactly one payout made.
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 200);
+    }
+}
+
+// ─── Issue #33 — Pause and resume time accounting composable ──────────────────
+//
+// Validates that paused seconds never accrue, that resume correctly shifts
+// last_update_time, that multiple pause/resume cycles compose correctly, that
+// top-up during pause preserves accrual state, and that resume near end time
+// cannot overdraw.
+
+#[cfg(test)]
+mod pause_resume_accounting {
+    use super::*;
+
+    /// Paused seconds must not add to the claimable balance.
+    #[test]
+    fn test_paused_seconds_do_not_accrue() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        // Accrue 100 tokens, then pause.
+        advance(&env, 100);
+        let claimable_at_t100 = client.get_claimable_amount(&id).unwrap();
+        assert_eq!(claimable_at_t100, 100);
+
+        client.pause_stream(&sender, &id);
+
+        // Advance 100 more seconds while paused.
+        advance(&env, 100);
+        let claimable_while_paused = client.get_claimable_amount(&id).unwrap();
+
+        // No additional accrual during pause.
+        assert_eq!(
+            claimable_while_paused, claimable_at_t100,
+            "paused seconds must not accrue"
+        );
+    }
+
+    /// After resume the stream must drain over the correct remaining duration
+    /// (end_time is extended by the pause gap).
+    #[test]
+    fn test_resume_extends_end_time() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        // Accrue 200 tokens, pause for 500 s, resume.
+        advance(&env, 200);
+        client.pause_stream(&sender, &id);
+        advance(&env, 500);
+        let new_end_time = client.resume_stream(&sender, &id);
+
+        // End time must be shifted by the 500-second pause gap.
+        // Original end time was start_time (0) + 1000 = 1000;
+        // after a 500 s pause gap the new end must be 1000 + 500 = 1500.
+        assert_eq!(new_end_time, 1_500, "end time must extend by pause duration");
+
+        // Advance to the new projected end time and drain.
+        let remaining = new_end_time - env.ledger().timestamp();
+        advance(&env, remaining);
+        let payout = client.withdraw(&recipient, &id);
+
+        // All 1 000 tokens drained (200 pre-pause + 800 post-resume).
+        assert_eq!(payout, 1_000);
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&recipient), 1_000);
+        assert_eq!(token_client.balance(&client.address), 0);
+    }
+
+    /// Two complete pause/resume cycles: total accrual == rate × total_unpaused_seconds.
+    #[test]
+    fn test_multi_pause_resume_no_double_count() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 1_000);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        // Cycle 1: 100 s active, pause 200 s, resume.
+        advance(&env, 100);
+        client.pause_stream(&sender, &id);
+        advance(&env, 200);
+        client.resume_stream(&sender, &id);
+
+        // Cycle 2: 150 s active, pause 300 s, resume.
+        advance(&env, 150);
+        client.pause_stream(&sender, &id);
+        advance(&env, 300);
+        client.resume_stream(&sender, &id);
+
+        // Advance another 50 s.
+        advance(&env, 50);
+
+        let claimable = client.get_claimable_amount(&id).unwrap();
+        // Total active (non-paused) seconds: 100 + 150 + 50 = 300
+        assert_eq!(claimable, 300, "accrual == rate * total_unpaused_seconds");
+
+        // Withdraw and confirm.
+        let payout = client.withdraw(&recipient, &id);
+        assert_eq!(payout, 300);
+    }
+
+    /// Top-up while paused must increase deposited_amount and the stream must
+    /// stay active; accrual from before the pause must be unaffected.
+    #[test]
+    fn test_topup_during_pause_correct_accounting() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 1 000 tokens / 1 000 s = 1 token/s
+        mint(&env, &token, &sender, 2_000); // extra for top-up
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &1_000, &1_000);
+
+        // Accrue 300, pause, top up while paused.
+        advance(&env, 300);
+        client.pause_stream(&sender, &id);
+        advance(&env, 200);
+
+        // Claimable still 300 (no accrual while paused).
+        assert_eq!(client.get_claimable_amount(&id).unwrap(), 300);
+
+        client.top_up_stream(&sender, &id, &500);
+
+        let stream_after_topup = client.get_stream(&id).unwrap();
+        // deposited_amount must reflect the additional 500.
+        assert_eq!(stream_after_topup.deposited_amount, 1_500);
+        // Stream still active/paused.
+        assert!(stream_after_topup.is_active);
+        assert!(stream_after_topup.paused);
+
+        // Claimable must still be 300 (top-up does not reset accrual).
+        assert_eq!(client.get_claimable_amount(&id).unwrap(), 300);
+
+        // Resume and advance; accrual resumes from 300.
+        client.resume_stream(&sender, &id);
+        advance(&env, 100);
+        let payout = client.withdraw(&recipient, &id);
+        // Should have 300 (pre-pause) + 100 (post-resume) = 400.
+        assert_eq!(payout, 400);
+    }
+
+    /// Resume very close to what would have been end time, then withdraw: the
+    /// payout must not exceed deposited_amount.
+    #[test]
+    fn test_resume_near_end_time_no_overdraw() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (token, _) = create_token(&env);
+        let sender = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        // 200 tokens / 200 s = 1 token/s
+        mint(&env, &token, &sender, 200);
+        let client = create_contract(&env);
+        let id = client.create_stream(&sender, &recipient, &token, &200, &200);
+
+        // Accrue 50, pause right before the old end time, then resume.
+        advance(&env, 50);
+        client.pause_stream(&sender, &id);
+        // Advance to just before the old end_time (t=200), which is now well
+        // within the pause window.
+        advance(&env, 148);
+        let new_end_time = client.resume_stream(&sender, &id);
+
+        // Advance past the new end time.
+        let jump = new_end_time - env.ledger().timestamp() + 1_000;
+        advance(&env, jump);
+
+        let payout = client.withdraw(&recipient, &id);
+
+        // Under no circumstances may payout exceed deposited_amount.
+        assert!(
+            payout <= 200,
+            "payout {} must not exceed deposited_amount 200",
+            payout
+        );
+        assert_eq!(payout, 200, "full deposit must be claimable after full drain");
+
+        let token_client = token::Client::new(&env, &token);
+        assert_eq!(token_client.balance(&client.address), 0, "contract fully drained");
+    }
+}

@@ -17,3 +17,20 @@ issue*.md
 pr*.md
 ISSUE_*.md
 PR_*.md
+
+# Soroban contract test artifacts
+contracts/stream_contract/test_snapshots/
+contracts/stream_contract/proptest-regressions/
+# Rust build artifacts
+contracts/target/
+# Deployment info
+deployment-info.json
+# Local env files
+.env.local
+.env.*.local
+# Editor directories
+.idea/
+*.swp
+*.swo
+# OS files
+Thumbs.db
