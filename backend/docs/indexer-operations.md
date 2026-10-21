@@ -2,9 +2,11 @@
 
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
-admin replay preview/execute contract, and the indexer metrics. It is written
-for operators and on-call engineers. All public interfaces described here are
-additive; existing endpoints and configuration keys keep working unless noted.
+admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
+graceful shutdown and poll cancellation, and the indexer metrics. It is
+written for operators and on-call engineers. All public interfaces described
+here are additive; existing endpoints and configuration keys keep working
+unless noted.
 
 ---
 
