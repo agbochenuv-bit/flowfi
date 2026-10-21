@@ -51,7 +51,9 @@ use events::{
     emit_initialized, emit_protocol_pause_status, emit_state_migrated,
     emit_step_vesting_stream_created, emit_stream_cancelled, emit_stream_closed,
     emit_stream_completed, emit_stream_created, emit_stream_paused, emit_stream_resumed,
-    emit_stream_topped_up, emit_tokens_withdrawn, AdminTransferredEvent,
+    emit_stream_topped_up, emit_tokens_withdrawn, emit_admin_transfer_cancelled,
+    emit_admin_transfer_proposed, AdminTransferCancelledEvent, AdminTransferProposedEvent,
+    AdminTransferredEvent,
     AllowanceStreamCreatedEvent, ContractUpgradedEvent, DisputeRequestedEvent,
     DisputeResolvedEvent, EmergencyGuardianUpdatedEvent, FeeCollectedEvent, FeeConfigUpdatedEvent,
     HybridCliffStreamCreatedEvent, InitializedEvent, MilestoneConditionUnlockedEvent,
@@ -63,7 +65,8 @@ use events::{
 use storage::{
     config_exists, get_contract_version, get_recorded_wasm_hash, load_config, load_stream,
     next_stream_id, remove_stream, save_config, save_contract_version, save_recorded_wasm_hash,
-    save_stream, try_load_config, try_load_stream,
+    save_stream, try_load_config, try_load_stream, INSTANCE_BUMP_AMOUNT,
+    INSTANCE_LIFETIME_THRESHOLD,
 };
 use types::{
     BatchStreamInput, ConditionalMilestone, DataKey, DisputeStatus, OracleAsset, OracleClient,
@@ -356,6 +359,17 @@ impl StreamContract {
     ///
     /// Returns the new stream ID (starts at 1, increments monotonically).
     ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// The gross token transfer from `sender` to the contract happens before
+    /// the stream record is persisted. If the transfer fails (insufficient
+    /// balance, revoked allowance, or a malicious token that panics), the
+    /// Soroban host aborts the entire transaction and rolls back all state
+    /// changes — no stream record is written and no fee is collected. The
+    /// fee transfer to the treasury is deferred until *after* the stream is
+    /// persisted, so a fee-transfer failure also rolls back cleanly without
+    /// leaving a partially-funded stream behind.
+    ///
     /// # Errors
     /// - `ProtocolPaused`     — the circuit breaker is engaged.
     /// - `InvalidAmount`      — `amount` ≤ 0.
@@ -380,7 +394,7 @@ impl StreamContract {
         if duration == 0 {
             return Err(StreamError::InvalidDuration);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let stream_id = next_stream_id(&env);
         let start_time = env.ledger().timestamp();
@@ -404,6 +418,12 @@ impl StreamContract {
             return Err(StreamError::InvalidRate);
         }
 
+        // Dust handling (#23): floor division means net_amount % duration tokens
+        // would be permanently locked. Instead, compute the exact streamable
+        // amount and refund the dust to the sender immediately at creation time.
+        let dust = net_amount - rate_per_second * (duration as i128);
+        let streamable_amount = net_amount - dust;
+
         save_stream(
             &env,
             stream_id,
@@ -412,7 +432,7 @@ impl StreamContract {
                 recipient: recipient.clone(),
                 token_address: token_address.clone(),
                 rate_per_second,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 withdrawn_amount: 0,
                 start_time,
                 last_update_time: start_time,
@@ -428,7 +448,17 @@ impl StreamContract {
             },
         );
 
-        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury, amount, net_amount);
+
+        // Refund dust to sender (silently, no new event) so deposited_amount
+        // equals exactly rate_per_second * duration and the stream fully drains.
+        if dust > 0 {
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                &sender,
+                &dust,
+            );
+        }
 
         emit_stream_created(
             &env,
@@ -438,7 +468,7 @@ impl StreamContract {
                 recipient,
                 rate_per_second,
                 token_address,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 start_time,
             },
         );
@@ -536,7 +566,18 @@ impl StreamContract {
             if rate_per_second == 0 {
                 return Err(StreamError::InvalidRate);
             }
-            let cliff_time = input.cliff_duration.map(|duration| start_time + duration);
+            let cliff_time = input
+                .cliff_duration
+                .map(|duration| {
+                    start_time
+                        .checked_add(duration)
+                        .ok_or(StreamError::TimestampOverflow)
+                })
+                .transpose()?;
+
+            // Dust handling (#23): refund un-streamable residual to sender.
+            let dust = net_amount - rate_per_second * (input.duration as i128);
+            let streamable_amount = net_amount - dust;
 
             save_stream(
                 &env,
@@ -546,7 +587,7 @@ impl StreamContract {
                     recipient: input.recipient.clone(),
                     token_address: input.token_address.clone(),
                     rate_per_second,
-                    deposited_amount: net_amount,
+                    deposited_amount: streamable_amount,
                     withdrawn_amount: 0,
                     start_time,
                     last_update_time: start_time,
@@ -562,7 +603,16 @@ impl StreamContract {
                 },
             );
 
-            Self::transfer_fee(&env, &input.token_address, stream_id, fee_amount, treasury);
+            Self::transfer_fee(&env, &input.token_address, stream_id, fee_amount, treasury, input.amount, net_amount);
+
+            // Refund dust to sender silently.
+            if dust > 0 {
+                token::Client::new(&env, &input.token_address).transfer(
+                    &env.current_contract_address(),
+                    &sender,
+                    &dust,
+                );
+            }
 
             env.events().publish(
                 (Symbol::new(&env, "stream_created"), stream_id),
@@ -572,7 +622,7 @@ impl StreamContract {
                     recipient: input.recipient.clone(),
                     rate_per_second,
                     token_address: input.token_address.clone(),
-                    deposited_amount: net_amount,
+                    deposited_amount: streamable_amount,
                     start_time,
                 },
             );
@@ -631,6 +681,10 @@ impl StreamContract {
             return Err(StreamError::InvalidRate);
         }
 
+        // Dust handling (#23): refund un-streamable residual to sender.
+        let dust = net_amount - rate_per_second * (duration as i128);
+        let streamable_amount = net_amount - dust;
+
         save_stream(
             &env,
             stream_id,
@@ -639,11 +693,15 @@ impl StreamContract {
                 recipient: recipient.clone(),
                 token_address: token_address.clone(),
                 rate_per_second,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 withdrawn_amount: 0,
                 start_time,
                 last_update_time: start_time,
-                cliff_time: Some(start_time + cliff_duration),
+                cliff_time: Some(
+                    start_time
+                        .checked_add(cliff_duration)
+                        .ok_or(StreamError::TimestampOverflow)?,
+                ),
                 is_active: true,
                 paused: false,
                 paused_at: None,
@@ -655,7 +713,16 @@ impl StreamContract {
             },
         );
 
-        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury, amount, net_amount);
+
+        // Refund dust to sender silently.
+        if dust > 0 {
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                &sender,
+                &dust,
+            );
+        }
 
         env.events().publish(
             (Symbol::new(&env, "stream_created"), stream_id),
@@ -665,7 +732,7 @@ impl StreamContract {
                 recipient,
                 rate_per_second,
                 token_address,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 start_time,
             },
         );
@@ -800,7 +867,7 @@ impl StreamContract {
         if amount <= 0 {
             return Err(StreamError::InvalidAmount);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let step_count = steps.len();
         if step_count == 0 {
@@ -853,7 +920,7 @@ impl StreamContract {
             },
         );
 
-        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury, amount, net_amount);
 
         emit_step_vesting_stream_created(
             &env,
@@ -903,7 +970,7 @@ impl StreamContract {
         if linear_duration == 0 {
             return Err(StreamError::InvalidCliffParameters);
         }
-        Self::validate_token_contract(&env, &token_address)?;
+        validate_token(&env, &token_address)?;
 
         let stream_id = next_stream_id(&env);
         let start_time = env.ledger().timestamp();
@@ -927,6 +994,12 @@ impl StreamContract {
             return Err(StreamError::InvalidCliffParameters);
         }
 
+        // Dust handling (#23): the linear tail uses floor division, so
+        // `linear_amount % linear_duration` tokens would never drain.
+        // Compute the exactly-streamable total and refund the linear dust.
+        let linear_dust = linear_amount - rate_per_second * (linear_duration as i128);
+        let streamable_amount = net_amount - linear_dust; // cliff portion unchanged
+
         save_stream(
             &env,
             stream_id,
@@ -935,7 +1008,7 @@ impl StreamContract {
                 recipient: recipient.clone(),
                 token_address: token_address.clone(),
                 rate_per_second,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 withdrawn_amount: 0,
                 start_time,
                 last_update_time: start_time,
@@ -951,7 +1024,16 @@ impl StreamContract {
             },
         );
 
-        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury, amount, net_amount);
+
+        // Refund linear dust to sender silently.
+        if linear_dust > 0 {
+            token::Client::new(&env, &token_address).transfer(
+                &env.current_contract_address(),
+                &sender,
+                &linear_dust,
+            );
+        }
 
         emit_hybrid_cliff_stream_created(
             &env,
@@ -960,7 +1042,7 @@ impl StreamContract {
                 sender,
                 recipient,
                 token_address,
-                deposited_amount: net_amount,
+                deposited_amount: streamable_amount,
                 cliff_time,
                 cliff_unlock_amount,
                 rate_per_second,
@@ -997,7 +1079,9 @@ impl StreamContract {
                 }
             }
             previous_unlock_time = Some(step.unlock_time);
-            total = total.saturating_add(step.unlock_amount);
+            total = total
+                .checked_add(step.unlock_amount)
+                .ok_or(StreamError::ArithmeticOverflow)?;
         }
 
         if total != net_amount {
@@ -1037,7 +1121,9 @@ impl StreamContract {
                     return Err(StreamError::InvalidMilestone);
                 }
             }
-            total = total.saturating_add(m.amount);
+            total = total
+                .checked_add(m.amount)
+                .ok_or(StreamError::ArithmeticOverflow)?;
         }
         if total != net_amount {
             return Err(StreamError::VestingStepTotalMismatch);
@@ -1143,7 +1229,7 @@ impl StreamContract {
             &Vec::<BytesN<32>>::new(&env),
         );
 
-        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &token_address, stream_id, fee_amount, treasury, amount, net_amount);
 
         env.events().publish(
             (Symbol::new(&env, "stream_created"), stream_id),
@@ -1313,6 +1399,38 @@ impl StreamContract {
     /// either be stranded as unclaimable residue or silently deferred to the
     /// final milestone. Both would misstate when the recipient gets their money.
     ///
+    /// # Schedule Semantics (#27)
+    ///
+    /// Top-ups **preserve the existing `rate_per_second`** — the rate is never
+    /// recalculated. The net top-up amount is added to `deposited_amount`,
+    /// which extends the stream's drain time at the same rate. Already-accrued
+    /// but unwithdrawn tokens are not affected: `last_update_time` is
+    /// intentionally left untouched so that prior accrual survives the top-up.
+    /// The emitted `stream_topped_up` event reports the new total deposit and
+    /// the projected end time so the backend indexer stays aligned.
+    ///
+    /// # Eligible Stream States (#28)
+    ///
+    /// All eligibility checks run **before** any token transfer, so a rejected
+    /// top-up never moves funds:
+    /// - **Active** — top-up succeeds.
+    /// - **Paused** — top-up succeeds; the deposit increases but accrual stays
+    ///   frozen until `resume_stream` is called.
+    /// - **Cancelled** — rejected with `StreamInactive`.
+    /// - **Completed** — rejected with `StreamInactive`.
+    /// - **Expired** (past the natural end but still `is_active`) — top-up
+    ///   succeeds, extending the stream further.
+    ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// The token transfer from `sender` to the contract happens after all
+    /// eligibility checks pass but before the stream record is persisted. If
+    /// the transfer fails, Soroban rolls back the entire transaction — no
+    /// stream state is changed and no fee is collected. The fee transfer to
+    /// the treasury is deferred until after the stream is persisted, so a
+    /// fee-transfer failure also rolls back without leaving a partially-funded
+    /// top-up behind.
+    ///
     /// # Errors
     /// - `ProtocolPaused`    — the circuit breaker is engaged.
     /// - `InvalidAmount`     — `amount` ≤ 0.
@@ -1320,6 +1438,8 @@ impl StreamContract {
     /// - `Unauthorized`      — caller is not the stream's sender.
     /// - `StreamInactive`    — stream has been cancelled or fully withdrawn.
     /// - `TopUpUnsupported`  — the stream uses a step-tranche schedule.
+    /// - `ArithmeticOverflow` — the new deposited total overflows `i128`.
+    /// - `TimestampOverflow`  — the projected end time overflows `u64`.
     pub fn top_up_stream(
         env: Env,
         sender: Address,
@@ -1370,7 +1490,7 @@ impl StreamContract {
 
         save_stream(&env, stream_id, &stream);
 
-        Self::transfer_fee(&env, &stream.token_address, stream_id, fee_amount, treasury);
+        Self::transfer_fee(&env, &stream.token_address, stream_id, fee_amount, treasury, amount, net_amount);
 
         // Emit top-up event
         emit_stream_topped_up(
@@ -1578,12 +1698,26 @@ impl StreamContract {
             .ok_or(StreamError::ArithmeticOverflow)
     }
 
+    /// Returns `true` when a stream is in a terminal state (`Cancelled` or
+    /// `Completed`). Terminal streams cannot be reactivated, topped up, paused,
+    /// or modified in any way. (#21)
+    fn stream_is_terminal(stream: &Stream) -> bool {
+        matches!(
+            stream.status,
+            StreamStatus::Cancelled | StreamStatus::Completed
+        )
+    }
+
     /// Validate that a stream is active.
     ///
+    /// Checks both `is_active` and `status` to prevent inconsistent states
+    /// where one field is set but not the other. (#21/#22)
+    ///
     /// # Errors
-    /// - `StreamInactive` — stream has been cancelled or fully withdrawn.
+    /// - `StreamInactive` — stream has been cancelled, completed, or otherwise
+    ///   made inactive.
     fn validate_stream_active(stream: &Stream) -> Result<(), StreamError> {
-        if !stream.is_active {
+        if !stream.is_active || Self::stream_is_terminal(stream) {
             return Err(StreamError::StreamInactive);
         }
         Ok(())
@@ -1631,6 +1765,14 @@ impl StreamContract {
     /// Only the stream's recipient may call this. The amount withdrawn is calculated
     /// based on elapsed time and the stream's rate. The stream is automatically marked
     /// inactive once fully drained.
+    ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// State is persisted before the token transfer (CEI). If the transfer
+    /// fails — e.g. the token contract panics or the contract has insufficient
+    /// balance — Soroban rolls back the entire transaction: `withdrawn_amount`
+    /// is not incremented, `last_update_time` is not advanced, and the stream
+    /// remains in its pre-call state. No partial withdrawal is ever observable.
     ///
     /// # Errors
     /// - `StreamNotFound`  — no stream exists with `stream_id`.
@@ -1702,6 +1844,15 @@ impl StreamContract {
     /// never be resumed, even if `paused` is `true`. This invariant must be
     /// preserved across all contract changes to prevent state-invariant bugs.
     /// See Testing #94 for test coverage.
+    ///
+    /// # Token Transfer Failure & Rollback (#25)
+    ///
+    /// All state mutations — `withdrawn_amount`, `is_active`, `status`,
+    /// `last_update_time` — are persisted to storage before either the
+    /// recipient payout or the sender refund transfer fires (CEI). If either
+    /// token transfer fails, Soroban rolls back the entire transaction: the
+    /// stream is not marked as cancelled, no tokens move, and the stream
+    /// remains in its pre-call active state.
     ///
     /// # Errors
     /// - `StreamNotFound`  — no stream exists with `stream_id`.
@@ -1926,8 +2077,14 @@ impl StreamContract {
 
         let new_end_time = match stream.schedule {
             // A linear stream is guaranteed rate >= 1 by create_stream's
-            // InvalidRate guard, so the division is safe here.
-            VestingSchedule::Linear => now + (remaining / stream.rate_per_second) as u64,
+            // InvalidRate guard, so the division is safe here. The addition
+            // uses checked_add so a projection past u64::MAX returns
+            // ArithmeticOverflow instead of silently wrapping.
+            VestingSchedule::Linear => {
+                let seconds = (remaining / stream.rate_per_second) as u64;
+                now.checked_add(seconds)
+                    .ok_or(StreamError::ArithmeticOverflow)?
+            }
             // Step and hybrid schedules are anchored to absolute timestamps;
             // ask the schedule-aware projection instead of dividing.
             _ => {
@@ -2529,12 +2686,18 @@ impl StreamContract {
 
     /// Transfers the previously calculated fee after the caller has persisted
     /// all stream state changes for this operation.
+    ///
+    /// `gross_amount` is the amount before fee deduction; `net_amount` is what
+    /// the stream received. Both are included in the `FeeCollectedEvent` for
+    /// off-chain auditability (#24).
     fn transfer_fee(
         env: &Env,
         token_address: &Address,
         stream_id: u64,
         fee: i128,
         treasury: Option<Address>,
+        gross_amount: i128,
+        net_amount: i128,
     ) {
         if let Some(treasury) = treasury {
             let token_client = token::Client::new(env, token_address);
@@ -2546,8 +2709,156 @@ impl StreamContract {
                     treasury,
                     fee_amount: fee,
                     token: token_address.clone(),
+                    gross_amount,
+                    net_amount,
                 },
             );
         }
     }
+
+    // ─── TTL Renewal ──────────────────────────────────────────────────────────
+
+    /// Renews the TTL of an active stream's persistent storage to prevent archival.
+    ///
+    /// This may be called by anyone — keepers, the sender, the recipient, or a
+    /// third-party cron job — because the operation is read-only with respect to
+    /// stream state; it only extends the storage lifetime.
+    ///
+    /// Terminal streams (Cancelled, Completed) are intentionally skipped: the
+    /// archival policy for settled records is deliberate.
+    ///
+    /// # Errors
+    /// - `StreamNotFound` — no stream exists at `stream_id`.
+    pub fn renew_stream_ttl(env: Env, stream_id: u64) -> Result<(), StreamError> {
+        // Verify the stream exists before renewing
+        let stream = load_stream(&env, stream_id)?;
+        // Only renew active/paused streams — terminal records should archive
+        match stream.status {
+            StreamStatus::Active | StreamStatus::Paused => {
+                storage::renew_stream_ttl(&env, stream_id);
+                // Also bump instance TTL since config is read on every call
+                env.storage()
+                    .instance()
+                    .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+            }
+            StreamStatus::Cancelled | StreamStatus::Completed => {
+                // Terminal: do not extend — let archival proceed naturally
+            }
+        }
+        Ok(())
+    }
+
+    // ─── Two-Step Admin Transfer ──────────────────────────────────────────────
+
+    /// Proposes a two-step admin transfer to `new_admin`.
+    ///
+    /// The transfer is not complete until `new_admin` calls `accept_admin_transfer`.
+    /// Proposing while a previous proposal is pending replaces the pending address.
+    /// Only the current admin may call this.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — caller is not the current admin.
+    pub fn propose_admin_transfer(env: Env, new_admin: Address) -> Result<(), StreamError> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdmin, &new_admin);
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+        emit_admin_transfer_proposed(
+            &env,
+            AdminTransferProposedEvent {
+                current_admin: config.admin,
+                proposed_admin: new_admin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Accepts a pending admin transfer, making the caller the new admin.
+    ///
+    /// Only the address previously proposed by `propose_admin_transfer` may call
+    /// this. On success, the pending transfer is cleared and `admin_transferred`
+    /// is emitted with the same payload as the legacy immediate transfer.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — no pending transfer, or caller is not the pending admin.
+    pub fn accept_admin_transfer(env: Env) -> Result<(), StreamError> {
+        let mut config = load_config(&env)?;
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin);
+        let pending_admin = pending.ok_or(StreamError::Unauthorized)?;
+        pending_admin.require_auth();
+        let previous_admin = config.admin.clone();
+        config.admin = pending_admin;
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        save_config(&env, &config);
+        emit_admin_transferred(
+            &env,
+            AdminTransferredEvent {
+                previous_admin,
+                new_admin: config.admin,
+            },
+        );
+        Ok(())
+    }
+
+    /// Cancels a pending admin transfer.
+    ///
+    /// Only the current admin may cancel. Calling this when no transfer is pending
+    /// is a no-op (returns `Ok`).
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol not yet initialized.
+    /// - `Unauthorized` — caller is not the current admin.
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), StreamError> {
+        let config = load_config(&env)?;
+        config.admin.require_auth();
+        let pending: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin);
+        if let Some(cancelled) = pending {
+            env.storage().instance().remove(&DataKey::PendingAdmin);
+            emit_admin_transfer_cancelled(
+                &env,
+                AdminTransferCancelledEvent {
+                    admin: config.admin,
+                    cancelled_proposed_admin: cancelled,
+                },
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `token_address` points to a token contract implementing
+/// the SEP-0041 interface by attempting a `balance` query against it.
+///
+/// A fresh contract address that is not a token will fail the cross-contract
+/// call. An address that encodes an invalid Stellar account format or an
+/// unknown contract will also fail here rather than at the token transfer,
+/// ensuring the caller gets a clean `IncompatibleToken` error instead of an
+/// opaque host error.
+///
+/// # Errors
+/// - `IncompatibleToken` — the token contract is missing, rejected the call,
+///   or the address is structurally invalid.
+fn validate_token(env: &Env, token_address: &Address) -> Result<(), StreamError> {
+    // Attempt to read the contract's own balance as a presence check.
+    // `token::Client::balance` is the lightest SEP-0041 call available;
+    // a non-token contract or an absent contract will trap here.
+    let client = token::Client::new(env, token_address);
+    // Use the contract's own address as the subject of the balance query;
+    // the value itself is irrelevant — we only care that the call does not
+    // trap.
+    let _balance = client.try_balance(&env.current_contract_address())
+        .map_err(|_| StreamError::IncompatibleToken)?;
+    Ok(())
 }

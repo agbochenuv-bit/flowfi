@@ -5,6 +5,11 @@
  * exercised without a database or a broker. The auth middleware is NOT stubbed:
  * these routes are the operator interface to a table that can silently drop
  * on-chain events, so the 401/403 paths are part of the contract.
+ *
+ * Error responses follow the centralized error mapper: every failure body
+ * carries a stable `code`, a human-readable `error` message, and (for
+ * validation failures) a `details` array of field-level issues. Internal
+ * failures never leak stack traces or database identifiers.
  */
 import { describe, it, expect, vi, beforeEach, afterAll } from 'vitest';
 import express from 'express';
@@ -144,6 +149,24 @@ function row(overrides: Record<string, unknown> = {}) {
   };
 }
 
+/**
+ * Asserts the standardized error envelope produced by the centralized error
+ * mapper. Every failure body must carry a stable `code` and a message, and
+ * must never leak a stack trace or raw internal identifiers.
+ */
+function expectErrorEnvelope(
+  body: Record<string, unknown>,
+  expected: { code: string; status: number },
+) {
+  expect(body).toHaveProperty('code', expected.code);
+  expect(typeof body.error).toBe('string');
+  expect((body.error as string).length).toBeGreaterThan(0);
+  expect(body).not.toHaveProperty('stack');
+  expect(body).not.toHaveProperty('statusCode');
+  // Internal identifiers (e.g. Prisma error codes, table names) must not leak.
+  expect(JSON.stringify(body)).not.toMatch(/relation does not exist|PrismaClient|P\d{4}/);
+}
+
 afterAll(() => {
   delete process.env.JWT_SECRET;
   delete process.env.ADMIN_PUBLIC_KEY;
@@ -157,7 +180,9 @@ describe('dead-letter auth', () => {
   });
 
   it('rejects an unauthenticated list', async () => {
-    expect((await request(app()).get('/v1/admin/indexer/dead-letter')).status).toBe(401);
+    const res = await request(app()).get('/v1/admin/indexer/dead-letter');
+    expect(res.status).toBe(401);
+    expectErrorEnvelope(res.body, { code: 'unauthorized', status: 401 });
   });
 
   it('rejects a non-admin list', async () => {
@@ -167,6 +192,7 @@ describe('dead-letter auth', () => {
 
     expect(res.status).toBe(403);
     expect(res.body.message).toMatch(/Admin access required/i);
+    expectErrorEnvelope(res.body, { code: 'forbidden', status: 403 });
   });
 
   it.each([
@@ -177,6 +203,20 @@ describe('dead-letter auth', () => {
   ])('rejects an unauthenticated %s %s', async (method, path) => {
     const res = await request(app())[method as 'get' | 'post' | 'delete'](path);
     expect(res.status).toBe(401);
+    expectErrorEnvelope(res.body, { code: 'unauthorized', status: 401 });
+  });
+
+  it.each([
+    ['get', '/v1/admin/indexer/dead-letter'],
+    ['post', '/v1/admin/indexer/dead-letter/replay-all'],
+    ['post', '/v1/admin/indexer/dead-letter/row-1/replay'],
+    ['delete', '/v1/admin/indexer/dead-letter/row-1'],
+  ])('rejects a non-admin %s %s', async (method, path) => {
+    const res = await request(app())
+      [method as 'get' | 'post' | 'delete'](path)
+      .set('Authorization', `Bearer ${userToken()}`);
+    expect(res.status).toBe(403);
+    expectErrorEnvelope(res.body, { code: 'forbidden', status: 403 });
   });
 });
 
@@ -252,7 +292,14 @@ describe('GET /v1/admin/indexer/dead-letter', () => {
       .set('Authorization', `Bearer ${adminToken()}`);
 
     expect(res.status).toBe(400);
+    expectErrorEnvelope(res.body, { code: 'validation_error', status: 400 });
     expect(res.body.error).toMatch(/startDate must be a valid ISO-8601 date/);
+    expect(Array.isArray(res.body.details)).toBe(true);
+    expect(res.body.details).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: expect.stringContaining('startDate') }),
+      ]),
+    );
     expect(mocks.prisma.indexerDeadLetterEvent.findMany).not.toHaveBeenCalled();
   });
 
@@ -262,10 +309,30 @@ describe('GET /v1/admin/indexer/dead-letter', () => {
       .set('Authorization', `Bearer ${adminToken()}`);
 
     expect(res.status).toBe(400);
+    expectErrorEnvelope(res.body, { code: 'validation_error', status: 400 });
     expect(res.body.error).toMatch(/startDate must be before endDate/);
   });
 
-  it('answers 500 when the table read fails', async () => {
+  it('rejects a non-numeric page parameter', async () => {
+    const res = await request(app())
+      .get('/v1/admin/indexer/dead-letter?page=abc')
+      .set('Authorization', `Bearer ${adminToken()}`);
+
+    expect(res.status).toBe(400);
+    expectErrorEnvelope(res.body, { code: 'validation_error', status: 400 });
+    expect(mocks.prisma.indexerDeadLetterEvent.findMany).not.toHaveBeenCalled();
+  });
+
+  it('rejects a negative page parameter', async () => {
+    const res = await request(app())
+      .get('/v1/admin/indexer/dead-letter?page=-1')
+      .set('Authorization', `Bearer ${adminToken()}`);
+
+    expect(res.status).toBe(400);
+    expectErrorEnvelope(res.body, { code: 'validation_error', status: 400 });
+  });
+
+  it('answers 500 when the table read fails without leaking internals', async () => {
     mocks.prisma.indexerDeadLetterEvent.findMany.mockRejectedValueOnce(
       new Error('relation does not exist'),
     );
@@ -275,6 +342,7 @@ describe('GET /v1/admin/indexer/dead-letter', () => {
       .set('Authorization', `Bearer ${adminToken()}`);
 
     expect(res.status).toBe(500);
+    expectErrorEnvelope(res.body, { code: 'internal_error', status: 500 });
     expect(res.body.error).toMatch(/Failed to list dead-letter events/);
   });
 });
@@ -311,6 +379,7 @@ describe('POST /v1/admin/indexer/dead-letter/:id/replay', () => {
       .set('Authorization', `Bearer ${adminToken()}`);
 
     expect(res.status).toBe(404);
+    expectErrorEnvelope(res.body, { code: 'not_found', status: 404 });
     expect(mocks.processEvent).not.toHaveBeenCalled();
   });
 
@@ -330,6 +399,7 @@ describe('POST /v1/admin/indexer/dead-letter/:id/replay', () => {
       attempts: 2,
       errorMessage: 'handler still throws',
     });
+    expect(res.body).not.toHaveProperty('stack');
     expect(mocks.prisma.indexerDeadLetterEvent.delete).not.toHaveBeenCalled();
   });
 
@@ -345,6 +415,7 @@ describe('POST /v1/admin/indexer/dead-letter/:id/replay', () => {
 
     expect(res.status).toBe(422);
     expect(res.body.code).toBe('undecodable_payload');
+    expect(res.body).not.toHaveProperty('stack');
     expect(mocks.processEvent).not.toHaveBeenCalled();
   });
 });
@@ -441,6 +512,21 @@ describe('DELETE /v1/admin/indexer/dead-letter/:id', () => {
       .set('Authorization', `Bearer ${adminToken()}`);
 
     expect(res.status).toBe(404);
+    expectErrorEnvelope(res.body, { code: 'not_found', status: 404 });
     expect(mocks.prisma.indexerDeadLetterEvent.delete).not.toHaveBeenCalled();
+  });
+
+  it('answers 500 without leaking internals when the delete fails', async () => {
+    mocks.prisma.indexerDeadLetterEvent.findUnique.mockResolvedValueOnce(row());
+    mocks.prisma.indexerDeadLetterEvent.delete.mockRejectedValueOnce(
+      new Error('PrismaClientKnownRequestError P2025'),
+    );
+
+    const res = await request(app())
+      .delete('/v1/admin/indexer/dead-letter/row-1')
+      .set('Authorization', `Bearer ${adminToken()}`);
+
+    expect(res.status).toBe(500);
+    expectErrorEnvelope(res.body, { code: 'internal_error', status: 500 });
   });
 });

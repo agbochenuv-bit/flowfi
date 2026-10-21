@@ -1,4 +1,4 @@
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS builder
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS builder
 
 WORKDIR /app
 
@@ -19,34 +19,20 @@ COPY src ./src
 
 RUN npm run build
 
-FROM node:20-alpine@sha256:fb4cd12c85ee03686f6af5362a0b0d56d50c58a04632e6c0fb8363f609372293 AS runner
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS runner
 
 WORKDIR /app
 
 ENV NODE_ENV=production
 
-# Order matters here for layer caching: COPY package*.json + npm install
-# stay pinned together so that pure source-only changes do NOT invalidate
-# the dependency install. --ignore-scripts skips the @prisma/client
-# postinstall (we already COPY the generated client from the builder
-# below), so the runner never needs the schema to install dependencies.
-# The schema is then copied AFTER install so it is on disk for the
-# `npx prisma db push` step the workflow runs against this container,
-# while keeping the install layer cached whenever prisma/ is unchanged.
 COPY package*.json ./
 RUN npm install --omit=dev --ignore-scripts
 
-# Copy the prisma schema into the runner. The boot-and-check-health step
-# in .github/workflows/ci.yml runs `npx prisma db push` against this
-# container; without prisma/schema.prisma on disk, that command errors
-# out and the 60-iteration /health poll times the job out.
-COPY prisma ./prisma
-
 COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/src/generated ./dist/generated
-COPY --from=builder /app/prisma ./prisma
-COPY prisma.config.ts ./
 
 EXPOSE 3001
 
-CMD ["npm", "start"]
+USER node
+
+CMD ["node", "dist/index.js"]

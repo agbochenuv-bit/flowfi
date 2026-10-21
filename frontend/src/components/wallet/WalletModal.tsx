@@ -85,6 +85,7 @@ export function WalletModal({ onClose }: WalletModalProps) {
       role="dialog"
       aria-modal="true"
       aria-labelledby="wallet-modal-title"
+        aria-describedby="wallet-modal-description"
       onClick={handleBackdropClick}
     >
       <div ref={dialogRef} className="wallet-modal">
@@ -93,8 +94,8 @@ export function WalletModal({ onClose }: WalletModalProps) {
           <div>
             <p className="kicker">FlowFi</p>
             <h2 id="wallet-modal-title">Connect a wallet</h2>
-            <p className="subtitle">
-              Choose your Stellar wallet. Your session is stored locally so you
+            <p id="wallet-modal-description" className="subtitle">
+                Choose your Stellar wallet. Your session is stored locally so you
               stay signed in after refresh.
             </p>
           </div>
@@ -153,6 +154,7 @@ export function WalletModal({ onClose }: WalletModalProps) {
                     type="button"
                     className="wallet-button"
                     disabled={isConnecting}
+                    aria-busy={isConnectingThis}
                     onClick={() => void handleConnect(wallet.id)}
                   >
                     {isConnectingThis ? (
@@ -173,6 +175,9 @@ export function WalletModal({ onClose }: WalletModalProps) {
         <p
           className="wallet-status"
           data-busy={isConnecting ? "true" : undefined}
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
         >
           {isConnecting
             ? "Waiting for wallet approval…"

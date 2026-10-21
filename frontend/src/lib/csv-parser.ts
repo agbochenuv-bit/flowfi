@@ -1,3 +1,5 @@
+import { hasValidPrecision, parseAmountExact } from "@/utils/amount";
+
 /**
  * CSV Parser & Validator for Batch Stream Payroll Upload
  * 
@@ -36,7 +38,7 @@ export interface BatchValidationSummary {
 
 const PROTOCOL_FEE_RATE = 250n; // 2.5% = 250 basis points
 const BASIS_POINTS = 10000n;
-const TOKEN_DECIMALS = 7;
+const DEFAULT_TOKEN_DECIMALS = 7;
 
 /**
  * Validates a Stellar public key format (starts with G, 56 chars, Base32)
@@ -57,7 +59,7 @@ function isValidFederatedName(value: string): boolean {
 /**
  * Validates a single batch stream entry
  */
-export function validateEntry(entry: BatchStreamEntry): ValidationError[] {
+export function validateEntry(entry: BatchStreamEntry, tokenDecimals = DEFAULT_TOKEN_DECIMALS): ValidationError[] {
   const errors: ValidationError[] = [];
 
   // Validate recipient
@@ -76,19 +78,15 @@ export function validateEntry(entry: BatchStreamEntry): ValidationError[] {
   if (!amountStr) {
     errors.push({ field: "amount", message: "Amount is required" });
   } else {
-    const amount = parseFloat(amountStr);
-    if (isNaN(amount)) {
+    if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(amountStr)) {
       errors.push({ field: "amount", message: "Amount must be a number" });
-    } else if (amount <= 0) {
+    } else if (!hasValidPrecision(amountStr, tokenDecimals)) {
+      errors.push({
+        field: "amount",
+        message: `Maximum ${tokenDecimals} decimal places allowed`
+      });
+    } else if (parseAmountExact(amountStr, tokenDecimals) <= 0n) {
       errors.push({ field: "amount", message: "Amount must be positive" });
-    } else if (amountStr.includes(".")) {
-      const decimals = amountStr.split(".")[1]?.length ?? 0;
-      if (decimals > TOKEN_DECIMALS) {
-        errors.push({
-          field: "amount",
-          message: `Maximum ${TOKEN_DECIMALS} decimal places allowed`
-        });
-      }
     }
   }
 
@@ -132,7 +130,7 @@ export function validateEntry(entry: BatchStreamEntry): ValidationError[] {
 /**
  * Parses a CSV string into batch stream entries with validation
  */
-export function parseBatchCSV(csvContent: string): BatchValidationSummary {
+export function parseBatchCSV(csvContent: string, tokenDecimals = DEFAULT_TOKEN_DECIMALS): BatchValidationSummary {
   const lines = csvContent
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -192,12 +190,12 @@ export function parseBatchCSV(csvContent: string): BatchValidationSummary {
       cliffSeconds: cliffIdx >= 0 ? ((columns[cliffIdx] as string) ?? "") : "0",
     };
 
-    const errors = validateEntry(entry);
+    const errors = validateEntry(entry, tokenDecimals);
 
     // Calculate amounts for valid entries
     if (errors.length === 0) {
       const amountStr = entry.amount.trim();
-      const amountUnits = BigInt(Math.round(parseFloat(amountStr) * 10 ** TOKEN_DECIMALS));
+      const amountUnits = parseAmountExact(amountStr, tokenDecimals);
       const protocolFee = (amountUnits * PROTOCOL_FEE_RATE) / BASIS_POINTS;
       totalGrossAmount += amountUnits;
       totalProtocolFee += protocolFee;
@@ -273,8 +271,8 @@ GCBA6C5YC3FXYC4KC7LC5MC2P3C4R5C6C7U4VC5WC2X3YC2Z3AC4BC5C,1000.00,86400,0`;
 /**
  * Formats a base units amount to human readable string
  */
-export function formatAmount(amount: bigint, decimals: number = TOKEN_DECIMALS): string {
-  const divisor = BigInt(10 ** decimals);
+export function formatAmount(amount: bigint, decimals: number = DEFAULT_TOKEN_DECIMALS): string {
+  const divisor = 10n ** BigInt(decimals);
   const whole = amount / divisor;
   const fraction = (amount % divisor).toString().padStart(decimals, "0").replace(/0+$/, "");
   return fraction.length > 0 ? `${whole.toString()}.${fraction}` : whole.toString();

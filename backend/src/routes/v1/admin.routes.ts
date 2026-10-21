@@ -14,6 +14,12 @@ import {
   listDeadLetterHandler,
   replayAllDeadLetterHandler,
   replayDeadLetterHandler,
+  startBackfillHandler,
+  listBackfillJobsHandler,
+  getBackfillStatusHandler,
+  pauseBackfillHandler,
+  resumeBackfillHandler,
+  cancelBackfillHandler,
 } from '../../controllers/admin.controller.js';
 
 import { prisma, pool } from '../../lib/prisma.js';
@@ -633,5 +639,302 @@ router.post('/indexer/dead-letter/:id/replay', replayDeadLetterHandler);
  *         description: Dead-letter event not found
  */
 router.delete('/indexer/dead-letter/:id', discardDeadLetterHandler);
+
+// ─── Backfill (range-based historical indexing) ─────────────────────────────────
+//
+// These endpoints manage bounded historical backfill jobs that process ledger
+// ranges independently of the live indexer cursor. They support progress tracking,
+// safe pause/resume, and duplicate protection via the existing unique constraints
+// on StreamEvent (transactionHash + eventType).
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Start a new bounded historical backfill job
+ *     description: |
+ *       Creates and starts a backfill job that processes events in the ledger range
+ *       [fromLedger, toLedger] independently of the live indexer cursor. The job runs
+ *       asynchronously and its progress can be tracked via GET /backfill/:id.
+ *
+ *       Duplicate protection: The same unique constraint on StreamEvent
+ *       (transactionHash + eventType) that protects the live indexer also protects
+ *       backfill jobs. Events already indexed will be skipped without error.
+ *
+ *       Concurrency: Only one running/pending backfill job per overlapping ledger
+ *       range is allowed. Returns 409 if an overlapping job exists.
+ *     security: [{ adminAuth: [] }]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [fromLedger, toLedger]
+ *             properties:
+ *               fromLedger:
+ *                 type: integer
+ *                 minimum: 0
+ *                 description: Inclusive start ledger sequence
+ *               toLedger:
+ *                 type: integer
+ *                 minimum: 0
+ *                 description: Inclusive end ledger sequence
+ *               name:
+ *                 type: string
+ *                 description: Optional human-readable name for the backfill job
+ *     responses:
+ *       202:
+ *         description: Backfill job created and started
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *                 id: { type: string }
+ *                 status: { type: string, enum: [PENDING, RUNNING, PAUSED, COMPLETED, FAILED, CANCELLED] }
+ *                 message: { type: string }
+ *       400:
+ *         description: Invalid ledger range
+ *       409:
+ *         description: Overlapping backfill job already running
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ *       500:
+ *         description: Internal server error
+ */
+router.post('/indexer/backfill', startBackfillHandler);
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill:
+ *   get:
+ *     tags: [Admin]
+ *     summary: List backfill jobs
+ *     description: |
+ *       Returns a paginated list of backfill jobs, optionally filtered by status.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: query
+ *         name: status
+ *         schema:
+ *           type: string
+ *           enum: [PENDING, RUNNING, PAUSED, COMPLETED, FAILED, CANCELLED]
+ *         description: Filter by job status
+ *       - in: query
+ *         name: limit
+ *         schema: { type: integer, minimum: 1, maximum: 100, default: 50 }
+ *       - in: query
+ *         name: offset
+ *         schema: { type: integer, minimum: 0, default: 0 }
+ *     responses:
+ *       200:
+ *         description: Paginated list of backfill jobs
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 jobs:
+ *                   type: array
+ *                   items:
+ *                     type: object
+ *                     properties:
+ *                       id: { type: string }
+ *                       name: { type: string, nullable: true }
+ *                       fromLedger: { type: integer }
+ *                       toLedger: { type: integer }
+ *                       status: { type: string }
+ *                       currentLedger: { type: integer }
+ *                       eventsProcessed: { type: integer }
+ *                       eventsFailed: { type: integer }
+ *                       errorMessage: { type: string, nullable: true }
+ *                       startedAt: { type: string, format: date-time, nullable: true }
+ *                       completedAt: { type: string, format: date-time, nullable: true }
+ *                       createdAt: { type: string, format: date-time }
+ *                       updatedAt: { type: string, format: date-time }
+ *                 total: { type: integer }
+ *                 limit: { type: integer }
+ *                 offset: { type: integer }
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ */
+router.get('/indexer/backfill', listBackfillJobsHandler);
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill/{id}:
+ *   get:
+ *     tags: [Admin]
+ *     summary: Get backfill job status and progress
+ *     description: |
+ *       Returns detailed progress information for a backfill job, including
+ *       percentage complete, ledgers remaining, and estimated completion time.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Backfill job progress
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 job:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     name: { type: string, nullable: true }
+ *                     fromLedger: { type: integer }
+ *                     toLedger: { type: integer }
+ *                     status: { type: string }
+ *                     currentLedger: { type: integer }
+ *                     eventsProcessed: { type: integer }
+ *                     eventsFailed: { type: integer }
+ *                     errorMessage: { type: string, nullable: true }
+ *                     startedAt: { type: string, format: date-time, nullable: true }
+ *                     completedAt: { type: string, format: date-time, nullable: true }
+ *                     createdAt: { type: string, format: date-time }
+ *                     updatedAt: { type: string, format: date-time }
+ *                 percentComplete: { type: number }
+ *                 ledgersRemaining: { type: integer }
+ *                 estimatedCompletionAt: { type: string, format: date-time, nullable: true }
+ *       404:
+ *         description: Backfill job not found
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ */
+router.get('/indexer/backfill/:id', getBackfillStatusHandler);
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill/{id}/pause:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Pause a running backfill job
+ *     description: |
+ *       Pauses a running backfill job. The job will finish processing the current
+ *       batch before pausing. Progress is preserved and can be resumed later.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Job paused
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *                 job:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     status: { type: string }
+ *       400:
+ *         description: Job cannot be paused (not in RUNNING state)
+ *       404:
+ *         description: Backfill job not found
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ */
+router.post('/indexer/backfill/:id/pause', pauseBackfillHandler);
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill/{id}/resume:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Resume a paused backfill job
+ *     description: |
+ *       Resumes a paused backfill job from where it left off.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Job resumed
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *                 job:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     status: { type: string }
+ *       400:
+ *         description: Job cannot be resumed (not in PAUSED state)
+ *       404:
+ *         description: Backfill job not found
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ */
+router.post('/indexer/backfill/:id/resume', resumeBackfillHandler);
+
+/**
+ * @openapi
+ * /v1/admin/indexer/backfill/{id}/cancel:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Cancel a backfill job
+ *     description: |
+ *       Cancels a pending, running, or paused backfill job. Cannot cancel a
+ *       completed or already cancelled job.
+ *     security: [{ adminAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Job cancelled
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok: { type: boolean, example: true }
+ *                 job:
+ *                   type: object
+ *                   properties:
+ *                     id: { type: string }
+ *                     status: { type: string }
+ *       400:
+ *         description: Job cannot be cancelled (already completed/cancelled)
+ *       404:
+ *         description: Backfill job not found
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden - admin access required
+ */
+router.post('/indexer/backfill/:id/cancel', cancelBackfillHandler);
 
 export default router;

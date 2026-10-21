@@ -41,6 +41,35 @@ export const TokenStep: React.FC<TokenStepProps> = ({
               type="button"
               role="radio"
               aria-checked={isSelected}
+              tabIndex={isSelected ? 0 : -1}
+              data-token-id={token.id}
+              onKeyDown={(event) => {
+                const direction = ["ArrowRight", "ArrowDown"].includes(event.key)
+                  ? 1
+                  : ["ArrowLeft", "ArrowUp"].includes(event.key)
+                    ? -1
+                    : event.key === "Home"
+                      ? -TOKENS.length
+                      : event.key === "End"
+                        ? TOKENS.length
+                        : 0;
+                if (!direction) return;
+                event.preventDefault();
+                const options = Array.from(
+                  event.currentTarget.closest('[role="radiogroup"]')?.querySelectorAll<HTMLButtonElement>('[role="radio"]') ?? [],
+                );
+                const currentIndex = options.indexOf(event.currentTarget);
+                const nextIndex = direction === TOKENS.length
+                  ? options.length - 1
+                  : direction === -TOKENS.length
+                    ? 0
+                    : (currentIndex + direction + options.length) % options.length;
+                const nextOption = options[nextIndex];
+                if (nextOption) {
+                  nextOption.focus();
+                  onChange(nextOption.dataset.tokenId ?? "");
+                }
+              }}
               onClick={() => onChange(token.id)}
               className={`p-4 rounded-lg border-2 transition-all text-left ${
                 isSelected

@@ -1,27 +1,32 @@
 "use client";
 import React, { useRef, useEffect } from "react";
-import { getSpendableBalance, XLM_BASE_RESERVE } from "@/lib/stream-validation";
+import { getSpendableBalanceExact, XLM_BASE_RESERVE } from "@/lib/stream-validation";
+import { parseAmountExact } from "@/utils/amount";
 
 interface AmountStepProps {
   value: string;
   onChange: (value: string) => void;
   error?: string;
+  rateError?: string;
   token?: string;
   availableBalance?: string | null;
   isBalanceLoading?: boolean;
   balanceError?: string | null;
   onSetMax?: () => void;
+  decimals?: number;
 }
 
 export const AmountStep: React.FC<AmountStepProps> = ({
   value,
   onChange,
   error,
+  rateError,
   token,
   availableBalance,
   isBalanceLoading = false,
   balanceError,
   onSetMax,
+  decimals = 7,
 }) => {
   const handleAmountChange = (newValue: string) => {
     onChange(newValue);
@@ -34,19 +39,20 @@ export const AmountStep: React.FC<AmountStepProps> = ({
   }, []);
 
   const isXlm = (token ?? "").toUpperCase() === "XLM";
-  const spendable = getSpendableBalance(availableBalance, token);
+  const spendable = getSpendableBalanceExact(availableBalance, token, decimals);
   const isSpendableKnown = spendable !== null;
-  const canSetMax = isSpendableKnown && spendable > 0 && !isBalanceLoading;
+  const canSetMax = isSpendableKnown && spendable !== "0" && !isBalanceLoading;
 
   // Live over-balance detection so the error appears before the user tries
   // to advance / submit, not just after the step is validated.
-  const parsedValue = parseFloat(value);
-  const isOverBalance =
-    !error &&
-    isSpendableKnown &&
-    value.trim() !== "" &&
-    !isNaN(parsedValue) &&
-    parsedValue > spendable;
+  let isOverBalance = false;
+  try {
+    if (value.trim() && spendable !== null) {
+      isOverBalance = parseAmountExact(value, decimals) > parseAmountExact(spendable, decimals);
+    }
+  } catch {
+    isOverBalance = false;
+  }
 
   return (
     <div className="space-y-4">
@@ -87,9 +93,8 @@ export const AmountStep: React.FC<AmountStepProps> = ({
           <input
             ref={inputRef}
             id="amount"
-            type="number"
-            step="any"
-            min="0"
+            type="text"
+            inputMode="decimal"
             value={value}
             onChange={(e) => handleAmountChange(e.target.value)}
             placeholder="0.00"
@@ -134,6 +139,11 @@ export const AmountStep: React.FC<AmountStepProps> = ({
             {error || "Amount exceeds wallet balance"}
           </p>
         )}
+        {rateError && (
+          <p className="mt-2 text-sm text-red-400" role="alert">
+            {rateError}
+          </p>
+        )}
         {!error && !isOverBalance && balanceError && (
           <p className="mt-2 text-sm text-amber-400" role="status">
             {balanceError}
@@ -141,7 +151,9 @@ export const AmountStep: React.FC<AmountStepProps> = ({
         )}
       </div>
 
-      {value && !error && !isOverBalance && parseFloat(value) > 0 && (
+      {value && !error && !isOverBalance && (() => {
+        try { return parseAmountExact(value, decimals) > 0n; } catch { return false; }
+      })() && (
         <div className="mt-4 p-4 rounded-lg bg-accent/5 border border-accent/20">
           <p className="text-sm text-slate-300">
             You will stream <strong className="text-accent">{value} {token || ""}</strong> to the recipient.

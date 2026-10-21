@@ -57,11 +57,21 @@ model Stream {
   @@index([isPaused])
 }
 
-// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker
+// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
+//
+// Concurrency contract (issue #43): replay, reset, and normal polling all mutate
+// this single row. Writers MUST take a row-level lock (SELECT ... FOR UPDATE) on
+// the singleton row inside a transaction before reading or advancing the cursor,
+// so an admin replay cannot race the live worker or move the cursor backwards.
+// The `version` column is an optimistic-concurrency guard: every write bumps it
+// and callers that observed a stale version must retry. `lastCursor` is only ever
+// advanced monotonically (never regressed) by the poll loop; replay/reset are the
+// only operations allowed to rewind it, and they do so under the same lock.
 model IndexerState {
   id          String   @id @default("singleton")
   lastLedger  Int      @default(0)
   lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
+  version     Int      @default(0) // Optimistic-concurrency guard; bumped on every write
   updatedAt   DateTime @updatedAt
 }
 
@@ -104,6 +114,10 @@ model StreamEvent {
   @@index([transactionHash])
   @@index([createdAt])
   @@index([streamId, timestamp])
+  // Canonical ordering index: (streamId, ledgerSequence) gives deterministic
+  // blockchain-ordered event listings. ledger_sequence is the total order on
+  // Stellar — no two events in different ledgers share a sequence number.
+  @@index([streamId, ledgerSequence])
 }
 
 // WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
@@ -176,4 +190,34 @@ model IndexerDeadLetterEvent {
   @@index([createdAt])
   @@index([attempts])
   @@index([eventType])
+}
+
+// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
+// Allows safe restart, progress monitoring, and protection from duplicate writes.
+model BackfillJob {
+  id            String   @id @default(uuid())
+  name          String?  // Optional human-readable name for the backfill
+  fromLedger    Int      // Inclusive start ledger
+  toLedger      Int      // Inclusive end ledger
+  status        BackfillStatus @default(PENDING)
+  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
+  eventsProcessed Int    @default(0)
+  eventsFailed    Int    @default(0)
+  errorMessage    String? // Last error if failed
+  startedAt       DateTime?
+  completedAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([status])
+  @@index([fromLedger, toLedger])
+  @@index([createdAt])
+}
+
+enum BackfillStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+  CANCELLED
 }

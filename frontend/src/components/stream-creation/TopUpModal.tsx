@@ -9,8 +9,9 @@
 
 import React, { useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
-import { hasValidPrecision, validateAmountInput } from "@/utils/amount";
+import { formatAmount, hasValidPrecision, parseAmountExact, validateAmountInput } from "@/utils/amount";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { getTokenDecimals, useTokenMetadata } from "@/hooks/useTokenMetadata";
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
 
@@ -18,7 +19,7 @@ interface TopUpModalProps {
   streamId: string;
   token: string;
   currentDeposited: number;
-  onConfirm: (streamId: string, amount: string) => Promise<void>;
+  onConfirm: (streamId: string, amount: string, decimals: number) => Promise<void>;
   onClose: () => void;
 }
 
@@ -40,17 +41,17 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
     initialFocusRef: inputRef,
   });
 
-  // Token decimals - using 7 as default (Stellar standard)
-  const TOKEN_DECIMALS = 7;
+  const { data: tokenMetadata = [] } = useTokenMetadata();
+  const tokenDecimals = getTokenDecimals(token, tokenMetadata);
 
   const validate = (): boolean => {
-    const validationError = validateAmountInput(amount, TOKEN_DECIMALS);
+    const validationError = validateAmountInput(amount, tokenDecimals);
     if (validationError) {
       setError(validationError);
       return false;
     }
-    if (!hasValidPrecision(amount, 7)) {
-      setError("Amount exceeds maximum precision (7 decimal places).");
+    if (!hasValidPrecision(amount, tokenDecimals)) {
+      setError(`Amount exceeds maximum precision (${tokenDecimals} decimal places).`);
       return false;
     }
     setError(null);
@@ -61,7 +62,7 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
     if (!validate()) return;
     setIsSubmitting(true);
     try {
-      await onConfirm(streamId, amount);
+      await onConfirm(streamId, amount, tokenDecimals);
       transactionSuccessToast(`Successfully added ${amount} ${token} to stream`);
     } catch {
       toast.error("Failed to top up stream. Please try again.");
@@ -69,10 +70,18 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
     }
   };
 
-  const parsedAmount = parseFloat(amount);
-  const newTotal = !isNaN(parsedAmount) && parsedAmount > 0
-    ? currentDeposited + parsedAmount
-    : null;
+  let newTotal: string | null = null;
+  try {
+    if (amount.trim()) {
+      newTotal = formatAmount(
+        parseAmountExact(String(currentDeposited), tokenDecimals) +
+          parseAmountExact(amount, tokenDecimals),
+        tokenDecimals,
+      );
+    }
+  } catch {
+    newTotal = null;
+  }
 
   return (
     <div
@@ -130,7 +139,7 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
                 const newValue = e.target.value;
                 // Only allow valid number characters and check precision
                 if (newValue === '' || /^\d*\.?\d*$/.test(newValue)) {
-                  if (hasValidPrecision(newValue, TOKEN_DECIMALS)) {
+                  if (hasValidPrecision(newValue, tokenDecimals)) {
                     setAmount(newValue);
                     if (error) setError(null);
                   }
@@ -170,7 +179,7 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
             <p className="text-slate-300">
               New total:{" "}
               <strong className="text-accent">
-                {newTotal.toFixed(2)} {token}
+                {newTotal} {token}
               </strong>
             </p>
           </div>

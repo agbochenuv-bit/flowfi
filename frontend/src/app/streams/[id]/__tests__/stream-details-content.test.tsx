@@ -18,6 +18,10 @@ vi.mock("@/context/wallet-context", () => ({
   }),
 }));
 
+vi.mock("@/context/NetworkContext", () => ({
+  useNetwork: () => ({ networkId: "testnet" }),
+}));
+
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
 }));
@@ -38,10 +42,12 @@ const { mockToast, mockSoroban, mockTracker, mockUseStreamingAmount, mockTransac
     txHash: "",
     error: "",
     start: vi.fn(),
+    stage: vi.fn(),
     submit: vi.fn(),
     confirm: vi.fn(),
     succeed: vi.fn(),
     fail: vi.fn(),
+    timeout: vi.fn(),
   };
   const mockUseStreamingAmount = vi.fn(() => 123456789);
   const mockTransactionSuccessToast = vi.fn();
@@ -75,6 +81,11 @@ vi.mock("@/hooks/useTokenPrice", () => ({
   useTokenPrice: () => ({ data: null, isLoading: false }),
   convertToFiat: () => 0,
   formatFiatAmount: (v: number) => `$${v.toFixed(2)}`,
+}));
+
+vi.mock("@/hooks/useTokenMetadata", () => ({
+  useTokenMetadata: () => ({ data: [] }),
+  getTokenDecimals: () => 7,
 }));
 
 // The shared ticking hook is exercised by its own suite
@@ -346,11 +357,14 @@ describe("StreamDetailsContent handleWithdraw", () => {
 
     const withdrawBtn = screen.getByRole("button", { name: /withdraw/i });
     await user.click(withdrawBtn);
+    expect(mockSoroban.withdrawFromStream).not.toHaveBeenCalled();
+    expect(screen.getByText("TESTNET")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.withdrawFromStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Withdrawal successful!");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when withdrawFromStream throws", async () => {
@@ -359,6 +373,7 @@ describe("StreamDetailsContent handleWithdraw", () => {
 
     const withdrawBtn = screen.getByRole("button", { name: /withdraw/i });
     await user.click(withdrawBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();
@@ -412,7 +427,7 @@ describe("StreamDetailsContent handleTopUp", () => {
     await waitFor(() => {
       expect(mockSoroban.topUpStream).toHaveBeenCalled();
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream topped up successfully!");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when topUpStream throws", async () => {
@@ -469,14 +484,16 @@ describe("StreamDetailsContent handlePause", () => {
 
     const pauseBtn = screen.getByRole("button", { name: /pause/i });
     await user.click(pauseBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.pauseStream).toHaveBeenCalledWith(
         mockSession,
         { streamId: BigInt(STREAM_ID) },
+        expect.any(Function),
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream paused");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when pauseStream throws", async () => {
@@ -485,6 +502,7 @@ describe("StreamDetailsContent handlePause", () => {
 
     const pauseBtn = screen.getByRole("button", { name: /pause/i });
     await user.click(pauseBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();
@@ -511,14 +529,16 @@ describe("StreamDetailsContent handleResume", () => {
 
     const resumeBtn = screen.getByRole("button", { name: /resume/i });
     await user.click(resumeBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockSoroban.resumeStream).toHaveBeenCalledWith(
         mockSession,
         { streamId: BigInt(STREAM_ID) },
+        expect.any(Function),
       );
     });
-    expect(mockTransactionSuccessToast).toHaveBeenCalledWith("Stream resumed");
+    expect(mockTransactionSuccessToast).not.toHaveBeenCalled();
   });
 
   it("shows error toast when resumeStream throws", async () => {
@@ -527,6 +547,7 @@ describe("StreamDetailsContent handleResume", () => {
 
     const resumeBtn = screen.getByRole("button", { name: /resume/i });
     await user.click(resumeBtn);
+    await user.click(screen.getByRole("button", { name: /continue to wallet/i }));
 
     await waitFor(() => {
       expect(mockToast.error).toHaveBeenCalled();

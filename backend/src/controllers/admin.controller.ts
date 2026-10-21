@@ -8,6 +8,14 @@ import {
   listDeadLetterEvents,
   replayAllDeadLetterEvents,
   replayDeadLetterEvent,
+  startBackfill,
+  getBackfillStatus,
+  getBackfillProgress,
+  listBackfillJobs,
+  pauseBackfill,
+  resumeBackfill,
+  cancelBackfill,
+  BackfillStatus,
 } from '../services/indexerService.js';
 import logger from '../logger.js';
 
@@ -182,5 +190,166 @@ export const discardDeadLetterHandler = async (req: Request, res: Response) => {
     }
     logger.error(`[AdminController] Discard of dead-letter ${id} threw:`, err);
     return res.status(500).json({ error: 'Discard failed' });
+  }
+};
+
+/**
+ * POST /api/v1/admin/indexer/backfill
+ *
+ * Start a new bounded historical backfill job.
+ */
+export const startBackfillHandler = async (req: Request, res: Response) => {
+  const fromLedger = parseOptionalInt(req.body?.fromLedger);
+  const toLedger = parseOptionalInt(req.body?.toLedger);
+  const name = readSingleQueryParam(req.body?.name);
+
+  if (fromLedger === undefined || toLedger === undefined) {
+    return res.status(400).json({ error: 'fromLedger and toLedger are required non-negative integers' });
+  }
+
+  if (fromLedger > toLedger) {
+    return res.status(400).json({ error: 'fromLedger must be less than or equal to toLedger' });
+  }
+
+  try {
+    const result = await startBackfill({ fromLedger, toLedger, name });
+    return res.status(202).json({ ok: true, ...result });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('already running')) {
+      return res.status(409).json({ error: message });
+    }
+    logger.error('[AdminController] Start backfill threw:', err);
+    return res.status(500).json({ error: 'Failed to start backfill' });
+  }
+};
+
+/**
+ * GET /api/v1/admin/indexer/backfill
+ *
+ * List backfill jobs with optional filtering.
+ */
+export const listBackfillJobsHandler = async (req: Request, res: Response) => {
+  const statusRaw = readSingleQueryParam(req.query.status);
+  const status = statusRaw && Object.values(BackfillStatus).includes(statusRaw as BackfillStatus)
+    ? (statusRaw as BackfillStatus)
+    : undefined;
+  const limit = parseOptionalInt(readSingleQueryParam(req.query.limit)) ?? 50;
+  const offset = parseOptionalInt(readSingleQueryParam(req.query.offset)) ?? 0;
+
+  try {
+    const result = await listBackfillJobs({ status, limit, offset });
+    return res.status(200).json(result);
+  } catch (err) {
+    logger.error('[AdminController] List backfill jobs threw:', err);
+    return res.status(500).json({ error: 'Failed to list backfill jobs' });
+  }
+};
+
+/**
+ * GET /api/v1/admin/indexer/backfill/:id
+ *
+ * Get backfill job status and progress metadata.
+ */
+export const getBackfillStatusHandler = async (req: Request, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  try {
+    const progress = await getBackfillProgress(id);
+    if (!progress) {
+      return res.status(404).json({ error: 'Backfill job not found' });
+    }
+    return res.status(200).json(progress);
+  } catch (err) {
+    logger.error(`[AdminController] Get backfill status ${id} threw:`, err);
+    return res.status(500).json({ error: 'Failed to get backfill status' });
+  }
+};
+
+/**
+ * POST /api/v1/admin/indexer/backfill/:id/pause
+ *
+ * Pause a running backfill job.
+ */
+export const pauseBackfillHandler = async (req: Request, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  try {
+    const job = await pauseBackfill(id);
+    if (!job) {
+      return res.status(404).json({ error: 'Backfill job not found' });
+    }
+    return res.status(200).json({ ok: true, job });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('Cannot pause')) {
+      return res.status(400).json({ error: message });
+    }
+    logger.error(`[AdminController] Pause backfill ${id} threw:`, err);
+    return res.status(500).json({ error: 'Failed to pause backfill' });
+  }
+};
+
+/**
+ * POST /api/v1/admin/indexer/backfill/:id/resume
+ *
+ * Resume a paused backfill job.
+ */
+export const resumeBackfillHandler = async (req: Request, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  try {
+    const job = await resumeBackfill(id);
+    if (!job) {
+      return res.status(404).json({ error: 'Backfill job not found' });
+    }
+    return res.status(200).json({ ok: true, job });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('Cannot resume')) {
+      return res.status(400).json({ error: message });
+    }
+    logger.error(`[AdminController] Resume backfill ${id} threw:`, err);
+    return res.status(500).json({ error: 'Failed to resume backfill' });
+  }
+};
+
+/**
+ * POST /api/v1/admin/indexer/backfill/:id/cancel
+ *
+ * Cancel a backfill job.
+ */
+export const cancelBackfillHandler = async (req: Request, res: Response) => {
+  const rawId = req.params.id;
+  const id = Array.isArray(rawId) ? rawId[0] : rawId;
+  if (!id) {
+    return res.status(400).json({ error: 'id is required' });
+  }
+
+  try {
+    const job = await cancelBackfill(id);
+    if (!job) {
+      return res.status(404).json({ error: 'Backfill job not found' });
+    }
+    return res.status(200).json({ ok: true, job });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes('Cannot cancel')) {
+      return res.status(400).json({ error: message });
+    }
+    logger.error(`[AdminController] Cancel backfill ${id} threw:`, err);
+    return res.status(500).json({ error: 'Failed to cancel backfill' });
   }
 };

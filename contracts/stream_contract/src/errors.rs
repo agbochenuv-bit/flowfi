@@ -112,6 +112,13 @@ pub enum StreamError {
     /// The conditional milestone list would exceed
     /// `MAX_CONDITIONAL_MILESTONES`.
     TooManyMilestones = 44,
+    /// A timestamp calculation (cliff time, end-time projection, step
+    /// accumulation) would overflow the `u64` ledger timestamp range.
+    ///
+    /// Raised by the `checked_add` guards introduced by the arithmetic-bounds
+    /// audit (#26) so an out-of-range timestamp is reported as a stable error
+    /// code rather than silently wrapping or panicking.
+    TimestampOverflow = 45,
 }
 
 // ─── Test diagnostics (compiled only under `cfg(test)`) ───────────────────
@@ -179,6 +186,7 @@ pub(crate) mod test_diagnostics {
                 StreamError::InvalidAttestation => "InvalidAttestation",
                 StreamError::MilestoneCallerUnauthorized => "MilestoneCallerUnauthorized",
                 StreamError::TooManyMilestones => "TooManyMilestones",
+                StreamError::TimestampOverflow => "TimestampOverflow",
             }
         }
     }

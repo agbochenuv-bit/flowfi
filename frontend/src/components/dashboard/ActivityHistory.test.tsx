@@ -94,4 +94,31 @@ describe("ActivityHistory CSV export", () => {
     ).toBeDisabled();
     expect(downloadCSV).not.toHaveBeenCalled();
   });
+
+  it("preserves an event node when an earlier event is prepended", () => {
+    const retainedEvent = makeEvent({ id: "evt-retained" });
+    const { container, rerender } = render(
+      <ActivityHistory events={[retainedEvent]} />,
+    );
+    const retainedNode = container.querySelector('[data-event-id="evt-retained"]');
+
+    rerender(
+      <ActivityHistory
+        events={[makeEvent({ id: "evt-new" }), retainedEvent]}
+      />,
+    );
+
+    expect(container.querySelector('[data-event-id="evt-retained"]')).toBe(retainedNode);
+  });
+
+  it("keeps large timelines bounded and keyboard-focusable", () => {
+    const events = Array.from({ length: 60 }, (_, index) =>
+      makeEvent({ id: `evt-${index}`, streamId: index + 1 }),
+    );
+    render(<ActivityHistory events={events} />);
+
+    const timeline = screen.getByRole("list", { name: "Activity timeline" });
+    expect(timeline).toHaveAttribute("tabindex", "0");
+    expect(timeline.querySelectorAll('[role="listitem"]').length).toBeLessThan(60);
+  });
 });

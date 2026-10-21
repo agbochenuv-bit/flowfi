@@ -46,6 +46,11 @@ vi.mock("@/context/wallet-context", () => ({
   useWallet: () => ({ status: "disconnected", session: null }),
 }));
 
+vi.mock("@/hooks/useTokenMetadata", () => ({
+  useTokenMetadata: () => ({ data: [] }),
+  getTokenDecimals: () => 7,
+}));
+
 vi.mock("@/lib/soroban", () => ({
   createStream: vi.fn(),
   toBaseUnits: vi.fn(),

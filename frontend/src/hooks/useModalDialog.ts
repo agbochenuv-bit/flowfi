@@ -22,24 +22,33 @@ export function useModalDialog({
 }: UseModalDialogOptions) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const previouslyFocusedRef = useRef<HTMLElement | null>(null);
+  const onCloseRef = useRef(onClose);
+  const isCloseDisabledRef = useRef(isCloseDisabled);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+    isCloseDisabledRef.current = isCloseDisabled;
+  }, [onClose, isCloseDisabled]);
 
   useEffect(() => {
     previouslyFocusedRef.current = document.activeElement as HTMLElement | null;
 
-    if (initialFocusRef?.current) {
-      initialFocusRef.current.focus();
-    } else {
-      const focusable = dialogRef.current?.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
-      focusable?.[0]?.focus();
+    const dialog = dialogRef.current;
+    if (dialog) {
+      const focusable = dialog.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR);
+      const initialTarget = initialFocusRef?.current ?? focusable[0] ?? dialog;
+      if (!dialog.hasAttribute("tabindex")) dialog.tabIndex = -1;
+      initialTarget.focus();
     }
 
+    const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
 
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        if (!isCloseDisabled) {
-          onClose();
+        if (!isCloseDisabledRef.current) {
+          onCloseRef.current();
         }
         return;
       }
@@ -61,12 +70,14 @@ export function useModalDialog({
       const lastElement = focusableElements[focusableElements.length - 1];
 
       if (firstElement && lastElement) {
-        if (event.shiftKey && document.activeElement === firstElement) {
+        if (event.shiftKey &&
+          (document.activeElement === firstElement || !dialogRef.current.contains(document.activeElement))) {
           event.preventDefault();
           lastElement.focus();
         }
 
-        if (!event.shiftKey && document.activeElement === lastElement) {
+        if (!event.shiftKey &&
+          (document.activeElement === lastElement || !dialogRef.current.contains(document.activeElement))) {
           event.preventDefault();
           firstElement.focus();
         }
@@ -77,10 +88,10 @@ export function useModalDialog({
 
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
-      document.body.style.overflow = "";
+      document.body.style.overflow = previousOverflow;
       previouslyFocusedRef.current?.focus();
     };
-  }, [onClose, isCloseDisabled, initialFocusRef]);
+  }, [initialFocusRef]);
 
   return dialogRef;
 }

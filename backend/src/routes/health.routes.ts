@@ -5,6 +5,7 @@ import { setIndexerLedgers } from '../lib/metrics.js';
 import { isRedisAvailable } from '../lib/redis.js';
 import { checkRpcHealth } from '../services/sorobanService.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
+import { SUPPORTED_VERSIONS, DEFAULT_VERSION } from '../middleware/api-version.middleware.js';
 
 const router = Router();
 
@@ -117,6 +118,12 @@ router.get('/', async (_req: Request, res: Response) => {
     indexerLedgerLag:
       networkLedger > 0 ? Math.max(0, networkLedger - (state?.lastLedger ?? 0)) : null,
     uptime: process.uptime(),
+    // Supported API versions — clients SHOULD poll this field and surface a
+    // warning when the version they pin is no longer in `supported`.
+    apiVersions: {
+      supported: [...SUPPORTED_VERSIONS] as string[],
+      default: DEFAULT_VERSION as string,
+    },
     checks: {
       database: { status: dbStatus === 'connected' ? 'ok' : 'down' },
       indexer: {

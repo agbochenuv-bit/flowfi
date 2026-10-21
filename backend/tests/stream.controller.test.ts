@@ -221,6 +221,19 @@ describe("Stream Controller", () => {
   });
 
   describe("listStreams", () => {
+    it("rejects a request for a network different from the configured indexer", async () => {
+      const configuredNetwork = process.env.STELLAR_NETWORK === "mainnet" ? "mainnet" : "testnet";
+      req.query = { network: configuredNetwork === "mainnet" ? "testnet" : "mainnet" };
+
+      await listStreams(req as Request, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+        error: expect.objectContaining({ code: "NETWORK_MISMATCH" }),
+      }));
+      expect(prisma.stream.findMany).not.toHaveBeenCalled();
+    });
+
     it("should list streams with pagination", async () => {
       req.query = {
         address: "GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ",

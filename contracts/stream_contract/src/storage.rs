@@ -102,6 +102,23 @@ pub fn remove_stream(env: &Env, stream_id: u64) {
         .remove(&DataKey::Stream(stream_id));
 }
 
+/// Explicitly renews the TTL of an active stream's persistent storage entry.
+///
+/// Call this in long-running operations (e.g. keepers, cron jobs) to prevent
+/// active streams from archiving before they complete. Terminal streams
+/// (Cancelled, Completed) are intentionally NOT renewed — they should archive
+/// naturally after settlement.
+pub fn renew_stream_ttl(env: &Env, stream_id: u64) {
+    let key = DataKey::Stream(stream_id);
+    if env.storage().persistent().has(&key) {
+        env.storage().persistent().extend_ttl(
+            &key,
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+    }
+}
+
 /// Returns the stream if it exists, `None` otherwise (used by read-only queries).
 pub fn try_load_stream(env: &Env, stream_id: u64) -> Option<Stream> {
     let raw: Option<Val> = env.storage().persistent().get(&DataKey::Stream(stream_id));

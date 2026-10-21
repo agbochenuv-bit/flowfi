@@ -38,6 +38,10 @@ if [[ -z "$PR" ]]; then
   echo "Error: --pr <number> is required" >&2
   exit 1
 fi
+if [[ ! "$PR" =~ ^[0-9]+$ ]]; then
+  echo "Error: --pr must be a numeric pull request number" >&2
+  exit 1
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DB_NAME="flowfi_preview_pr_${PR}"

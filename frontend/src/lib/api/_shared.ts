@@ -36,7 +36,11 @@ export async function fetchWithTimeout(
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    const response = await fetch(input, { ...init, signal: controller.signal });
+    if (response.status === 401 && typeof window !== "undefined") {
+      window.dispatchEvent(new Event("flowfi:auth-expired"));
+    }
+    return response;
   } catch (err) {
     if (err instanceof Error && err.name === "AbortError") {
       throw new FetchTimeoutError(timeoutMs);

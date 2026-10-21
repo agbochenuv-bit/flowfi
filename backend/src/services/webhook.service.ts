@@ -3,6 +3,9 @@
  * Delivers real-time HTTP POST notifications for stream events
  */
 import crypto from "crypto";
+import { lookup as dnsLookup } from "node:dns/promises";
+import https from "node:https";
+import { isIP, type LookupFunction } from "node:net";
 import { prisma } from "../lib/prisma.js";
 import logger from "../logger.js";
 
@@ -23,6 +26,169 @@ export interface WebhookPayload {
 
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [0, 60000, 300000, 900000, 3600000]; // 0, 1m, 5m, 15m, 1h
+const WEBHOOK_DELIVERY_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
+const ALERT_HISTORY_RETENTION_MS = 90 * 24 * 60 * 60 * 1000;
+
+export async function purgeExpiredWebhookDeliveries(
+  now = new Date(),
+): Promise<number> {
+  const cutoff = new Date(now.getTime() - WEBHOOK_DELIVERY_RETENTION_MS);
+  const result = await prisma.webhookDelivery.deleteMany({
+    where: { createdAt: { lt: cutoff } },
+  });
+  return result.count;
+}
+
+export async function purgeExpiredAlertHistory(now = new Date()): Promise<number> {
+  const cutoff = new Date(now.getTime() - ALERT_HISTORY_RETENTION_MS);
+  const result = await prisma.alertHistory.deleteMany({
+    where: { sentAt: { lt: cutoff } },
+  });
+  return result.count;
+}
+
+type ResolvedAddress = { address: string; family: number };
+type AddressResolver = (hostname: string) => Promise<ResolvedAddress[]>;
+
+const IPV4_DENY_RANGES: Array<[number, number]> = [
+  [0x00000000, 8], [0x0a000000, 8], [0x64400000, 10], [0x7f000000, 8],
+  [0xa9fe0000, 16], [0xac100000, 12], [0xc0000000, 24], [0xc0000200, 24],
+  [0xc0586300, 24], [0xc0a80000, 16], [0xc6120000, 15], [0xc6336400, 24],
+  [0xcb007100, 24], [0xe0000000, 4], [0xf0000000, 4],
+];
+
+function inIpv4Range(address: number, network: number, prefix: number): boolean {
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  return (address & mask) === (network & mask);
+}
+
+function ipv4Number(address: string): number {
+  return address.split('.').reduce((value, octet) => (value * 256) + Number(octet), 0) >>> 0;
+}
+
+function ipv6Number(address: string): bigint | null {
+  let value = address.toLowerCase().split('%')[0] ?? '';
+  if (value.includes('.')) {
+    const separator = value.lastIndexOf(':');
+    const ipv4 = value.slice(separator + 1);
+    if (isIP(ipv4) !== 4) return null;
+    const number = ipv4Number(ipv4);
+    value = `${value.slice(0, separator)}:${(number >>> 16).toString(16)}:${(number & 0xffff).toString(16)}`;
+  }
+
+  const halves = value.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':') : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':') : [];
+  const missing = 8 - left.length - right.length;
+  if ((halves.length === 1 && missing !== 0) || (halves.length === 2 && missing < 1)) return null;
+  const words = [...left, ...Array(halves.length === 2 ? missing : 0).fill('0'), ...right];
+  if (words.length !== 8 || words.some((word) => !/^[0-9a-f]{1,4}$/.test(word))) return null;
+  return words.reduce((result, word) => (result << 16n) | BigInt(`0x${word}`), 0n);
+}
+
+export function isPublicWebhookAddress(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) {
+    const number = ipv4Number(address);
+    return !IPV4_DENY_RANGES.some(([network, prefix]) => inIpv4Range(number, network, prefix));
+  }
+  if (family !== 6) return false;
+
+  const number = ipv6Number(address);
+  if (number === null) return false;
+  const firstWord = Number((number >> 112n) & 0xffffn);
+  const secondWord = Number((number >> 96n) & 0xffffn);
+  const inGlobalUnicast = (number >> 125n) === 1n;
+  const specialUse =
+    (firstWord === 0x2001 && secondWord <= 0x01ff) ||
+    (firstWord === 0x2001 && secondWord >= 0x0200 && secondWord <= 0x03ff) ||
+    (firstWord === 0x2001 && secondWord === 0x0db8) ||
+    (firstWord === 0x2002) ||
+    (firstWord === 0x3fff && secondWord <= 0x0fff);
+  return inGlobalUnicast && !specialUse;
+}
+
+const resolveAddresses: AddressResolver = async (hostname) => {
+  const unwrappedHostname = hostname.replace(/^\[|\]$/g, '');
+  const family = isIP(unwrappedHostname);
+  if (family) return [{ address: unwrappedHostname, family }];
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      dnsLookup(unwrappedHostname, { all: true, verbatim: true }),
+      new Promise<never>((_, reject) => {
+        timeout = setTimeout(() => reject(new Error('Webhook DNS lookup timed out')), 5_000);
+      }),
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+};
+
+export async function resolveSafeWebhookTarget(
+  target: string,
+  resolver: AddressResolver = resolveAddresses,
+): Promise<{ url: URL; addresses: ResolvedAddress[] }> {
+  let url: URL;
+  try {
+    url = new URL(target);
+  } catch {
+    throw new Error('Webhook URL must be a valid HTTPS URL');
+  }
+  if (url.protocol !== 'https:') throw new Error('Webhook URL must use HTTPS');
+  if (url.username || url.password) throw new Error('Webhook URL must not contain credentials');
+  if (url.hash) throw new Error('Webhook URL must not contain a fragment');
+
+  const addresses = await resolver(url.hostname);
+  if (addresses.length === 0 || addresses.some(({ address }) => !isPublicWebhookAddress(address))) {
+    throw new Error('Webhook URL must resolve only to public IP addresses');
+  }
+  return { url, addresses };
+}
+
+function webhookOrigin(target: string): string {
+  try {
+    return new URL(target).origin;
+  } catch {
+    return 'invalid destination';
+  }
+}
+
+export function createPinnedWebhookLookup(addresses: ResolvedAddress[]): LookupFunction {
+  if (addresses.length === 0) throw new Error('At least one validated webhook address is required');
+  return (_hostname, options, callback) => {
+    if (options.all) callback(null, addresses);
+    else callback(null, addresses[0]!.address, addresses[0]!.family);
+  };
+}
+
+export function postToPinnedTarget(
+  url: URL,
+  addresses: ResolvedAddress[],
+  headers: Record<string, string>,
+  body: string,
+): Promise<number> {
+  const pinnedLookup = createPinnedWebhookLookup(addresses);
+
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, {
+      method: 'POST',
+      headers,
+      lookup: pinnedLookup,
+    }, (response) => {
+      clearTimeout(timeout);
+      response.resume();
+      resolve(response.statusCode ?? 0);
+    });
+    const timeout = setTimeout(() => request.destroy(new Error('Webhook request timed out')), 10_000);
+    request.once('error', (error) => {
+      clearTimeout(timeout);
+      reject(error);
+    });
+    request.end(body);
+  });
+}
 
 /**
  * Generate HMAC-SHA256 signature for webhook payload
@@ -72,10 +238,7 @@ export async function createWebhookSubscription(
   targetUrl: string,
   eventTypes: string[],
 ): Promise<WebhookSubscription> {
-  // Validate HTTPS
-  if (!targetUrl.startsWith("https://")) {
-    throw new Error("Webhook URL must use HTTPS");
-  }
+  const { url } = await resolveSafeWebhookTarget(targetUrl);
 
   // Generate secure secret
   const secretKey = crypto.randomBytes(32).toString("hex");
@@ -83,7 +246,7 @@ export async function createWebhookSubscription(
   const subscription = await prisma.webhookSubscription.create({
     data: {
       userAddress,
-      targetUrl,
+      targetUrl: url.href,
       secretKey,
       eventTypes,
       isActive: true,
@@ -118,13 +281,10 @@ export async function deleteWebhookSubscription(
   id: string,
   userAddress: string,
 ): Promise<void> {
-  await prisma.webhookSubscription.updateMany({
+  await prisma.webhookSubscription.deleteMany({
     where: {
       id,
       userAddress, // Ensure user owns this webhook
-    },
-    data: {
-      isActive: false,
     },
   });
 }
@@ -134,12 +294,12 @@ export async function updateWebhookSubscription(
   userAddress: string,
   input: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean },
 ): Promise<Omit<WebhookSubscription, "secretKey">> {
-  if (input.targetUrl !== undefined && !input.targetUrl.startsWith("https://")) {
-    throw new Error("Webhook URL must use HTTPS");
-  }
+  const data = input.targetUrl === undefined
+    ? input
+    : { ...input, targetUrl: (await resolveSafeWebhookTarget(input.targetUrl)).url.href };
   const subscription = await prisma.webhookSubscription.updateMany({
     where: { id, userAddress },
-    data: input,
+    data,
   });
   if (subscription.count === 0) throw new Error("Webhook subscription not found");
   const updated = await prisma.webhookSubscription.findUniqueOrThrow({ where: { id } });
@@ -246,20 +406,14 @@ export async function deliverWebhook(
         );
       }
 
-      const response = await fetch(subscription.targetUrl, {
-        method: "POST",
-        headers: {
+      const { url, addresses } = await resolveSafeWebhookTarget(subscription.targetUrl);
+      lastStatus = await postToPinnedTarget(url, addresses, {
           "Content-Type": "application/json",
           "X-FlowFi-Signature": `t=${timestamp},v1=${signature}`,
           "X-FlowFi-Event": payload.eventType,
           "X-FlowFi-Delivery-ID": deliveryId,
           "User-Agent": "FlowFi-Webhook/1.0",
-        },
-        body: payloadJson,
-        signal: AbortSignal.timeout(10000), // 10s timeout
-      });
-
-      lastStatus = response.status;
+        }, payloadJson);
 
       // Update delivery record
       await prisma.webhookDelivery.update({
@@ -276,7 +430,7 @@ export async function deliverWebhook(
 
       if (lastStatus >= 200 && lastStatus < 300) {
         logger.info(
-          `[Webhook] Successfully delivered ${payload.eventType} to ${subscription.targetUrl} (attempt ${attempt + 1})`,
+          `[Webhook] Delivered ${payload.eventType} with status ${lastStatus} (attempt ${attempt + 1})`,
         );
         return { success: true, status: lastStatus };
       }
@@ -285,10 +439,10 @@ export async function deliverWebhook(
       logger.warn(
         `[Webhook] Delivery failed with status ${lastStatus} (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
-    } catch (error: any) {
-      lastError = error.message || "Network error";
+    } catch {
+      lastError = "Network error";
       logger.warn(
-        `[Webhook] Delivery error: ${lastError} (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
+        `[Webhook] Delivery failed with a network error (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
 
       await prisma.webhookDelivery.update({
@@ -376,13 +530,11 @@ export async function dispatchWebhookEvent(
   const deliveries = subscriptions.map((subscription) =>
     deliverWebhook(subscription as WebhookSubscription, payload).catch(
       (error) => {
-        logger.error(
-          `[Webhook] Failed to deliver to ${subscription.targetUrl}:`,
-          error,
-        );
+        logger.error(`[Webhook] Dispatch failed for ${payload.eventType}`);
       },
     ),
   );
 
   await Promise.all(deliveries);
 }
+

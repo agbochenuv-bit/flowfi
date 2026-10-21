@@ -10,6 +10,11 @@ vi.mock("@/lib/transaction-feedback", () => ({
   transactionSuccessToast: vi.fn(),
 }));
 
+vi.mock("@/hooks/useTokenMetadata", () => ({
+  useTokenMetadata: () => ({ data: [] }),
+  getTokenDecimals: () => 7,
+}));
+
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import { TopUpModal } from "../TopUpModal";
@@ -78,10 +83,10 @@ describe("TopUpModal", () => {
       const user = userEvent.setup();
       render(<TopUpModal {...baseProps} />);
       await user.type(getAmountInput(), "100.5");
-      expect(screen.getByText(/600.50 USDC/)).toBeInTheDocument();
+      expect(screen.getByText(/600.5 USDC/)).toBeInTheDocument();
       fireEvent.click(getConfirmButton());
       await waitFor(() => {
-        expect(baseProps.onConfirm).toHaveBeenCalledWith("stream-42", "100.5");
+        expect(baseProps.onConfirm).toHaveBeenCalledWith("stream-42", "100.5", 7);
       });
       expect(transactionSuccessToast).toHaveBeenCalledWith("Successfully added 100.5 USDC to stream");
     });

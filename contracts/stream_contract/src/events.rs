@@ -1,4 +1,71 @@
+//! # FlowFi On-Chain Event Contract — Schema v1
+//!
+//! ## Schema Version
+//!
+//! [`EVENT_SCHEMA_VERSION`] = `1`. Bump this constant whenever a
+//! **breaking** change is made to any event (see compatibility rules below).
+//!
+//! ## Compatibility Rules
+//!
+//! - Fields MAY be **added to the end** of an existing event struct in a new
+//!   version without bumping the version number, provided the backend decoder
+//!   treats unknown fields as optional.
+//! - Fields MUST NOT be **renamed or removed** from an existing struct without
+//!   a version bump. Renaming changes the `Map` key the Soroban host writes,
+//!   which would silently break every indexer that reads the old key name.
+//! - New event structs MAY be introduced at any version; they do not require a
+//!   bump on their own.
+//! - The numeric discriminant of an existing variant MUST NOT change.
+//!
+//! ## Topic Format
+//!
+//! Each event is published as `env.events().publish(topics, data)` where
+//! `topics` is a tuple of Soroban `Symbol` values and `data` is the typed
+//! `#[contracttype]` payload struct. The general shape is:
+//!
+//! ```text
+//! topics: (symbol_name, optional_stream_id_u64)
+//! data:   <EventStruct>
+//! ```
+//!
+//! Stream-scoped events include the `stream_id` as a second topic element so
+//! indexers can filter by stream without decoding the payload.
+//! Protocol-scoped events (e.g. `initialized`, `fee_config_updated`) use a
+//! single-symbol topic.
+//!
+//! ## Event Catalogue
+//!
+//! | Event struct | Topic | Key payload fields |
+//! |---|---|---|
+//! | [`StreamCreatedEvent`] | `("stream_created", stream_id)` | sender, recipient, token_address, deposited_amount, rate_per_second, start_time |
+//! | [`StreamToppedUpEvent`] | `("stream_topped_up", stream_id)` | sender, amount, new_deposited_amount, new_end_time |
+//! | [`TokensWithdrawnEvent`] | `("tokens_withdrawn", stream_id)` | recipient, amount, timestamp |
+//! | [`StreamCancelledEvent`] | `("stream_cancelled", stream_id)` | sender, recipient, amount_withdrawn, refunded_amount |
+//! | [`FeeCollectedEvent`] | `("fee_collected", stream_id)` | treasury, fee_amount, token |
+//! | [`InitializedEvent`] | `("initialized",)` | admin, treasury, fee_rate_bps |
+//! | [`FeeConfigUpdatedEvent`] | `("fee_config_updated",)` | admin, old_treasury, new_treasury, old_fee_rate_bps, new_fee_rate_bps |
+//! | [`AdminTransferredEvent`] | `("admin_transferred",)` | previous_admin, new_admin |
+//! | [`AdminTransferProposedEvent`] | `("admin_transfer_proposed",)` | current_admin, proposed_admin |
+//! | [`AdminTransferCancelledEvent`] | `("admin_transfer_cancelled",)` | admin, cancelled_proposed_admin |
+//! | [`StreamPausedEvent`] | `("stream_paused", stream_id)` | sender, paused_at |
+//! | [`StreamResumedEvent`] | `("stream_resumed", stream_id)` | sender, new_end_time |
+//! | [`StreamCompletedEvent`] | `("stream_completed", stream_id)` | recipient, total_withdrawn |
+//! | [`ProtocolPauseStatusEvent`] | `("protocol_pause_status",)` | caller, paused, timestamp |
+//! | [`EmergencyGuardianUpdatedEvent`] | `("emergency_guardian_updated",)` | admin, guardian |
+//! | [`StreamClosedEvent`] | `("stream_closed", stream_id)` | closer, timestamp |
+//! | [`StateMigratedEvent`] | `("state_migrated",)` | admin, old_version, new_version |
+//! | [`ContractUpgradedEvent`] | `("contract_upgraded",)` | admin, old_wasm_hash, new_wasm_hash, timestamp |
+//! | [`StepVestingStreamCreatedEvent`] | `("step_vesting_stream_created", stream_id)` | sender, recipient, token_address, deposited_amount, step_count, last_unlock_time |
+//! | [`HybridCliffStreamCreatedEvent`] | `("hybrid_cliff_stream_created", stream_id)` | sender, recipient, token_address, deposited_amount, cliff_time, cliff_unlock_amount, rate_per_second |
+
 use soroban_sdk::{contracttype, Address, BytesN, Env, Symbol};
+
+/// Current schema version of the on-chain event contract.
+///
+/// Increment this constant when making any breaking change to an existing event
+/// struct (field rename, removal, or type change). Additive changes (new fields
+/// at the end, new event structs) do not require a bump.
+pub const EVENT_SCHEMA_VERSION: u32 = 1;
 
 // ─── Wire Format ─────────────────────────────────────────────────────────────
 //
@@ -87,6 +154,12 @@ pub struct StreamCancelledEvent {
 /// Emitted when a protocol fee is collected during create or top-up.
 ///
 /// Topic: `("fee_collected", stream_id)`
+///
+/// # Auditability fields (#24)
+/// `gross_amount` is the amount passed into fee collection (before the fee is
+/// deducted). `net_amount` is what the stream actually receives (gross minus
+/// fee). Off-chain indexers can verify: `gross_amount * fee_rate_bps / 10_000
+/// == fee_amount` and `gross_amount - fee_amount == net_amount`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeCollectedEvent {
@@ -94,6 +167,10 @@ pub struct FeeCollectedEvent {
     pub treasury: Address,
     pub fee_amount: i128,
     pub token: Address,
+    /// Gross amount before fee deduction (i.e. `net_amount + fee_amount`).
+    pub gross_amount: i128,
+    /// Net amount credited to the stream after fee deduction.
+    pub net_amount: i128,
 }
 
 /// Emitted once during one-time protocol initialization.
@@ -130,6 +207,30 @@ pub struct AdminTransferredEvent {
     pub previous_admin: Address,
     /// The new admin address that now controls the protocol.
     pub new_admin: Address,
+}
+
+/// Emitted when an admin transfer is proposed (two-step flow).
+///
+/// Topic: `("admin_transfer_proposed",)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposedEvent {
+    /// The current admin that initiated the proposal.
+    pub current_admin: Address,
+    /// The proposed new admin pending acceptance.
+    pub proposed_admin: Address,
+}
+
+/// Emitted when a pending admin transfer is cancelled.
+///
+/// Topic: `("admin_transfer_cancelled",)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelledEvent {
+    /// The admin that cancelled the proposal.
+    pub admin: Address,
+    /// The proposed admin whose transfer was cancelled.
+    pub cancelled_proposed_admin: Address,
 }
 
 /// Emitted when a sender pauses an active stream.
@@ -544,6 +645,43 @@ pub fn emit_fee_config_updated(env: &Env, event: FeeConfigUpdatedEvent) {
 pub fn emit_admin_transferred(env: &Env, event: AdminTransferredEvent) {
     env.events()
         .publish((Symbol::new(env, "admin_transferred"),), event);
+}
+
+/// Emit an `admin_transfer_proposed` event.
+///
+/// # Event topic
+/// `("admin_transfer_proposed",)`.
+///
+/// # Emission trigger
+/// `propose_admin_transfer`, after the pending admin has been stored in
+/// instance storage. No transfer is effective until the proposed admin calls
+/// `accept_admin_transfer`.
+///
+/// # Parameters
+/// - `env` — the Soroban environment to publish into.
+/// - `event` — the [`AdminTransferProposedEvent`] payload: `current_admin` and
+///   `proposed_admin` addresses.
+pub fn emit_admin_transfer_proposed(env: &Env, event: AdminTransferProposedEvent) {
+    env.events()
+        .publish((Symbol::new(env, "admin_transfer_proposed"),), event);
+}
+
+/// Emit an `admin_transfer_cancelled` event.
+///
+/// # Event topic
+/// `("admin_transfer_cancelled",)`.
+///
+/// # Emission trigger
+/// `cancel_admin_transfer`, after the pending admin entry has been removed
+/// from instance storage. Only emitted when a pending transfer existed.
+///
+/// # Parameters
+/// - `env` — the Soroban environment to publish into.
+/// - `event` — the [`AdminTransferCancelledEvent`] payload: `admin` (the
+///   current admin who cancelled) and `cancelled_proposed_admin`.
+pub fn emit_admin_transfer_cancelled(env: &Env, event: AdminTransferCancelledEvent) {
+    env.events()
+        .publish((Symbol::new(env, "admin_transfer_cancelled"),), event);
 }
 
 /// Emit a `stream_paused` event indexed by `stream_id`.

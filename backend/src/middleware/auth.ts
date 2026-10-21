@@ -7,26 +7,124 @@ import logger from '../logger.js';
 const isProduction = process.env.NODE_ENV === 'production';
 const rawJwtSecret = process.env.JWT_SECRET;
 
-let JWT_SECRET: string;
+// ─── JWT signing-key set (rotation support) ─────────────────────────────────
+//
+// Keys are identified by a `kid` (key id) carried in the JWT header. New tokens
+// are always signed with the *active* kid. Verification accepts any kid present
+// in the current key set (the "overlap window"), so a key can be rotated in by
+// adding it to the set, promoting it to active, and later retiring the old key
+// once all tokens signed with it have expired.
+//
+// Configuration:
+//   JWT_KEYS       JSON object mapping kid -> secret, e.g. {"2024-01":"...","2024-02":"..."}
+//   JWT_ACTIVE_KID kid used to sign new tokens; must exist in JWT_KEYS
+//   JWT_SECRET     legacy single-secret config; used as the sole key (kid "default")
+//                  when JWT_KEYS is not set, preserving backward compatibility.
+//
+// Secret values are never logged; only kid identifiers appear in diagnostics.
 
-if (isProduction) {
-  if (!rawJwtSecret) {
-    throw new Error('JWT_SECRET environment variable is required in production');
+const LEGACY_KID = 'default';
+const MIN_SECRET_BYTES = 32;
+
+export interface JwtKeySet {
+  /** kid -> secret used for HMAC signing/verification. */
+  keys: Map<string, string>;
+  /** kid used to sign newly issued tokens. */
+  activeKid: string;
+}
+
+function assertSecretStrength(kid: string, secret: string): void {
+  if (Buffer.from(secret).length < MIN_SECRET_BYTES) {
+    const msg = `JWT secret for kid "${kid}" must be at least ${MIN_SECRET_BYTES} bytes long`;
+    if (isProduction) {
+      throw new Error(msg);
+    }
+    logger.warn(`[Auth] ${msg}; consider using a stronger secret`);
   }
-  if (Buffer.from(rawJwtSecret).length < 32) {
-    throw new Error('JWT_SECRET must be at least 32 bytes long in production');
+}
+
+function parseJwtKeysEnv(raw: string | undefined): Map<string, string> | null {
+  if (!raw || raw.trim() === '') return null;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    // Never echo the raw value — it contains secrets.
+    throw new Error('JWT_KEYS must be valid JSON mapping kid -> secret');
   }
-  JWT_SECRET = rawJwtSecret;
-} else {
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('JWT_KEYS must be a JSON object mapping kid -> secret');
+  }
+
+  const keys = new Map<string, string>();
+  for (const [kid, secret] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof kid !== 'string' || kid.trim() === '') {
+      throw new Error('JWT_KEYS contains an empty or invalid kid');
+    }
+    if (typeof secret !== 'string' || secret === '') {
+      throw new Error(`JWT_KEYS entry for kid "${kid}" must be a non-empty string`);
+    }
+    if (keys.has(kid)) {
+      throw new Error(`JWT_KEYS contains duplicate kid "${kid}"`);
+    }
+    keys.set(kid, secret);
+  }
+
+  if (keys.size === 0) {
+    throw new Error('JWT_KEYS must contain at least one key');
+  }
+
+  return keys;
+}
+
+function loadJwtKeySet(): JwtKeySet {
+  const keys = parseJwtKeysEnv(process.env.JWT_KEYS);
+
+  if (keys) {
+    const activeKid = process.env.JWT_ACTIVE_KID;
+    if (!activeKid) {
+      throw new Error('JWT_ACTIVE_KID is required when JWT_KEYS is set');
+    }
+    if (!keys.has(activeKid)) {
+      throw new Error(`JWT_ACTIVE_KID "${activeKid}" is not present in JWT_KEYS`);
+    }
+    for (const [kid, secret] of keys) {
+      assertSecretStrength(kid, secret);
+    }
+    return { keys, activeKid };
+  }
+
+  // Legacy single-secret path.
+  if (isProduction) {
+    if (!rawJwtSecret) {
+      throw new Error('JWT_SECRET environment variable is required in production');
+    }
+    assertSecretStrength(LEGACY_KID, rawJwtSecret);
+    return { keys: new Map([[LEGACY_KID, rawJwtSecret]]), activeKid: LEGACY_KID };
+  }
+
   if (!rawJwtSecret) {
     logger.warn('[Auth] JWT_SECRET not set — using random secret; tokens will NOT survive server restart');
-    JWT_SECRET = crypto.randomBytes(32).toString('hex');
-  } else {
-    if (Buffer.from(rawJwtSecret).length < 32) {
-      logger.warn('[Auth] JWT_SECRET is less than 32 bytes long; consider using a stronger secret');
-    }
-    JWT_SECRET = rawJwtSecret;
+    const generated = crypto.randomBytes(32).toString('hex');
+    return { keys: new Map([[LEGACY_KID, generated]]), activeKid: LEGACY_KID };
   }
+
+  assertSecretStrength(LEGACY_KID, rawJwtSecret);
+  return { keys: new Map([[LEGACY_KID, rawJwtSecret]]), activeKid: LEGACY_KID };
+}
+
+let JWT_KEY_SET: JwtKeySet = loadJwtKeySet();
+
+/** Returns the kid used to sign new tokens. */
+export function getActiveJwtKid(): string {
+  return JWT_KEY_SET.activeKid;
+}
+
+/** Returns the kids currently accepted for verification (the overlap set). */
+export function getAcceptedJwtKids(): string[] {
+  return Array.from(JWT_KEY_SET.keys.keys());
 }
 
 const JWT_EXPIRY_SECONDS = 3600; // 1 hour max per spec
@@ -39,8 +137,29 @@ const STELLAR_NETWORK =
     ? StellarSdk.Networks.PUBLIC
     : StellarSdk.Networks.TESTNET;
 
-// In-memory challenge store: publicKey -> { nonce, expiresAt }
-const challenges = new Map<string, { nonce: string; expiresAt: number }>();
+// ─── Challenge store ────────────────────────────────────────────────────────
+//
+// Each challenge is a single-use record keyed by its nonce. The record binds
+// the challenge to the wallet that requested it, the intended audience, the
+// Stellar network passphrase, and an expiration. Verification consumes the
+// record atomically (delete-before-verify) so a nonce can never be replayed,
+// even under concurrent requests.
+
+export interface WalletChallenge {
+  nonce: string;
+  publicKey: string;
+  audience: string;
+  networkPassphrase: string;
+  issuedAt: number;
+  expiresAt: number;
+  consumed: boolean;
+}
+
+const CHALLENGE_TTL_MS = 60_000; // 60s to sign
+
+// nonce -> challenge record
+const challenges = new Map<string, WalletChallenge>();
+
 const DEFAULT_CHALLENGE_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
 let challengeSweepTimer: NodeJS.Timeout | undefined;
 
@@ -55,9 +174,9 @@ function resolveChallengeSweepIntervalMs(): number {
 
 export function sweepExpiredChallenges(now = Date.now()): number {
   let deleted = 0;
-  for (const [publicKey, challenge] of challenges.entries()) {
-    if (challenge.expiresAt < now) {
-      challenges.delete(publicKey);
+  for (const [nonce, challenge] of challenges.entries()) {
+    if (challenge.expiresAt < now || challenge.consumed) {
+      challenges.delete(nonce);
       deleted += 1;
     }
   }
@@ -88,19 +207,42 @@ function b64url(buf: Buffer | string): string {
 }
 
 export function signJwt(payload: object): string {
-  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const kid = JWT_KEY_SET.activeKid;
+  const secret = JWT_KEY_SET.keys.get(kid);
+  if (!secret) {
+    // Should be unreachable: activeKid is validated against the key set at load.
+    throw new Error(`Active JWT kid "${kid}" is not present in the key set`);
+  }
+  const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT', kid }));
   const body = b64url(JSON.stringify(payload));
   const sig = crypto
-    .createHmac('sha256', JWT_SECRET)
+    .createHmac('sha256', secret)
     .update(`${header}.${body}`)
     .digest();
   return `${header}.${body}.${b64url(sig)}`;
+}
+
+function decodeJwtHeader(header: string): { kid?: unknown } | null {
+  try {
+    const parsed = JSON.parse(Buffer.from(header, 'base64url').toString());
+    return typeof parsed === 'object' && parsed !== null ? parsed : null;
+  } catch {
+    return null;
+  }
 }
 
 export function verifyJwt(token: string): { publicKey: string } | null {
   try {
     const [header, body, sig] = token.split('.');
     if (!header || !body || !sig) return null;
+
+    // Resolve the signing key by kid. Unknown or retired kids are rejected.
+    const decodedHeader = decodeJwtHeader(header);
+    if (!decodedHeader) return null;
+    const kid = decodedHeader.kid;
+    if (typeof kid !== 'string' || kid === '') return null;
+    const secret = JWT_KEY_SET.keys.get(kid);
+    if (!secret) return null;
 
     // Compute the expected signature and re-encode it as base64url so we can
     // compare strings directly, rather than decoding the provided signature
@@ -110,7 +252,7 @@ export function verifyJwt(token: string): { publicKey: string } | null {
     // tampered last character can decode to the *same* bytes as the
     // original and slip past a byte-level comparison undetected.
     const expected = crypto
-      .createHmac('sha256', JWT_SECRET)
+      .createHmac('sha256', secret)
       .update(`${header}.${body}`)
       .digest();
     const expectedSig = b64url(expected);
@@ -144,7 +286,59 @@ export function verifyJwt(token: string): { publicKey: string } | null {
   }
 }
 
+const SSE_TICKET_TTL_SECONDS = 60;
+
+export interface SseTicket {
+  publicKey: string;
+  streams: string[];
+  users: string[];
+}
+
+export function signSseTicket(ticket: SseTicket): string {
+  const now = Math.floor(Date.now() / 1000);
+  return signJwt({
+    sub: ticket.publicKey,
+    iat: now,
+    exp: now + SSE_TICKET_TTL_SECONDS,
+    iss: JWT_ISSUER,
+    aud: JWT_AUDIENCE,
+    scope: 'sse:subscribe',
+    streams: ticket.streams,
+    users: ticket.users,
+  });
+}
+
+export function verifySseTicket(token: string): SseTicket | null {
+  const verified = verifyJwt(token);
+  if (!verified) return null;
+  try {
+    const [, body] = token.split('.');
+    if (!body) return null;
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString());
+    const now = Math.floor(Date.now() / 1000);
+    if (
+      payload.scope !== 'sse:subscribe' ||
+      payload.sub !== verified.publicKey ||
+      !Number.isInteger(payload.iat) ||
+      !Number.isInteger(payload.exp) ||
+      payload.exp - payload.iat > SSE_TICKET_TTL_SECONDS ||
+      payload.exp <= now ||
+      !Array.isArray(payload.streams) ||
+      !Array.isArray(payload.users) ||
+      payload.streams.some((id: unknown) => typeof id !== 'string') ||
+      payload.users.some((key: unknown) => typeof key !== 'string')
+    ) return null;
+    return { publicKey: verified.publicKey, streams: payload.streams, users: payload.users };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Challenge / Verify handlers ────────────────────────────────────────────
+
+function resolveNetworkPassphrase(): string {
+  return STELLAR_NETWORK;
+}
 
 export function issueChallenge(req: Request, res: Response): void {
   const { publicKey } = req.body as { publicKey?: string };
@@ -153,8 +347,19 @@ export function issueChallenge(req: Request, res: Response): void {
     return;
   }
   const nonce = crypto.randomBytes(32).toString('hex');
-  challenges.set(publicKey, { nonce, expiresAt: Date.now() + 60_000 }); // 60s to sign
-  res.json({ nonce, expiresAt: Date.now() + 60_000 });
+  const now = Date.now();
+  const expiresAt = now + CHALLENGE_TTL_MS;
+  const record: WalletChallenge = {
+    nonce,
+    publicKey,
+    audience: JWT_AUDIENCE,
+    networkPassphrase: resolveNetworkPassphrase(),
+    issuedAt: now,
+    expiresAt,
+    consumed: false,
+  };
+  challenges.set(nonce, record);
+  res.json({ nonce, expiresAt });
 }
 
 export const __authChallengeTestUtils = {
@@ -162,6 +367,41 @@ export const __authChallengeTestUtils = {
   startChallengeSweep,
   stopChallengeSweep,
   sweepExpiredChallenges,
+  /** Seed a challenge record directly (bypasses HTTP layer). */
+  seedChallenge(record: WalletChallenge): void {
+    challenges.set(record.nonce, { ...record });
+  },
+  /** Read a challenge record by nonce, if present. */
+  getChallenge(nonce: string): WalletChallenge | undefined {
+    const record = challenges.get(nonce);
+    return record ? { ...record } : undefined;
+  },
+  /** Remove all challenge records (test isolation). */
+  clearChallenges(): void {
+    challenges.clear();
+  },
+  CHALLENGE_TTL_MS,
+};
+
+export const __authKeyTestUtils = {
+  /** Replace the in-memory key set (for rotation tests). */
+  setKeySet(keys: Record<string, string>, activeKid: string): void {
+    const map = new Map<string, string>();
+    for (const [kid, secret] of Object.entries(keys)) {
+      if (map.has(kid)) throw new Error(`duplicate kid "${kid}"`);
+      map.set(kid, secret);
+    }
+    if (!map.has(activeKid)) {
+      throw new Error(`active kid "${activeKid}" not present in key set`);
+    }
+    JWT_KEY_SET = { keys: map, activeKid };
+  },
+  /** Restore the key set loaded from the environment. */
+  resetKeySet(): void {
+    JWT_KEY_SET = loadJwtKeySet();
+  },
+  getActiveKid: getActiveJwtKid,
+  getAcceptedKids: getAcceptedJwtKids,
 };
 
 export function verifyChallenge(req: Request, res: Response): void {
@@ -172,12 +412,6 @@ export function verifyChallenge(req: Request, res: Response): void {
 
   if (!publicKey || !signedTransaction) {
     res.status(400).json({ error: 'publicKey and signedTransaction required' });
-    return;
-  }
-
-  const challenge = challenges.get(publicKey);
-  if (!challenge || challenge.expiresAt < Date.now()) {
-    res.status(401).json({ error: 'Challenge expired or not found' });
     return;
   }
 
@@ -192,10 +426,49 @@ export function verifyChallenge(req: Request, res: Response): void {
       return;
     }
 
-    // Verify the manage_data op contains our nonce
+    // Verify the manage_data op contains a nonce we issued.
     const op = tx.operations[0] as StellarSdk.Operation.ManageData | undefined;
-    if (!op || op.type !== 'manageData' || Buffer.from(op.value ?? new Uint8Array()).toString('hex') !== challenge.nonce) {
+    const nonceHex =
+      op && op.type === 'manageData'
+        ? Buffer.from(op.value ?? new Uint8Array()).toString('hex')
+        : undefined;
+    if (!nonceHex) {
       res.status(401).json({ error: 'Invalid challenge nonce in transaction' });
+      return;
+    }
+
+    // Atomically consume the challenge before doing any signature work. The
+    // delete happens synchronously, so a concurrent request carrying the same
+    // nonce will observe it as missing and be rejected — no replay window.
+    const challenge = challenges.get(nonceHex);
+    if (!challenge) {
+      res.status(401).json({ error: 'Challenge expired or not found' });
+      return;
+    }
+    if (challenge.consumed) {
+      res.status(401).json({ error: 'Challenge already used' });
+      return;
+    }
+    challenge.consumed = true;
+    challenges.delete(nonceHex);
+
+    // Bind the challenge to the wallet, audience, and network it was issued
+    // for. A challenge issued to wallet A cannot be redeemed by wallet B, nor
+    // on a different network or for a different audience.
+    if (challenge.publicKey !== publicKey) {
+      res.status(401).json({ error: 'Challenge wallet mismatch' });
+      return;
+    }
+    if (challenge.audience !== JWT_AUDIENCE) {
+      res.status(401).json({ error: 'Challenge audience mismatch' });
+      return;
+    }
+    if (challenge.networkPassphrase !== resolveNetworkPassphrase()) {
+      res.status(401).json({ error: 'Challenge network mismatch' });
+      return;
+    }
+    if (challenge.expiresAt < Date.now()) {
+      res.status(401).json({ error: 'Challenge expired or not found' });
       return;
     }
 
@@ -209,8 +482,6 @@ export function verifyChallenge(req: Request, res: Response): void {
       res.status(401).json({ error: 'Invalid signature' });
       return;
     }
-
-    challenges.delete(publicKey);
 
     const now = Math.floor(Date.now() / 1000);
     const token = signJwt({ sub: publicKey, iat: now, exp: now + JWT_EXPIRY_SECONDS, iss: JWT_ISSUER, aud: JWT_AUDIENCE });
@@ -248,4 +519,97 @@ export function requireAdmin(req: Request, res: Response, next: NextFunction): v
     }
     next();
   });
+}
+
+// ─── Wallet ownership / authorization helpers ───────────────────────────────
+//
+// Routes must never trust client-supplied sender/recipient addresses. These
+// helpers resolve ownership from the database and compare it against the
+// authenticated wallet on the request.
+
+/**
+ * Resolve the wallet that owns a stream, or `null` if the stream does not
+ * exist. The lookup is delegated to the caller-supplied resolver so this
+ * module stays free of a direct DB dependency (and remains unit-testable).
+ */
+export type StreamOwnerResolver = (
+  streamId: string,
+) => Promise<string | null> | string | null;
+
+let streamOwnerResolver: StreamOwnerResolver | undefined;
+
+/**
+ * Register the DB-backed resolver used by `resolveStreamOwnership`. Call once
+ * at startup (e.g. from the app bootstrap) with a function that queries the
+ * streams table.
+ */
+export function setStreamOwnerResolver(resolver: StreamOwnerResolver): void {
+  streamOwnerResolver = resolver;
+}
+
+export async function resolveStreamOwnership(
+  streamId: string,
+): Promise<string | null> {
+  if (!streamOwnerResolver) {
+    throw new Error(
+      'Stream owner resolver not configured; call setStreamOwnerResolver() at startup',
+    );
+  }
+  return streamOwnerResolver(streamId);
+}
+
+export class WalletAuthorizationError extends Error {
+  status: number;
+  constructor(message: string, status = 403) {
+    super(message);
+    this.name = 'WalletAuthorizationError';
+    this.status = status;
+  }
+}
+
+/**
+ * Assert that the authenticated wallet owns the given stream. Throws a
+ * `WalletAuthorizationError` (404 if the stream is missing, 403 if it belongs
+ * to another wallet) so route handlers can translate it into a response.
+ */
+export async function assertWalletOwnsStream(
+  req: Request,
+  streamId: string,
+): Promise<void> {
+  const user = (req as AuthenticatedRequest).user;
+  if (!user?.publicKey) {
+    throw new WalletAuthorizationError('Unauthorized', 401);
+  }
+  const owner = await resolveStreamOwnership(streamId);
+  if (owner === null) {
+    throw new WalletAuthorizationError('Stream not found', 404);
+  }
+  if (owner !== user.publicKey) {
+    throw new WalletAuthorizationError('Forbidden', 403);
+  }
+}
+
+/**
+ * Express middleware factory enforcing stream ownership for `:id` routes.
+ */
+export function requireStreamOwnership(
+  paramName = 'id',
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, res, next) => {
+    const streamId = req.params[paramName];
+    if (!streamId) {
+      res.status(400).json({ error: 'Bad Request', message: 'Missing stream id' });
+      return;
+    }
+    assertWalletOwnsStream(req, streamId)
+      .then(() => next())
+      .catch((err: unknown) => {
+        if (err instanceof WalletAuthorizationError) {
+          res.status(err.status).json({ error: err.message });
+          return;
+        }
+        logger.error('[Auth] requireStreamOwnership error:', err);
+        res.status(500).json({ error: 'Internal Server Error' });
+      });
+  };
 }

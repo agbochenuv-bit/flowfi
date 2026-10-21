@@ -8,6 +8,7 @@ import TransactionTracker, {
 import { IncomingStreamCard } from "@/components/streams/IncomingStreamCard";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { useWallet } from "@/context/wallet-context";
+import { formatNetwork } from "@/lib/wallet";
 import {
   type IncomingStreamRecord,
 } from "@/lib/api/streams";
@@ -33,7 +34,7 @@ function LoadingCard() {
 }
 
 export default function IncomingContent() {
-  const { session, status, isHydrated } = useWallet();
+  const { session, status, isHydrated, authToken } = useWallet();
   const tracker = useTransactionTracker();
   // Stream being withdrawn and its withdrawn total (base units) before the
   // withdrawal, so the tracker only confirms once the indexer shows an increase.
@@ -42,22 +43,28 @@ export default function IncomingContent() {
     expectedChanges: { withdrawnAmountAbove: string };
   } | null>(null);
 
-  const incomingStreamsQuery = useIncomingStreams(session?.publicKey);
+  const incomingStreamsQuery = useIncomingStreams(session?.publicKey, { authToken });
   const withdrawMutation = useWithdrawIncomingStream(
     session,
     session?.publicKey,
+    authToken,
     {
       onSuccess: async (result, _stream) => {
-        tracker.submit(result.txHash);
-        toast.success(`Withdrawal submitted for stream #${_stream.streamId}`);
-        // Move to confirming — TransactionTracker polls the indexer from here
         tracker.confirm();
+        toast.success(`Withdrawal submitted for stream #${_stream.streamId}`);
       },
       onError: (error) => {
         const message = toSorobanErrorMessage(error);
-        tracker.fail(message);
+        if (error instanceof Error && "code" in error && error.code === "TransactionTimeout") {
+          tracker.timeout();
+        } else if (error instanceof Error && "code" in error && error.code === "WalletRejected") {
+          tracker.cancel();
+        } else {
+          tracker.fail(message);
+        }
         toast.error(message);
       },
+      onStage: (stage, hash) => tracker.stage(stage, hash),
     },
   );
 
@@ -74,6 +81,7 @@ export default function IncomingContent() {
       await withdrawMutation.mutateAsync(stream);
     } catch {
       // Errors are handled by the mutation callback so the UI stays consistent.
+      throw new Error("Withdrawal failed");
     }
   };
 
@@ -159,13 +167,12 @@ export default function IncomingContent() {
               <IncomingStreamCard
                 key={stream.id}
                 stream={stream}
+                network={formatNetwork(session?.network ?? "")}
                 withdrawing={
                   withdrawMutation.isPending &&
                   withdrawMutation.variables?.streamId === stream.streamId
                 }
-                onWithdraw={(selectedStream) => {
-                  void handleWithdraw(selectedStream);
-                }}
+                onWithdraw={handleWithdraw}
               />
             ))}
           </section>
@@ -181,6 +188,7 @@ export default function IncomingContent() {
               streamId={pendingWithdrawal?.streamId}
               expectedChanges={pendingWithdrawal?.expectedChanges}
               onConfirmed={tracker.succeed}
+              onTimeout={tracker.timeout}
             />
           </section>
         )}

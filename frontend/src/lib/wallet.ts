@@ -1,91 +1,228 @@
 /**
- * lib/wallet.ts
+ * wallet.ts — Wallet utilities for FlowFi.
  *
- * Production wallet adapter for FlowFi.
- * Currently supports Freighter (browser extension).
+ * Network terminology used throughout this module:
+ *  - APP NETWORK:    The network the user selected in NetworkSelector, stored in
+ *                    localStorage as "flowfi.network" and available via useNetwork().
+ *  - WALLET NETWORK: The network Freighter is currently connected to, exposed as
+ *                    session.network from wallet-context.
+ *  - CONTRACT DEPLOYMENT NETWORK: Determined by NEXT_PUBLIC_STREAM_CONTRACT_ID
+ *                    and the app's selected network (APP NETWORK).
  *
- * Albedo and xBull are intentionally not advertised until real connectors are
- * implemented. No mock sessions are created in production paths.
- * Set NEXT_PUBLIC_STELLAR_NETWORK=TESTNET|MAINNET in .env to control network.
+ * isExpectedNetwork() compares WALLET NETWORK against the hardcoded env-var
+ * (CONTRACT DEPLOYMENT NETWORK). Use isWalletOnNetwork() when you want to
+ * compare against the dynamically chosen APP NETWORK instead.
  */
 
-// ── Network configuration ─────────────────────────────────────────────────────
+import type { NetworkConfig } from "@/lib/stellar-config";
 
-export const STELLAR_NETWORK = (process.env.NEXT_PUBLIC_STELLAR_NETWORK ??
-  "TESTNET") as "TESTNET" | "MAINNET";
+// ── Environment-based network constants (CONTRACT DEPLOYMENT NETWORK) ───────
 
-export const STELLAR_NETWORK_ID =
+/** Env-var network name, e.g. "TESTNET" or "MAINNET". Defaults to "TESTNET". */
+export const STELLAR_NETWORK: string =
+  process.env.NEXT_PUBLIC_STELLAR_NETWORK ?? "TESTNET";
+
+/** Network passphrase corresponding to STELLAR_NETWORK. */
+export const STELLAR_NETWORK_ID: string =
   STELLAR_NETWORK === "MAINNET"
     ? "Public Global Stellar Network ; September 2015"
     : "Test SDF Network ; September 2015";
 
-import {
-  isConnected,
-  setAllowed,
-  getAddress,
-  getNetworkDetails,
-} from "@stellar/freighter-api";
+// ── WalletSession ────────────────────────────────────────────────────────────
 
-export type WalletId = "freighter" | "albedo" | "xbull" | "hana" | "walletconnect";
-
-export interface WalletDescriptor {
-  id: WalletId;
-  name: string;
-  badge: string;
-  description: string;
-}
-
+/** Shape of a persisted wallet session stored in localStorage. */
 export interface WalletSession {
-  walletId: WalletId;
+  walletId: string;
   walletName: string;
   publicKey: string;
   connectedAt: string;
+  /** Human-readable network name or passphrase reported by the wallet. */
   network: string;
+  /** True only for synthetic/mock sessions used in testing. */
   mocked: boolean;
 }
 
-// ── Error types ───────────────────────────────────────────────────────────────
+// ── Supported wallet definitions ─────────────────────────────────────────────
 
-/**
- * Thrown when the user tries to connect Freighter but the extension is not
- * installed. The UI checks for this to show an install prompt instead of a
- * generic error message.
- */
+export interface WalletDefinition {
+  id: string;
+  name: string;
+  badge: string;
+  description: string;
+  installUrl?: string;
+}
+
+export const SUPPORTED_WALLETS: WalletDefinition[] = [
+  {
+    id: "freighter",
+    name: "Freighter",
+    badge: "Extension",
+    description: "Direct browser wallet for Stellar",
+    installUrl: "https://freighter.app",
+  },
+];
+
+// ── Custom errors ─────────────────────────────────────────────────────────────
+
 export class FreighterNotInstalledError extends Error {
   constructor() {
     super(
-      "Freighter extension is not installed. Please install it from freighter.app.",
+      "Freighter wallet extension is not installed. Visit https://freighter.app to install it.",
     );
     this.name = "FreighterNotInstalledError";
   }
 }
 
-// ── Wallet metadata ───────────────────────────────────────────────────────────
+// ── Network helpers ──────────────────────────────────────────────────────────
 
-export const SUPPORTED_WALLETS: readonly WalletDescriptor[] = [
-  { id: "freighter", name: "Freighter", badge: "Extension", description: "Direct browser wallet for Stellar accounts and Soroban apps." },
-  { id: "albedo", name: "Albedo", badge: "Web / Mobile", description: "Popup wallet for browser and mobile users." },
-  { id: "xbull", name: "xBull", badge: "Extension / Web", description: "Stellar wallet for desktop and web users." },
-  { id: "hana", name: "Hana", badge: "Extension", description: "Secure Stellar browser wallet." },
-  { id: "walletconnect", name: "WalletConnect", badge: "Mobile", description: "Connect mobile wallets with WalletConnect." },
-];
+/**
+ * Maps a raw network string (passphrase or short name returned by Freighter)
+ * to a human-readable display name.
+ */
+export function formatNetwork(network: string): string {
+  const n = network.toLowerCase();
+  if (n.includes("public global") || n === "mainnet") return "Mainnet";
+  if (
+    n.includes("test sdf network") ||
+    n === "testnet" ||
+    n.includes("testnet")
+  )
+    return "Testnet";
+  if (n.includes("future") || n === "futurenet") return "Futurenet";
+  if (n.includes("standalone") || n === "sandbox" || n.includes("sandbox"))
+    return "Local Sandbox";
+  return network;
+}
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+/**
+ * Returns true if the given wallet network string matches the app's
+ * CONTRACT DEPLOYMENT NETWORK (read from NEXT_PUBLIC_STELLAR_NETWORK env var).
+ *
+ * @deprecated Prefer isWalletOnNetwork() which accepts a NetworkConfig so the
+ * check is made against the user's dynamically selected APP NETWORK instead of
+ * the hardcoded env var.
+ */
+export function isExpectedNetwork(walletNetwork: string): boolean {
+  const formatted = formatNetwork(walletNetwork);
+  const expected = formatNetwork(STELLAR_NETWORK);
+  return formatted.toLowerCase() === expected.toLowerCase();
+}
 
-function buildSession(
-  walletId: WalletId,
-  publicKey: string,
-  network: string,
-): WalletSession {
-  const descriptor = SUPPORTED_WALLETS.find((w) => w.id === walletId);
-
-  if (!descriptor) {
-    throw new Error("Unsupported wallet selected.");
+/**
+ * Returns true if the given wallet network matches the provided NetworkConfig.
+ *
+ * This should be preferred over isExpectedNetwork() when you have access to
+ * the app-selected NetworkConfig from useNetwork(), because it compares against
+ * the APP NETWORK (user's choice) rather than the hardcoded env var.
+ *
+ * Comparison is done by network passphrase first (most reliable), then falls
+ * back to display name matching.
+ *
+ * @param walletNetwork - The network string reported by Freighter (session.network).
+ * @param networkConfig - The NetworkConfig from useNetwork().
+ */
+export function isWalletOnNetwork(
+  walletNetwork: string,
+  networkConfig: NetworkConfig,
+): boolean {
+  // Primary: compare by passphrase (exact match)
+  if (
+    walletNetwork === networkConfig.passphrase ||
+    walletNetwork.toLowerCase() === networkConfig.passphrase.toLowerCase()
+  ) {
+    return true;
   }
 
+  // Secondary: compare display names (normalized)
+  const formattedWallet = formatNetwork(walletNetwork).toLowerCase();
+  const formattedConfig = networkConfig.name.toLowerCase();
+  return formattedWallet === formattedConfig;
+}
+
+// ── Key display helpers ───────────────────────────────────────────────────────
+
+/**
+ * Returns a shortened Stellar public key, e.g. "GAAAAA...ZZZZZZ".
+ * If the key is 14 characters or fewer it is returned unchanged.
+ */
+export function shortenPublicKey(publicKey: string, prefixLen = 7, suffixLen = 7): string {
+  if (publicKey.length <= prefixLen + suffixLen) return publicKey;
+  return `${publicKey.slice(0, prefixLen)}...${publicKey.slice(-suffixLen)}`;
+}
+
+// ── Error message helpers ─────────────────────────────────────────────────────
+
+const REJECTION_PATTERN = /reject|cancel|denied|declined|closed|window closed/i;
+
+/**
+ * Converts a wallet connection error (any shape) into a user-friendly string.
+ */
+export function toWalletErrorMessage(error: unknown): string {
+  if (error instanceof FreighterNotInstalledError) return error.message;
+
+  if (error instanceof Error) {
+    if (REJECTION_PATTERN.test(error.message)) {
+      return "You rejected the connection request. Try again when ready.";
+    }
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    if (REJECTION_PATTERN.test(error)) {
+      return "You rejected the connection request. Try again when ready.";
+    }
+    return error;
+  }
+
+  return "Wallet connection failed. Please try again.";
+}
+
+// ── Freighter connect / authenticate helpers ──────────────────────────────────
+
+/**
+ * Connects to the specified wallet and returns a WalletSession.
+ * Currently only "freighter" is supported.
+ */
+export async function connectWallet(walletId: string): Promise<WalletSession> {
+  if (walletId !== "freighter") {
+    throw new Error(`Unsupported wallet: ${walletId}`);
+  }
+
+  const freighter = await import("@stellar/freighter-api");
+
+  // Check if Freighter is installed
+  const isConnected =
+    typeof (freighter as { isConnected?: () => Promise<{ isConnected: boolean }> }).isConnected ===
+    "function"
+      ? await (freighter as { isConnected: () => Promise<{ isConnected: boolean }> }).isConnected()
+      : { isConnected: typeof window !== "undefined" && ("freighter" in window || "stellar" in window) };
+
+  if (
+    !(
+      (typeof isConnected === "object" && isConnected !== null && "isConnected" in isConnected)
+        ? (isConnected as { isConnected: boolean }).isConnected
+        : isConnected
+    )
+  ) {
+    throw new FreighterNotInstalledError();
+  }
+
+  const result = await freighter.getAddress();
+  if ("error" in result && result.error) {
+    throw new Error(String(result.error));
+  }
+
+  const publicKey = (result as { address: string }).address;
+
+  const networkResult = await freighter.getNetwork();
+  const network =
+    "network" in networkResult
+      ? (networkResult as { network: string }).network
+      : "Testnet";
+
   return {
-    walletId,
-    walletName: descriptor.name,
+    walletId: "freighter",
+    walletName: "Freighter",
     publicKey,
     connectedAt: new Date().toISOString(),
     network,
@@ -93,142 +230,50 @@ function buildSession(
   };
 }
 
-// ── Freighter ─────────────────────────────────────────────────────────────────
-
-async function connectFreighter(): Promise<WalletSession> {
-  const connObj = await isConnected();
-  if (!connObj.isConnected) {
-    throw new FreighterNotInstalledError();
+/**
+ * Fetches the currently connected wallet address from Freighter.
+ * Throws if Freighter is not installed or no account is connected.
+ */
+export async function getConnectedWalletAddress(): Promise<string> {
+  const freighter = await import("@stellar/freighter-api");
+  const result = await freighter.getAddress();
+  if ("error" in result && result.error) {
+    throw new Error(String(result.error));
   }
-
-  await setAllowed();
-
-  const { address, error: addressError } = await getAddress();
-
-  if (!address || addressError) {
-    throw new Error(
-      addressError || "Freighter did not return a valid public key.",
-    );
-  }
-
-  let networkId = STELLAR_NETWORK_ID.toLowerCase().includes("public")
-    ? "Mainnet"
-    : "Testnet";
-
-  try {
-    const details = await getNetworkDetails();
-    if (details.networkPassphrase && !details.error) {
-      const raw = String(details.networkPassphrase).toLowerCase();
-      if (raw.includes("public") || raw === "mainnet") {
-        networkId = "Mainnet";
-      } else if (raw.includes("test") || raw.includes("sdf")) {
-        networkId = "Testnet";
-      } else {
-        networkId = "Other";
-      }
-    }
-  } catch {
-    // ignore
-  }
-
-  return buildSession("freighter", address, networkId);
-}
-
-// ── Public connect dispatch ───────────────────────────────────────────────────
-
-export async function connectWallet(
-  walletId: WalletId,
-): Promise<WalletSession> {
-  if (walletId === "freighter") return connectFreighter();
-
-  // These adapters are exposed through their wallet web bridges when installed.
-  // Fail clearly rather than creating an unverifiable/mock session.
-  const bridge = (window as unknown as Record<string, unknown>)[walletId];
-  if (!bridge || typeof bridge !== "object") {
-    throw new Error(`${SUPPORTED_WALLETS.find((wallet) => wallet.id === walletId)?.name ?? walletId} is not installed or available.`);
-  }
-  const api = bridge as { connect?: () => Promise<{ publicKey?: string; address?: string }> };
-  if (!api.connect) throw new Error(`${walletId} does not expose a compatible connect API.`);
-  const result = await api.connect();
-  const publicKey = result.publicKey ?? result.address;
-  if (!publicKey) throw new Error(`${walletId} did not return a public key.`);
-  return buildSession(walletId, publicKey, STELLAR_NETWORK === "MAINNET" ? "Mainnet" : "Testnet");
-}
-
-// ── Error message mapping ─────────────────────────────────────────────────────
-
-const USER_REJECTION_PATTERNS = [
-  /rejected/i,
-  /declined/i,
-  /denied/i,
-  /canceled/i,
-  /cancelled/i,
-  /closed/i,
-  /user.*denied/i,
-  /user.*abort/i,
-  /popup.*closed/i,
-  /window.*closed/i,
-];
-
-export function toWalletErrorMessage(error: unknown): string {
-  // Provide a specialised message for the extension-not-installed case.
-  if (error instanceof FreighterNotInstalledError) {
-    return error.message;
-  }
-
-  const baseMessage =
-    error instanceof Error
-      ? error.message
-      : typeof error === "string"
-        ? error
-        : "Wallet connection failed. Please try again.";
-
-  if (USER_REJECTION_PATTERNS.some((pattern) => pattern.test(baseMessage))) {
-    return "You rejected the connection request. Try again when ready.";
-  }
-
-  return baseMessage;
-}
-
-// ── Display helpers ───────────────────────────────────────────────────────────
-
-export function shortenPublicKey(publicKey: string): string {
-  if (publicKey.length <= 14) {
-    return publicKey;
-  }
-
-  return `${publicKey.slice(0, 7)}...${publicKey.slice(-7)}`;
+  return (result as { address: string }).address;
 }
 
 /**
- * Maps raw Stellar network strings (passphrases, env-style IDs, legacy labels)
- * to friendly display labels: "Mainnet" | "Testnet" | original string.
+ * Authenticates the wallet by obtaining a JWT from the backend.
+ * Returns the raw JWT string.
+ *
+ * NOTE: This is a placeholder implementation. Replace with a proper
+ * challenge/response flow (e.g. SEP-10) when the backend auth endpoint
+ * is finalized.
  */
-export function formatNetwork(network: string): string {
-  const n = network.trim().toLowerCase();
+export async function authenticateWallet(
+  publicKey: string,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _walletId: string,
+): Promise<string> {
+  // Encode a minimal JWT with a far-future expiry for local/test use.
+  // In production this should call the backend challenge endpoint and
+  // have the user sign the challenge transaction.
+  const header = btoa(JSON.stringify({ alg: "none", typ: "JWT" }))
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 
-  if (n.includes("public") || n === "mainnet" || n === "public") {
-    return "Mainnet";
-  }
+  const payload = btoa(
+    JSON.stringify({
+      sub: publicKey,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 3600,
+    }),
+  )
+    .replace(/=/g, "")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_");
 
-  if (
-    n.includes("test") ||
-    n === "testnet" ||
-    n.includes("sdf") ||
-    n === "stellar testnet"
-  ) {
-    return "Testnet";
-  }
-
-  return network;
-}
-
-/**
- * Returns true if the connected wallet's network matches what this app is
- * configured to use (NEXT_PUBLIC_STELLAR_NETWORK).
- */
-export function isExpectedNetwork(sessionNetwork: string): boolean {
-  const sessionLabel = formatNetwork(sessionNetwork);
-  const expectedLabel = STELLAR_NETWORK === "MAINNET" ? "Mainnet" : "Testnet";
-  return sessionLabel === expectedLabel;
+  return `${header}.${payload}.placeholder`;
 }

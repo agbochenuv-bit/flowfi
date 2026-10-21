@@ -72,6 +72,26 @@ export function parseAmount(display: string, decimals: number): bigint {
   return BigInt(integerPart) * factor + BigInt(fractionalPart);
 }
 
+/** Parse a user-entered amount exactly, rejecting invalid or excess precision. */
+export function parseAmountExact(display: string, decimals: number): bigint {
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new RangeError("Token decimals must be a non-negative integer");
+  }
+
+  const trimmed = display.trim();
+  if (!/^(?:\d+(?:\.\d*)?|\.\d+)$/.test(trimmed)) {
+    throw new Error("Please enter a valid positive amount");
+  }
+  if (!hasValidPrecision(trimmed, decimals)) {
+    throw new Error(`Amount cannot have more than ${decimals} decimal places`);
+  }
+
+  const [integerPart = "0", fractionalPart = ""] = trimmed.split(".");
+  const factor = 10n ** BigInt(decimals);
+  const scaledFraction = fractionalPart.padEnd(decimals, "0");
+  return BigInt(integerPart || "0") * factor + BigInt(scaledFraction || "0");
+}
+
 /**
  * Alias for parseAmount - convert human-readable to raw on-chain amount
  * @param amount - Display string (e.g., "1.234")
@@ -211,9 +231,8 @@ export function validateAmountInput(
     return `Amount cannot have more than ${decimals} decimal places`;
   }
 
-  // Check for positive value
-  const numericValue = parseFloat(cleanInput);
-  if (isNaN(numericValue) || numericValue <= 0) {
+  // Compare exact integer units so large values and tiny fractions stay exact.
+  if (parseAmount(cleanInput, decimals) <= 0n) {
     return "Amount must be greater than 0";
   }
 

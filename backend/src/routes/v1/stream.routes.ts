@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { requireAuth } from '../../middleware/auth.js';
 import {
   createStream,
   listStreams,
@@ -13,366 +14,140 @@ import {
 import { cancelStreamHandler } from '../../controllers/stream/cancel.js';
 import { simulateStreamHandler } from '../../controllers/stream/simulate.js';
 import { withdrawHandler } from './streams/withdraw.js';
-import { requireAuth } from '../../middleware/auth.js';
-import { streamCreationRateLimiter } from '../../middleware/stream-rate-limiter.middleware.js';
 
 const router = Router();
 
 /**
  * @openapi
  * /v1/streams:
- *   post:
- *     tags:
- *       - Streams
- *     summary: Create a new payment stream
- *     description: Creates or reactivates a payment stream record for the authenticated wallet. The authenticated wallet must be the stream sender.
- *     security:
- *       - BearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [streamId, sender, recipient, tokenAddress, ratePerSecond, depositedAmount, startTime]
- *             properties:
- *               streamId:
- *                 type: integer
- *                 description: On-chain stream ID
- *                 example: 1
- *               sender:
- *                 type: string
- *                 description: Sender Stellar public key — must match the authenticated wallet
- *                 example: "GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA"
- *               recipient:
- *                 type: string
- *                 description: Recipient Stellar public key
- *                 example: "GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD"
- *               tokenAddress:
- *                 type: string
- *                 description: Token contract address
- *                 example: "CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE"
- *               ratePerSecond:
- *                 type: string
- *                 description: Payment rate per second (i128 as string)
- *                 example: "100"
- *               depositedAmount:
- *                 type: string
- *                 description: Total deposited amount (i128 as string)
- *                 example: "10000"
- *               startTime:
- *                 type: integer
- *                 description: Stream start time (Unix timestamp)
- *                 example: 1708531200
- *     responses:
- *       201:
- *         description: Stream created successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Stream'
- *       400:
- *         description: Invalid input data
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication token
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - sender does not match the authenticated wallet, or stream is owned by another wallet
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       429:
- *         description: Too Many Requests - rate limit exceeded (10 requests per minute)
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-router.post('/', requireAuth, streamCreationRateLimiter, createStream);
-
-/**
- * @openapi
- * /v1/streams/simulate:
- *   post:
- *     tags:
- *       - Streams
- *     summary: Simulate a stream contract call (client-side signing)
- *     description: |
- *       Runs a Soroban `simulateTransaction` for the requested action and
- *       returns an **unsigned** transaction with the ledger footprint, resource
- *       limits and a padded resource fee already applied, ready for a browser
- *       wallet (Freighter, Lobstr, xBull) to sign.
- *
- *       The returned XDR carries the sender's sequence number as of the moment
- *       of simulation, so clients should sign promptly rather than holding the
- *       response open. A 15% resource-fee buffer is applied on top of the
- *       simulated minimum to absorb footprint drift between simulation and
- *       submission.
- *
- *       Reverted simulations return HTTP 400 with the decoded contract error
- *       code and a remediation hint in `details`.
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - action
- *               - senderPublicKey
- *             properties:
- *               action:
- *                 type: string
- *                 enum: [create, withdraw, cancel, top_up, batch_withdraw]
- *                 example: create
- *               senderPublicKey:
- *                 type: string
- *                 description: Stellar account that will sign the transaction
- *                 example: GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF
- *               params:
- *                 type: object
- *                 description: |
- *                   Action-specific arguments. `create` needs `recipient`,
- *                   `amount`, `duration` and `tokenAddress`; `withdraw` and
- *                   `cancel` need `streamId`; `top_up` needs `streamId` and
- *                   `amount`; `batch_withdraw` needs `streamIds`.
- *                 properties:
- *                   streamId:
- *                     type: string
- *                     example: '123'
- *                   streamIds:
- *                     type: array
- *                     items:
- *                       type: string
- *                   recipient:
- *                     type: string
- *                     example: GBBJ6H3FJN34VLIGNU2QZJ4T6NMY4B2LKCVYGCXK5HO3JFXKHTGSHRQ
- *                   amount:
- *                     type: string
- *                     description: Amount in the token's smallest unit (i128 as string)
- *                     example: '1000000000'
- *                   duration:
- *                     type: integer
- *                     description: Stream duration in seconds
- *                     example: 2592000
- *                   tokenAddress:
- *                     type: string
- *                     description: Token contract address — required for `create`
- *     responses:
- *       200:
- *         description: Simulation succeeded
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success:
- *                   type: boolean
- *                   example: true
- *                 data:
- *                   type: object
- *                   properties:
- *                     unsignedXdr:
- *                       type: string
- *                       description: Base64-encoded unsigned transaction XDR
- *                       example: AAAAAB...
- *                     minResourceFee:
- *                       type: string
- *                       description: Simulated minimum resource fee in stroops
- *                       example: '15000'
- *                     recommendedFee:
- *                       type: string
- *                       description: minResourceFee plus a 15% safety buffer
- *                       example: '17250'
- *                     cpuInstructions:
- *                       type: integer
- *                       example: 1420500
- *                     memoryBytes:
- *                       type: integer
- *                       example: 524000
- *                     expiresAtLedger:
- *                       type: integer
- *                       description: Last ledger the returned footprint is valid against
- *                       example: 482910
- *                     simulatedReturn:
- *                       type: string
- *                       description: Decoded contract return value (empty string for void returns)
- *                       example: '100000000'
- *       400:
- *         description: Invalid parameters, or the simulation reverted
- *       503:
- *         description: Stream contract is not configured
- */
-router.post('/simulate', simulateStreamHandler);
-
-/**
- * @openapi
- * /v1/streams:
  *   get:
- *     tags:
- *       - Streams
- *     summary: List payment streams
- *     description: Retrieve a list of payment streams with optional filtering, sorting, and pagination.
+ *     tags: [Streams]
+ *     summary: List streams
+ *     description: |
+ *       Returns a paginated list of streams optionally filtered by sender,
+ *       recipient, status, or token address.
  *     parameters:
  *       - in: query
  *         name: sender
  *         schema: { type: string }
- *         description: Filter by sender public key
  *       - in: query
  *         name: recipient
  *         schema: { type: string }
- *         description: Filter by recipient public key
  *       - in: query
  *         name: status
- *         schema:
- *           type: string
- *           enum: [active, cancelled, completed, paused]
- *         description: Filter by stream status
+ *         schema: { type: string, enum: [active, cancelled, completed, paused] }
  *       - in: query
  *         name: token
  *         schema: { type: string }
- *         description: Filter by token contract address
  *       - in: query
  *         name: sort
- *         schema:
- *           type: string
- *           enum: [createdAt, startTime, lastUpdateTime, depositedAmount, endTime]
- *           default: createdAt
- *         description: Sort field
+ *         schema: { type: string }
  *       - in: query
  *         name: order
- *         schema:
- *           type: string
- *           enum: [asc, desc]
- *           default: desc
- *         description: Sort order
+ *         schema: { type: string, enum: [asc, desc] }
  *       - in: query
  *         name: limit
- *         schema:
- *           type: integer
- *           default: 20
- *           minimum: 1
- *           maximum: 100
- *         description: Max results per page (capped at 100)
+ *         schema: { type: integer }
  *       - in: query
  *         name: offset
- *         schema:
- *           type: integer
- *           default: 0
- *           minimum: 0
- *         description: Number of results to skip
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: cursor
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: Paginated list of streams
+ *         description: Paginated stream list
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/StreamListResponse'
  *       400:
- *         description: Invalid status or pagination parameters
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid query parameters
  */
 router.get('/', listStreams);
 
 /**
  * @openapi
- * /v1/streams/summary/{address}:
+ * /v1/streams:
+ *   post:
+ *     tags: [Streams]
+ *     summary: Register an on-chain stream in the backend index
+ *     description: |
+ *       Creates a DB projection for a stream that has already been confirmed
+ *       on-chain. Rejects requests where the provided parameters do not match
+ *       the on-chain state.
+ *     security:
+ *       - bearerAuth: []
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CreateStreamRequest'
+ *     responses:
+ *       201:
+ *         description: Stream registered
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       409:
+ *         description: On-chain state mismatch
+ */
+router.post('/', requireAuth, createStream);
+
+/**
+ * @openapi
+ * /v1/streams/simulate:
+ *   post:
+ *     tags: [Streams]
+ *     summary: Simulate a stream contract call
+ */
+router.post('/simulate', simulateStreamHandler);
+
+/**
+ * @openapi
+ * /v1/streams/users/{address}/summary:
  *   get:
- *     tags:
- *       - Streams
- *     summary: Get user stream summary
- *     description: Aggregate dashboard/profile summary for a wallet address. Cached for 30 seconds.
+ *     tags: [Streams]
+ *     summary: Get aggregate stream statistics for a wallet address
  *     parameters:
  *       - in: path
  *         name: address
  *         required: true
  *         schema: { type: string }
- *         description: Stellar public key
  *     responses:
  *       200:
  *         description: User stream summary
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/UserStreamSummary'
  *       400:
- *         description: Address is required
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid address
  */
-router.get('/summary/:address', getUserStreamSummary);
+router.get('/users/:address/summary', getUserStreamSummary);
 
 /**
  * @openapi
  * /v1/streams/{streamId}:
  *   get:
- *     tags:
- *       - Streams
- *     summary: Get stream details
- *     description: Returns a single stream. Falls back to live on-chain data when the DB record is missing or stale.
+ *     tags: [Streams]
+ *     summary: Get a single stream by ID
  *     parameters:
  *       - in: path
  *         name: streamId
  *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
+ *         schema: { type: integer }
  *     responses:
  *       200:
- *         description: Stream details
+ *         description: Stream record
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Stream'
  *       400:
- *         description: Invalid streamId parameter
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid streamId
  *       404:
  *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  */
 router.get('/:streamId', getStream);
 
@@ -380,82 +155,35 @@ router.get('/:streamId', getStream);
  * @openapi
  * /v1/streams/{streamId}/events:
  *   get:
- *     tags:
- *       - Streams
- *     summary: Get stream events
- *     description: Retrieve events for a specific stream with pagination, filtering, and sorting.
+ *     tags: [Streams]
+ *     summary: List events for a stream
  *     parameters:
  *       - in: path
  *         name: streamId
  *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
+ *         schema: { type: integer }
  *       - in: query
  *         name: limit
- *         schema:
- *           type: integer
- *           default: 50
- *           minimum: 1
- *           maximum: 200
- *         description: "Number of events to return per page (default: 50, max: 200)"
+ *         schema: { type: integer }
  *       - in: query
  *         name: offset
- *         schema:
- *           type: integer
- *           default: 0
- *           minimum: 0
- *         description: "Number of events to skip (default: 0)"
- *       - in: query
- *         name: eventType
- *         schema:
- *           type: string
- *           enum: [CREATED, TOPPED_UP, WITHDRAWN, CANCELLED, COMPLETED, PAUSED, RESUMED, FEE_COLLECTED, FEE_CONFIG_UPDATED, ADMIN_TRANSFERRED]
- *         description: Filter events by type
- *       - in: query
- *         name: page
- *         schema:
- *           type: integer
- *           default: 1
- *           minimum: 1
- *         description: 1-based page index (offset based). Ignored when `cursor` is set.
+ *         schema: { type: integer }
  *       - in: query
  *         name: cursor
- *         schema:
- *           type: string
- *         description: Event id cursor for stable pagination (hasMore-aware). Ignored when `offset` is set.
+ *         schema: { type: string }
  *       - in: query
  *         name: order
- *         schema:
- *           type: string
- *           enum: [asc, desc]
- *           default: desc
- *         description: "Sort order by timestamp (default: desc)"
+ *         schema: { type: string, enum: [asc, desc] }
+ *       - in: query
+ *         name: eventType
+ *         schema: { type: string }
  *     responses:
  *       200:
- *         description: Paginated stream events
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/StreamEventListResponse'
+ *         description: Paginated event list
  *       400:
- *         description: Invalid request parameters
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid parameters
  *       404:
  *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  */
 router.get('/:streamId/events', getStreamEvents);
 
@@ -463,111 +191,46 @@ router.get('/:streamId/events', getStreamEvents);
  * @openapi
  * /v1/streams/{streamId}/claimable:
  *   get:
- *     tags:
- *       - Streams
- *     summary: Get actionable claimable amount for a stream
- *     description: Returns the amount claimable right now (or at an optional timestamp). Uses a 5s-cached computation, with an on-chain fallback when the record is missing or stale.
+ *     tags: [Streams]
+ *     summary: Get claimable balance for a stream
  *     parameters:
  *       - in: path
  *         name: streamId
  *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
+ *         schema: { type: integer }
  *       - in: query
  *         name: at
- *         schema:
- *           type: integer
- *           minimum: 0
- *         description: Optional Unix timestamp (seconds) to compute the claimable amount at
+ *         schema: { type: integer }
+ *         description: Unix timestamp to calculate claimable amount at
  *     responses:
  *       200:
  *         description: Claimable amount
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/ClaimableResponse'
  *       400:
- *         description: Invalid streamId or `at` parameter
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ *         description: Invalid parameters
  *       404:
  *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  */
 router.get('/:streamId/claimable', getStreamClaimableAmount);
 
 /**
  * @openapi
- * /v1/streams/{streamId}/pause:
+ * /v1/streams/{streamId}/top-up:
  *   post:
- *     tags:
- *       - Streams
- *     summary: Pause a payment stream
- *     description: Pause an active stream. Only the sender can pause their own stream.
- *     parameters:
- *       - in: path
- *         name: streamId
- *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
+ *     tags: [Streams]
+ *     summary: Add tokens to a running stream
  *     security:
  *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Stream paused successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/PauseResumeResponse'
- *       400:
- *         description: Invalid streamId, or on-chain pause simulation failed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - caller is not the stream sender
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       409:
- *         description: Conflict - stream already paused or inactive
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
+ */
+router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
+
+/**
+ * @openapi
+ * /v1/streams/{streamId}/pause:
+ *   post:
+ *     tags: [Streams]
+ *     summary: Pause a running stream
+ *     security:
+ *       - bearerAuth: []
  */
 router.post('/:streamId/pause', requireAuth, pauseStream);
 
@@ -575,265 +238,33 @@ router.post('/:streamId/pause', requireAuth, pauseStream);
  * @openapi
  * /v1/streams/{streamId}/resume:
  *   post:
- *     tags:
- *       - Streams
- *     summary: Resume a paused payment stream
- *     description: Resume a paused stream. Only the sender can resume their own stream.
- *     parameters:
- *       - in: path
- *         name: streamId
- *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
+ *     tags: [Streams]
+ *     summary: Resume a paused stream
  *     security:
  *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Stream resumed successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/PauseResumeResponse'
- *       400:
- *         description: Invalid streamId, or on-chain resume simulation failed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - caller is not the stream sender
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       409:
- *         description: Conflict - stream not paused or inactive
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  */
 router.post('/:streamId/resume', requireAuth, resumeStream);
 
 /**
  * @openapi
- * /v1/streams/{streamId}/withdraw:
- *   post:
- *     tags:
- *       - Streams
- *     summary: Withdraw claimable balance from a payment stream
- *     description: Withdraws the currently claimable amount. Only the recipient can withdraw.
- *     parameters:
- *       - in: path
- *         name: streamId
- *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
- *     security:
- *       - bearerAuth: []
- *     responses:
- *       200:
- *         description: Withdrawal submitted successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/WithdrawResponse'
- *       400:
- *         description: Invalid streamId or contract revert
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - caller is not the stream recipient
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       409:
- *         description: Conflict - no claimable balance available
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-router.post('/:streamId/withdraw', requireAuth, withdrawHandler as any);
-
-/**
- * @openapi
- * /v1/streams/{streamId}/top-up:
- *   post:
- *     tags:
- *       - Streams
- *     summary: Top up a payment stream
- *     description: Adds additional funds to an existing active stream. Only the original sender can top up.
- *     parameters:
- *       - in: path
- *         name: streamId
- *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
- *     security:
- *       - bearerAuth: []
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required:
- *               - amount
- *             properties:
- *               amount:
- *                 type: string
- *                 description: Amount to add to the stream deposit (i128 as string)
- *                 example: '5000'
- *     responses:
- *       200:
- *         description: Stream topped up successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/TopUpResponse'
- *       400:
- *         description: Invalid request — amount missing or not a positive integer string
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication token
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - caller is not the stream sender
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       409:
- *         description: Conflict - stream inactive or paused
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- */
-router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
-
-/**
- * @openapi
  * /v1/streams/{streamId}/cancel:
  *   post:
- *     tags:
- *       - Streams
- *     summary: Cancel an active payment stream
- *     description: Cancels an active payment stream. Only the sender can cancel; accrued tokens go to the recipient and the remainder is refunded to the sender.
+ *     tags: [Streams]
+ *     summary: Cancel an active stream
  *     security:
  *       - bearerAuth: []
- *     parameters:
- *       - in: path
- *         name: streamId
- *         required: true
- *         schema:
- *           type: integer
- *         description: On-chain stream ID
- *     responses:
- *       200:
- *         description: Stream cancelled successfully
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/CancelResponse'
- *       400:
- *         description: Invalid streamId or transaction simulation failed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       401:
- *         description: Unauthorized - missing or invalid authentication
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       403:
- *         description: Forbidden - only the sender can cancel
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       404:
- *         description: Stream not found
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       409:
- *         description: Stream already cancelled or completed
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
- *       500:
- *         description: Internal server error
- *         content:
- *           application/json:
- *             schema:
- *               $ref: '#/components/schemas/Error'
  */
-router.post('/:streamId/cancel', requireAuth, cancelStreamHandler as any);
+router.post('/:streamId/cancel', requireAuth, cancelStreamHandler);
+
+/**
+ * @openapi
+ * /v1/streams/{streamId}/withdraw:
+ *   post:
+ *     tags: [Streams]
+ *     summary: Withdraw claimable balance from a stream
+ *     security:
+ *       - bearerAuth: []
+ */
+router.post('/:streamId/withdraw', requireAuth, withdrawHandler);
 
 export default router;

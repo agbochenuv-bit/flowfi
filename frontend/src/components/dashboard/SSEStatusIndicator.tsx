@@ -6,6 +6,7 @@ import { AlertCircle } from "lucide-react";
 interface SSEStatusIndicatorProps {
   connected: boolean;
   reconnecting: boolean;
+  offline?: boolean;
   error: Error | null;
   /** Optional handler for the "Retry Now" button (issue #1508). */
   onRetry?: () => void;
@@ -14,16 +15,17 @@ interface SSEStatusIndicatorProps {
 export function SSEStatusIndicator({
   connected,
   reconnecting,
+  offline = false,
   error,
   onRetry,
 }: SSEStatusIndicatorProps) {
   // Show disconnect banner when error occurs
   const showDisconnectBanner = useMemo(() => {
-    return !!error || (reconnecting && !connected);
-  }, [connected, reconnecting, error]);
+    return offline || !!error || (reconnecting && !connected);
+  }, [connected, reconnecting, error, offline]);
 
   const isLive = connected && !reconnecting && !error;
-  const isReconnecting = reconnecting;
+  const isReconnecting = reconnecting && !offline;
   const isDisconnected = !connected || error;
 
   return (
@@ -50,7 +52,9 @@ export function SSEStatusIndicator({
                 : "text-red-600 dark:text-red-400"
           }`}
         >
-          {isLive
+          {offline
+            ? "Offline"
+            : isLive
             ? "Live"
             : isReconnecting
               ? "Reconnecting..."
@@ -66,12 +70,15 @@ export function SSEStatusIndicator({
               ? "bg-yellow-500/90"
               : "bg-red-500/90"
           } text-white p-4 flex items-center justify-between gap-4 animate-in slide-in-from-top`}
-          role="alert"
+          role={offline ? "status" : "alert"}
+          aria-live={offline ? "polite" : "assertive"}
         >
           <div className="flex items-center gap-3 max-w-2xl">
             <AlertCircle size={20} className="flex-shrink-0" />
             <p className="text-sm font-medium">
-              {isReconnecting
+              {offline
+                ? "You are offline. Dashboard data is cached until your connection returns."
+                : isReconnecting
                 ? "Real-time updates paused. Reconnecting..."
                 : "Real-time updates paused. Data may be stale."}
             </p>

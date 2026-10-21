@@ -1,18 +1,22 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { useVirtualizer } from '@tanstack/react-virtual';
 import { ArrowDown, ArrowUp, RotateCcw, SlidersHorizontal } from 'lucide-react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import type { Stream } from '@/lib/dashboard';
 import { useStreamingAmount } from '@/hooks/useStreamingAmount';
 import { useTablePreferences } from '@/hooks/useTablePreferences';
 import toast from 'react-hot-toast';
 import { transactionSuccessToast } from '@/lib/transaction-feedback';
+import { StreamActionReviewModal } from '@/components/stream-creation/StreamActionReviewModal';
 
 
 interface IncomingStreamsProps {
     streams: Stream[];
     onWithdraw: (stream: Stream) => Promise<void>;
     withdrawingStreamId?: string | null;
+    network?: string;
     /** Stream highlighted by keyboard navigation (j/k). */
     selectedStreamId?: string | null;
 }
@@ -29,8 +33,16 @@ const COLUMNS = [
 type ColumnId = (typeof COLUMNS)[number]['id'];
 
 const COLUMN_IDS: ColumnId[] = COLUMNS.map((column) => column.id);
+const PAGE_SIZE = 10;
+const FILTERS = ['All', 'Active', 'Completed', 'Paused'] as const;
 
 const STORAGE_KEY = 'flowfi.table.incoming-streams.v1';
+
+/** Render rows virtually once the dataset exceeds this size (matches ActivityHistory). */
+const VIRTUALIZATION_THRESHOLD = 50;
+
+/** Default estimated row height for the virtualizer. */
+const ROW_HEIGHT = 64;
 
 const HEADER_CELL_CLASS =
     'px-6 py-3 text-left text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider';
@@ -101,6 +113,102 @@ const ClaimableAmount: React.FC<{ stream: Stream }> = ({ stream }) => {
     );
 };
 
+// ─── Shared StreamRow ────────────────────────────────────────────────────────
+
+interface StreamRowProps {
+    stream: Stream;
+    isSelected: boolean;
+    isVisible: (columnId: ColumnId) => boolean;
+    onWithdraw: (stream: Stream) => void;
+    withdrawingStreamId: string | null;
+    /** Forwarded ref for virtualizer dynamic measurement. Omit for non-virtualised rows. */
+    measureRef?: (node: Element | null) => void;
+    /** 1-based row index for aria-rowindex (only used in virtualized mode). */
+    ariaRowIndex?: number;
+    style?: React.CSSProperties;
+    /** data-index used by @tanstack/react-virtual measureElement. */
+    'data-index'?: number;
+}
+
+const StreamRow: React.FC<StreamRowProps> = ({
+    stream,
+    isSelected,
+    isVisible,
+    onWithdraw,
+    withdrawingStreamId,
+    measureRef,
+    ariaRowIndex,
+    style,
+    ...rest
+}) => {
+    const isPaused = stream.status === 'Paused';
+    return (
+        <tr
+            ref={measureRef}
+            key={stream.id}
+            data-stream-id={stream.id}
+            aria-selected={isSelected}
+            {...(ariaRowIndex !== undefined ? { 'aria-rowindex': ariaRowIndex } : {})}
+            style={style}
+            {...rest}
+            className={`hover:bg-gray-50 dark:hover:bg-gray-700/50 transition-colors ${isPaused ? 'bg-gray-50/50 dark:bg-gray-800/50 opacity-75' : ''} ${isSelected ? 'bg-accent/10 ring-1 ring-inset ring-accent/50' : ''}`}
+        >
+            {isVisible('sender') && (
+                <td className="px-6 py-4 whitespace-nowrap">
+                    <div className={`text-sm font-mono ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                        {stream.recipient}
+                    </div>
+                    <div className="text-xs text-gray-500 dark:text-gray-400">Stream #{stream.id}</div>
+                </td>
+            )}
+            {isVisible('token') && (
+                <td className={`px-6 py-4 whitespace-nowrap text-sm ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                    {stream.token}
+                </td>
+            )}
+            {isVisible('deposited') && (
+                <td className={`px-6 py-4 whitespace-nowrap text-sm tabular-nums ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                    {formatTokenAmount(stream.deposited)} {stream.token}
+                </td>
+            )}
+            {isVisible('withdrawn') && (
+                <td className={`px-6 py-4 whitespace-nowrap text-sm font-bold tabular-nums ${isPaused ? 'text-gray-500 dark:text-gray-400' : 'text-gray-900 dark:text-gray-100'}`}>
+                    {formatTokenAmount(stream.withdrawn)} {stream.token}
+                </td>
+            )}
+            {isVisible('claimable') && (
+                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                    <ClaimableAmount stream={stream} />
+                </td>
+            )}
+            {isVisible('status') && (
+                <td className="px-6 py-4 whitespace-nowrap text-sm">
+                    <span className={`px-2 inline-flex text-xs leading-5 font-semibold rounded-full
+                        ${stream.status === 'Active' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' :
+                            stream.status === 'Paused' ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' :
+                                stream.status === 'Completed' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' :
+                                    'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'}`}>
+                        {stream.status}
+                    </span>
+                </td>
+            )}
+            <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                <button
+                    disabled={stream.status !== 'Active' || withdrawingStreamId === stream.id}
+                    onClick={() => onWithdraw(stream)}
+                    className={`px-4 py-2 rounded-lg transition-all ${
+                        stream.status === 'Active'
+                            ? 'bg-accent text-white hover:bg-accent-hover shadow-lg'
+                            : 'bg-gray-200 dark:bg-gray-700 text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                    }`}
+                >
+                    {withdrawingStreamId === stream.id ? 'Withdrawing...' : 'Withdraw'}
+                </button>
+            </td>
+        </tr>
+    );
+};
+
 /**
  * Shown when the current filter returns no results.
  * Distinguished from the global empty-state (no streams at all), which is
@@ -134,23 +242,51 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     streams,
     onWithdraw,
     withdrawingStreamId = null,
+    network = 'Unknown',
     selectedStreamId = null,
 }) => {
-    const [filter, setFilter] = useState<'All' | 'Active' | 'Completed' | 'Paused'>('All');
+    const router = useRouter();
+    const searchParams = useSearchParams();
+    const requestedFilter = searchParams.get('incomingStatus');
+    const filter = FILTERS.includes(requestedFilter as (typeof FILTERS)[number])
+        ? requestedFilter as (typeof FILTERS)[number]
+        : 'All';
+    const requestedSort = searchParams.get('incomingSort');
+    const urlSortBy = COLUMN_IDS.includes(requestedSort as ColumnId)
+        ? requestedSort as ColumnId
+        : null;
+    const requestedDirection = searchParams.get('incomingDirection');
+    const urlSortDirection = requestedDirection === 'asc' || requestedDirection === 'desc'
+        ? requestedDirection
+        : null;
+    const requestedPage = Number(searchParams.get('incomingPage') ?? '1');
+    const page = Number.isSafeInteger(requestedPage) && requestedPage > 0 ? requestedPage : 1;
+    const [reviewStream, setReviewStream] = useState<Stream | null>(null);
     const [showSettings, setShowSettings] = useState(false);
     const settingsRef = useRef<HTMLDivElement>(null);
 
     const {
-        sortBy,
-        sortDirection,
+        sortBy: _storedSortBy,
+        sortDirection: _storedSortDirection,
         isVisible,
         toggleColumn,
-        setSort,
         resetPreferences,
     } = useTablePreferences<ColumnId>({
         storageKey: STORAGE_KEY,
         defaultColumns: COLUMN_IDS,
     });
+    const sortBy = urlSortBy;
+    const sortDirection = urlSortDirection ?? 'desc';
+
+    const updateView = (changes: Record<string, string | null>, resetPage = false) => {
+        const params = new URLSearchParams(searchParams.toString());
+        for (const [key, value] of Object.entries(changes)) {
+            if (value === null) params.delete(key);
+            else params.set(key, value);
+        }
+        if (resetPage) params.set('incomingPage', '1');
+        router.push(`?${params.toString()}`);
+    };
 
     // Close the settings dropdown on outside click / Escape.
     useEffect(() => {
@@ -188,13 +324,25 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
     }, [filteredStreams, sortBy, sortDirection]);
 
     const handleFilterChange = (e: React.ChangeEvent<HTMLSelectElement>) => {
-        setFilter(e.target.value as 'All' | 'Active' | 'Completed' | 'Paused');
+        updateView({ incomingStatus: e.target.value === 'All' ? null : e.target.value }, true);
+    };
+
+    const handleSort = (columnId: ColumnId) => {
+        const direction = sortBy === columnId
+            ? sortDirection === 'asc' ? 'desc' : 'asc'
+            : 'asc';
+        updateView({ incomingSort: columnId, incomingDirection: direction }, true);
     };
 
     const handleResetLayout = () => {
         resetPreferences();
+        updateView({ incomingSort: null, incomingDirection: null }, true);
         setShowSettings(false);
     };
+
+    const pageCount = Math.max(1, Math.ceil(sortedStreams.length / PAGE_SIZE));
+    const currentPage = Math.min(page, pageCount);
+    const visibleStreams = sortedStreams.slice((currentPage - 1) * PAGE_SIZE, currentPage * PAGE_SIZE);
 
     const handleWithdraw = async (stream: Stream) => {
         try {
@@ -202,8 +350,52 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
             transactionSuccessToast(`Successfully withdrew from stream #${stream.id}`);
         } catch {
             toast.error(`Failed to withdraw from stream #${stream.id}`);
+            throw new Error('Withdrawal failed');
         }
     };
+
+    const openWithdrawalReview = (stream: Stream) => setReviewStream(stream);
+
+    const confirmWithdrawal = async () => {
+        if (!reviewStream) return;
+        await handleWithdraw(reviewStream);
+        setReviewStream(null);
+    };
+
+    const reviewAmount = reviewStream
+        ? Math.min(
+            Math.max(0, reviewStream.deposited - reviewStream.withdrawn),
+            Math.max(0, Date.now() / 1000 - reviewStream.lastUpdateTime) * reviewStream.ratePerSecond,
+        )
+        : 0;
+
+    // ── Virtualization (only for large histories) ───────────────────────────
+    const shouldVirtualize = sortedStreams.length > VIRTUALIZATION_THRESHOLD;
+    const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+    const virtualizer = useVirtualizer({
+        count: sortedStreams.length,
+        getScrollElement: () => scrollContainerRef.current,
+        estimateSize: () => ROW_HEIGHT,
+        overscan: 5,
+        enabled: shouldVirtualize,
+        getItemKey: (index) => sortedStreams[index]?.id ?? index,
+    });
+
+    // Keep the keyboard-selected row scrolled into view. The parent
+    // (dashboard-view.tsx) also calls `scrollIntoView` on the DOM node, but
+    // that only works for rows that are currently mounted. When virtualization
+    // hides the selected row, proactively scroll it into the viewport so the
+    // node gets rendered and the parent's scrollIntoView finds it.
+    useEffect(() => {
+        if (!shouldVirtualize || !selectedStreamId) return;
+        const index = sortedStreams.findIndex((s) => s.id === selectedStreamId);
+        if (index >= 0) {
+            virtualizer.scrollToIndex(index, { align: 'auto' });
+        }
+    }, [selectedStreamId, shouldVirtualize, sortedStreams, virtualizer]);
+
+    const visibleCols = COLUMNS.filter((c) => isVisible(c.id));
 
     return (
         <div className="bg-white/40 dark:bg-slate-900/40 backdrop-blur-md rounded-2xl border border-white/20 dark:border-white/10 shadow-xl overflow-hidden">
@@ -219,7 +411,8 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                         Filter:
                     </label>
                     <select
-                        id="filter"
+                        id="incoming-status-filter"
+                        aria-label="Filter incoming streams"
                         value={filter}
                         onChange={handleFilterChange}
                         className="bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-700 rounded-lg px-3 py-1 text-sm focus:ring-2 focus:ring-accent outline-none"
@@ -284,9 +477,73 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
             {filteredStreams.length === 0 ? (
                 <FilterEmptyState
                     filter={filter}
-                    onClearFilter={() => setFilter('All')}
+                    onClearFilter={() => updateView({ incomingStatus: null }, true)}
                 />
+            ) : shouldVirtualize ? (
+                /* ── Virtualized path (> 50 rows) ────────────────────────────── */
+                <div ref={scrollContainerRef} className="overflow-auto" style={{ maxHeight: 600 }}>
+                    <table
+                        className="w-full text-left border-collapse"
+                        aria-rowcount={sortedStreams.length + 1}
+                        style={{ display: 'table', width: '100%' }}
+                    >
+                        <thead className="bg-gray-50/50 dark:bg-gray-800/50 sticky top-0 z-10">
+                            <tr>
+                                {visibleCols.map((column) => (
+                                    <th key={column.id} className={HEADER_CELL_CLASS}>
+                                        <button
+                                            type="button"
+                                            onClick={() => setSort(column.id)}
+                                            aria-label={`Sort by ${column.label}`}
+                                            className="inline-flex items-center gap-1 uppercase tracking-wider hover:text-accent"
+                                        >
+                                            {column.label}
+                                            {sortBy === column.id && (
+                                                sortDirection === 'asc' ? (
+                                                    <ArrowUp className="h-3 w-3" aria-hidden="true" />
+                                                ) : (
+                                                    <ArrowDown className="h-3 w-3" aria-hidden="true" />
+                                                )
+                                            )}
+                                        </button>
+                                    </th>
+                                ))}
+                                <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody
+                            className="bg-white dark:bg-gray-800"
+                            style={{ height: virtualizer.getTotalSize(), position: 'relative' }}
+                        >
+                            {virtualizer.getVirtualItems().map((virtualRow) => {
+                                const stream = sortedStreams[virtualRow.index];
+                                if (!stream) return null;
+                                return (
+                                    <StreamRow
+                                        key={stream.id}
+                                        stream={stream}
+                                        isSelected={selectedStreamId === stream.id}
+                                        isVisible={isVisible}
+                                        onWithdraw={openWithdrawalReview}
+                                        withdrawingStreamId={withdrawingStreamId}
+                                        ariaRowIndex={virtualRow.index + 2}
+                                        measureRef={virtualizer.measureElement}
+                                        data-index={virtualRow.index}
+                                        style={{
+                                            position: 'absolute',
+                                            top: 0,
+                                            left: 0,
+                                            width: '100%',
+                                            transform: `translateY(${virtualRow.start}px)`,
+                                        }}
+                                    />
+                                );
+                            })}
+                        </tbody>
+                    </table>
+                </div>
             ) : (
+                /* ── Non-virtualized path (<= 50 rows) ─────────────────────────── */
                 <div className="overflow-x-auto">
                     <table className="w-full text-left border-collapse">
                         <thead className="bg-gray-50/50 dark:bg-gray-800/50">
@@ -296,7 +553,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                                         <th key={column.id} className={HEADER_CELL_CLASS}>
                                             <button
                                                 type="button"
-                                                onClick={() => setSort(column.id)}
+                                                onClick={() => handleSort(column.id)}
                                                 aria-label={`Sort by ${column.label}`}
                                                 className="inline-flex items-center gap-1 uppercase tracking-wider hover:text-accent"
                                             >
@@ -316,7 +573,7 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                             </tr>
                         </thead>
                         <tbody className="bg-white dark:bg-gray-800 divide-y divide-gray-200 dark:divide-gray-700">
-                            {sortedStreams.map((stream) => {
+                            {visibleStreams.map((stream) => {
                                 const isPaused = stream.status === 'Paused';
                                 const isSelected = selectedStreamId === stream.id;
                                 return (
@@ -384,6 +641,44 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                         </tbody>
                     </table>
                 </div>
+            )}
+            {reviewStream && (
+                <StreamActionReviewModal
+                    title="Review withdrawal"
+                    actionLabel="Continue to wallet"
+                    streamId={reviewStream.id}
+                    network={network}
+                    token={reviewStream.token}
+                    amount={formatTokenAmount(reviewAmount)}
+                    consequence="This withdraws the claimable amount to your wallet. The stream continues accruing afterward."
+                    onConfirm={confirmWithdrawal}
+                    onClose={() => setReviewStream(null)}
+                />
+            )}
+
+            {filteredStreams.length > 0 && (
+                <div className="flex items-center justify-between border-t border-gray-200 px-6 py-3 dark:border-gray-700">
+                    <span className="text-sm text-gray-500 dark:text-gray-400">
+                        Page {currentPage} of {pageCount} ({sortedStreams.length} streams)
+                    </span>
+                    <div className="flex gap-2">
+                        <button
+                            type="button"
+                            aria-label="Previous page"
+                            disabled={currentPage <= 1}
+                            onClick={() => updateView({ incomingPage: String(currentPage - 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Previous</button>
+                        <button
+                            type="button"
+                            aria-label="Next page"
+                            disabled={currentPage >= pageCount}
+                            onClick={() => updateView({ incomingPage: String(currentPage + 1) })}
+                            className="rounded border border-gray-300 px-3 py-1 text-sm disabled:opacity-40 dark:border-gray-700"
+                        >Next</button>
+                    </div>
+                </div>
+            )}
             )}
         </div>
     );

@@ -7,9 +7,17 @@ vi.mock('next/navigation', () => ({
     useRouter: () => ({ push: pushMock }),
 }));
 
+vi.mock('@/context/NetworkContext', () => ({
+    useNetwork: () => ({ networkId: 'testnet' }),
+}));
+
 const useStreamEventsMock = vi.fn();
 vi.mock('@/hooks/useStreamEvents', () => ({
     useStreamEvents: (...args: unknown[]) => useStreamEventsMock(...args),
+}));
+
+vi.mock('@/context/wallet-context', () => ({
+    useWallet: () => ({ authToken: null }),
 }));
 
 // Imported after the mock registrations above.
@@ -63,11 +71,13 @@ describe('NotificationDropdown empty state', () => {
         expect(dialog).toHaveTextContent('View All Activity');
     });
 
-    it('disables the bell while the event stream is disconnected', () => {
+    it('keeps cached notifications accessible while the event stream is disconnected', async () => {
         mockStream({ connected: false });
         render(<NotificationDropdown publicKey={PUBLIC_KEY} />);
 
-        expect(screen.getByRole('button', { name: /notifications/i })).toBeDisabled();
+        expect(screen.getByRole('button', { name: /notifications/i })).toBeEnabled();
+        await openDropdown();
+        expect(screen.getByText('Connecting to live updates...')).toBeInTheDocument();
     });
 
     it('renders notifications instead of the empty state once events arrive', async () => {

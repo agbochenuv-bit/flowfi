@@ -30,6 +30,8 @@ import type { BackendStreamEvent } from "@/lib/api-types";
 import { formatAmount, streamProgressPercent, validateAmountInput } from "@/utils/amount";
 import { shortenPublicKey } from "@/lib/wallet";
 import { LiquidStreamVisualizer } from "@/components/LiquidStreamVisualizer";
+import { getTokenDecimals, useTokenMetadata } from "@/hooks/useTokenMetadata";
+import { useNetwork } from "@/context/NetworkContext";
 
 interface StreamDetail {
   id: string;
@@ -76,6 +78,8 @@ const EVENT_STYLES: Record<string, { color: string; icon: string; label: string 
 
 export default function StreamDetailsContent({ streamId }: { streamId: string }) {
   const { session, isHydrated } = useWallet();
+    const { networkId } = useNetwork();
+  const { data: tokenMetadata = [] } = useTokenMetadata();
   const tracker = useTransactionTracker();
 
   const [stream, setStream] = useState<StreamDetail | null>(null);
@@ -128,6 +132,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
   const { events: streamEvents } = useStreamEvents({
     streamIds: [streamId],
     autoReconnect: true,
+    networkId,
   });
 
   const streamReqId = useRef(0);
@@ -225,6 +230,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
     if (!stream) return "??";
     return TOKEN_SYMBOLS[stream.tokenAddress] || stream.tokenAddress.slice(0, 4);
   }, [stream]);
+  const tokenDecimals = getTokenDecimals(tokenSymbol, tokenMetadata);
 
   const { data: tokenPrice } = useTokenPrice({ tokenSymbol, enabled: Boolean(stream) });
 
@@ -276,14 +282,14 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
     }
     // Same validation as TopUpModal: rejects over-precise input instead of
     // letting toBaseUnits silently round it.
-    const amountError = validateAmountInput(topUpAmount, 7);
+    const amountError = validateAmountInput(topUpAmount, tokenDecimals);
     if (amountError) {
       toast.error(amountError);
       return;
     }
     tracker.start();
     try {
-      const amount = toBaseUnits(topUpAmount);
+      const amount = toBaseUnits(topUpAmount, tokenDecimals);
       const result = await topUpStream(session, { streamId: BigInt(streamId), amount });
       tracker.submit(result.txHash);
       tracker.confirm();

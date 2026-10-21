@@ -14,6 +14,7 @@ import { httpRequestDuration, httpRequestsTotal } from '../lib/metrics.js';
  */
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 const LONG_HEX_RE = /\b[0-9a-f]{56,}\b/i;
+const STELLAR_PUBLIC_KEY_RE = /^G[A-Z2-7]{55}$/;
 const NUMERIC_RE = /^\d+$/;
 
 export function normalizeRoute(req: Request): string {
@@ -44,6 +45,7 @@ export function normalizeRoute(req: Request): string {
       if (NUMERIC_RE.test(segment)) return ':id';
       if (UUID_RE.test(segment)) return ':uuid';
       if (LONG_HEX_RE.test(segment)) return ':hash';
+      if (STELLAR_PUBLIC_KEY_RE.test(segment)) return ':wallet';
       return segment;
     });
 

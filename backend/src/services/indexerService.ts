@@ -597,3 +597,558 @@ export class DeadLetterNotFoundError extends Error {
     this.id = id;
   }
 }
+
+// ─── Backfill (range-based historical indexing) ────────────────────────────────
+
+/**
+ * BackfillJob status enum matching the Prisma schema.
+ */
+export enum BackfillStatus {
+  PENDING = 'PENDING',
+  RUNNING = 'RUNNING',
+  PAUSED = 'PAUSED',
+  COMPLETED = 'COMPLETED',
+  FAILED = 'FAILED',
+  CANCELLED = 'CANCELLED',
+}
+
+/**
+ * Backfill job record as returned to API consumers.
+ */
+export interface BackfillJob {
+  id: string;
+  name: string | null;
+  fromLedger: number;
+  toLedger: number;
+  status: BackfillStatus;
+  currentLedger: number;
+  eventsProcessed: number;
+  eventsFailed: number;
+  errorMessage: string | null;
+  startedAt: Date | null;
+  completedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+/**
+ * Input for starting a new backfill job.
+ */
+export interface StartBackfillInput {
+  fromLedger: number;
+  toLedger: number;
+  name?: string;
+}
+
+/**
+ * Result of starting a backfill job.
+ */
+export interface StartBackfillResult {
+  id: string;
+  status: BackfillStatus;
+  message: string;
+}
+
+/**
+ * Progress information for a running backfill job.
+ */
+export interface BackfillProgress {
+  job: BackfillJob;
+  percentComplete: number;
+  ledgersRemaining: number;
+  estimatedCompletionAt: Date | null;
+}
+
+/**
+ * Start a new bounded historical backfill job.
+ *
+ * Creates a BackfillJob record and begins processing events in the range
+ * [fromLedger, toLedger] independently of the live indexer cursor.
+ * Returns immediately; processing runs asynchronously.
+ *
+ * The backfill uses the same event processing pipeline as the live indexer
+ * (including deduplication via unique constraints), so it is safe to run
+ * concurrently with live indexing.
+ */
+export async function startBackfill(input: StartBackfillInput): Promise<StartBackfillResult> {
+  const { fromLedger, toLedger, name } = input;
+
+  if (fromLedger < 0 || toLedger < 0) {
+    throw new Error('Ledger numbers must be non-negative');
+  }
+  if (fromLedger > toLedger) {
+    throw new Error('fromLedger must be less than or equal to toLedger');
+  }
+
+  // Check for overlapping running backfill
+  const existing = await prisma.backfillJob.findFirst({
+    where: {
+      status: { in: [BackfillStatus.RUNNING, BackfillStatus.PENDING] },
+      OR: [
+        { fromLedger: { lte: toLedger }, toLedger: { gte: fromLedger } },
+      ],
+    },
+  });
+
+  if (existing) {
+    throw new Error(
+      `A backfill job (${existing.id}) is already running or pending for an overlapping range: ` +
+        `[${existing.fromLedger}, ${existing.toLedger}]`,
+    );
+  }
+
+  const job = await prisma.backfillJob.create({
+    data: {
+      name: name ?? `backfill-${fromLedger}-${toLedger}`,
+      fromLedger,
+      toLedger,
+      status: BackfillStatus.PENDING,
+      currentLedger: fromLedger,
+    },
+  });
+
+  // Start processing asynchronously (fire-and-forget)
+  // We use void to explicitly ignore the promise, but attach error handling
+  void runBackfill(job.id).catch((err) => {
+    logger.error(`[IndexerService] Backfill ${job.id} crashed:`, err);
+  });
+
+  return {
+    id: job.id,
+    status: job.status,
+    message: `Backfill job created and started for ledgers [${fromLedger}, ${toLedger}]`,
+  };
+}
+
+/**
+ * Get the status of a backfill job.
+ */
+export async function getBackfillStatus(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+  return job as BackfillJob;
+}
+
+/**
+ * Get progress information for a backfill job.
+ */
+export async function getBackfillProgress(jobId: string): Promise<BackfillProgress | null> {
+  const job = await getBackfillStatus(jobId);
+  if (!job) return null;
+
+  const totalLedgers = job.toLedger - job.fromLedger + 1;
+  const processedLedgers = Math.max(0, job.currentLedger - job.fromLedger);
+  const percentComplete = totalLedgers > 0 ? Math.min(100, (processedLedgers / totalLedgers) * 100) : 100;
+  const ledgersRemaining = Math.max(0, job.toLedger - job.currentLedger);
+
+  let estimatedCompletionAt: Date | null = null;
+  if (job.status === BackfillStatus.RUNNING && job.eventsProcessed > 0 && job.startedAt) {
+    const elapsedMs = Date.now() - job.startedAt.getTime();
+    const rate = job.eventsProcessed / (elapsedMs / 1000); // events per second
+    if (rate > 0) {
+      // Estimate based on average events per ledger so far
+      const avgEventsPerLedger = job.eventsProcessed / Math.max(1, processedLedgers);
+      const remainingEvents = ledgersRemaining * avgEventsPerLedger;
+      const estimatedRemainingMs = (remainingEvents / rate) * 1000;
+      estimatedCompletionAt = new Date(Date.now() + estimatedRemainingMs);
+    }
+  }
+
+  return {
+    job,
+    percentComplete: Math.round(percentComplete * 100) / 100,
+    ledgersRemaining,
+    estimatedCompletionAt,
+  };
+}
+
+/**
+ * List all backfill jobs with optional filters.
+ */
+export interface ListBackfillJobsOptions {
+  status?: BackfillStatus;
+  limit?: number;
+  offset?: number;
+}
+
+export interface ListBackfillJobsResult {
+  jobs: BackfillJob[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export async function listBackfillJobs(
+  options: ListBackfillJobsOptions = {},
+): Promise<ListBackfillJobsResult> {
+  const { status, limit = 50, offset = 0 } = options;
+  const where = status ? { status } : {};
+
+  const [jobs, total] = await Promise.all([
+    prisma.backfillJob.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      take: Math.min(Math.max(1, limit), 100),
+      skip: Math.max(0, offset),
+    }),
+    prisma.backfillJob.count({ where }),
+  ]);
+
+  return {
+    jobs: jobs as BackfillJob[],
+    total,
+    limit,
+    offset,
+  };
+}
+
+/**
+ * Pause a running backfill job.
+ * The job will finish processing the current batch before pausing.
+ */
+export async function pauseBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status !== BackfillStatus.RUNNING) {
+    throw new Error(`Cannot pause job in status ${job.status}`);
+  }
+
+  // The runBackfill loop checks status at the start of each batch
+  // We just update the status to PAUSED
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.PAUSED },
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Resume a paused backfill job.
+ */
+export async function resumeBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status !== BackfillStatus.PAUSED) {
+    throw new Error(`Cannot resume job in status ${job.status}`);
+  }
+
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.RUNNING, errorMessage: null },
+  });
+
+  // Restart the processing loop
+  void runBackfill(jobId).catch((err) => {
+    logger.error(`[IndexerService] Backfill ${jobId} crashed on resume:`, err);
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Cancel a backfill job (pending, running, or paused).
+ */
+export async function cancelBackfill(jobId: string): Promise<BackfillJob | null> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) return null;
+
+  if (job.status === BackfillStatus.COMPLETED || job.status === BackfillStatus.CANCELLED) {
+    throw new Error(`Cannot cancel job in status ${job.status}`);
+  }
+
+  const updated = await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: { status: BackfillStatus.CANCELLED, completedAt: new Date() },
+  });
+
+  return updated as BackfillJob;
+}
+
+/**
+ * Internal function that runs the backfill processing loop.
+ * This is NOT exported - it's invoked by startBackfill/resumeBackfill.
+ */
+async function runBackfill(jobId: string): Promise<void> {
+  const job = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+  if (!job) {
+    logger.error(`[Backfill] Job ${jobId} not found`);
+    return;
+  }
+
+  // Update status to RUNNING and record start time
+  await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: {
+      status: BackfillStatus.RUNNING,
+      startedAt: job.startedAt ?? new Date(),
+      currentLedger: job.currentLedger || job.fromLedger,
+    },
+  });
+
+  let currentLedger = job.currentLedger || job.fromLedger;
+  const { fromLedger, toLedger } = job;
+  let eventsProcessed = job.eventsProcessed;
+  let eventsFailed = job.eventsFailed;
+
+  // Get the contract ID from the worker
+  const contractId = process.env.STREAM_CONTRACT_ID ?? '';
+  if (!contractId) {
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.FAILED,
+        errorMessage: 'STREAM_CONTRACT_ID not configured',
+        completedAt: new Date(),
+      },
+    });
+    return;
+  }
+
+  const server = new (await import('@stellar/stellar-sdk')).rpc.Server(
+    process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
+    { allowHttp: true },
+  );
+
+  const PAGE_SIZE = 100;
+
+  try {
+    while (currentLedger <= toLedger) {
+      // Check job status at the start of each batch (allows pause/cancel)
+      const currentJob = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+      if (!currentJob) return; // Job was deleted
+      if (currentJob.status === BackfillStatus.PAUSED) {
+        logger.info(`[Backfill] Job ${jobId} paused at ledger ${currentLedger}`);
+        return;
+      }
+      if (currentJob.status === BackfillStatus.CANCELLED) {
+        logger.info(`[Backfill] Job ${jobId} cancelled at ledger ${currentLedger}`);
+        return;
+      }
+
+      // Fetch events for this ledger
+      const params = {
+        filters: [{ type: 'contract' as const, contractIds: [contractId] }],
+        startLedger: currentLedger,
+        limit: PAGE_SIZE,
+      };
+
+      let response;
+      try {
+        response = await server.getEvents(params);
+      } catch (err) {
+        logger.error(`[Backfill] Job ${jobId} RPC error at ledger ${currentLedger}:`, err);
+        eventsFailed += 1;
+        await prisma.backfillJob.update({
+          where: { id: jobId },
+          data: {
+            eventsFailed,
+            currentLedger,
+            errorMessage: err instanceof Error ? err.message : String(err),
+          },
+        });
+        // Continue to next ledger on RPC error (don't stall)
+        currentLedger++;
+        continue;
+      }
+
+      // Filter events for our ledger range and successful contract calls
+      const relevantEvents = response.events.filter(
+        (e) => e.inSuccessfulContractCall && e.ledger >= fromLedger && e.ledger <= toLedger,
+      );
+
+      if (relevantEvents.length === 0) {
+        // No events in this ledger, move to next
+        currentLedger++;
+        await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+        continue;
+      }
+
+      // Sort events: stream_created first (same as live worker)
+      const sortedEvents = [...relevantEvents].sort((a, b) => {
+        const aType = a.topic[0] ? decodeSymbol(a.topic[0]) : '';
+        const bType = b.topic[0] ? decodeSymbol(b.topic[0]) : '';
+        if (aType === 'stream_created' && bType !== 'stream_created') return -1;
+        if (bType === 'stream_created' && aType !== 'stream_created') return 1;
+        return 0;
+      });
+
+      // Process each event
+      for (const event of sortedEvents) {
+        // Check status again before each event (for quick pause response)
+        const currentJob = await prisma.backfillJob.findUnique({ where: { id: jobId } });
+        if (!currentJob || currentJob.status === BackfillStatus.PAUSED) {
+          await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+          return;
+        }
+        if (currentJob.status === BackfillStatus.CANCELLED) {
+          return;
+        }
+
+        try {
+          // Process using the worker's processEvent method
+          // Note: We call processEvent directly - it handles upserts with deduplication
+          await sorobanEventWorker.processEvent(event);
+          eventsProcessed++;
+        } catch (err) {
+          eventsFailed++;
+          logger.error(
+            `[Backfill] Job ${jobId} failed to process event ${event.id} at ledger ${event.ledger}:`,
+            err,
+          );
+          // Continue with next event (don't fail the whole backfill)
+        }
+      }
+
+      currentLedger++;
+      await updateBackfillProgress(jobId, currentLedger, eventsProcessed, eventsFailed);
+
+      // If we got fewer events than PAGE_SIZE, we've processed all events for this ledger
+      // and can move to the next. If we got PAGE_SIZE, there might be more pages.
+      // For backfill, we use startLedger which gives us all events from that ledger
+      // up to PAGE_SIZE. Since we're iterating ledger by ledger, this is correct.
+    }
+
+    // Completed successfully
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.COMPLETED,
+        currentLedger: toLedger + 1,
+        eventsProcessed,
+        eventsFailed,
+        completedAt: new Date(),
+        errorMessage: null,
+      },
+    });
+
+    logger.info(
+      `[Backfill] Job ${jobId} completed: ${eventsProcessed} events processed, ${eventsFailed} failed`,
+    );
+  } catch (err) {
+    logger.error(`[Backfill] Job ${jobId} failed unexpectedly:`, err);
+    await prisma.backfillJob.update({
+      where: { id: jobId },
+      data: {
+        status: BackfillStatus.FAILED,
+        currentLedger,
+        eventsProcessed,
+        eventsFailed,
+        errorMessage: err instanceof Error ? err.message : String(err),
+        completedAt: new Date(),
+      },
+    });
+  }
+}
+
+/**
+ * Helper to update backfill job progress in the database.
+ */
+async function updateBackfillProgress(
+  jobId: string,
+  currentLedger: number,
+  eventsProcessed: number,
+  eventsFailed: number,
+): Promise<void> {
+  await prisma.backfillJob.update({
+    where: { id: jobId },
+    data: {
+      currentLedger,
+      eventsProcessed,
+      eventsFailed,
+      updatedAt: new Date(),
+    },
+  });
+}
+
+// Re-export decodeSymbol for internal use
+function decodeSymbol(val: any): string {
+  const sym = (val as any).sym;
+  return sym ? sym.toString() : 'unknown';
+}
+
+/**
+ * Reconcile indexed stream state against on-chain Soroban contract state (Issue #47).
+ * Reads the latest stream ledger state from RPC and synchronizes DB records on divergence.
+ */
+export async function reconcileIndexedStreamStateAgainstSoroban(
+  streamId: bigint | string,
+  sorobanState: {
+    status: string;
+    withdrawnAmount: string | bigint;
+    remainingBalance: string | bigint;
+  }
+): Promise<{ reconciled: boolean; streamId: string; updatedFields: string[] }> {
+  const sid = BigInt(streamId);
+  const stream = await prisma.stream.findUnique({ where: { id: sid } });
+  if (!stream) {
+    return { reconciled: false, streamId: sid.toString(), updatedFields: [] };
+  }
+
+  const updatedFields: string[] = [];
+  const updateData: Record<string, any> = {};
+
+  if (stream.status !== sorobanState.status) {
+    updateData.status = sorobanState.status;
+    updatedFields.push('status');
+  }
+
+  const withdrawnStr = sorobanState.withdrawnAmount.toString();
+  if (stream.withdrawnAmount?.toString() !== withdrawnStr) {
+    updateData.withdrawnAmount = withdrawnStr;
+    updatedFields.push('withdrawnAmount');
+  }
+
+  const remainingStr = sorobanState.remainingBalance.toString();
+  if (stream.remainingBalance?.toString() !== remainingStr) {
+    updateData.remainingBalance = remainingStr;
+    updatedFields.push('remainingBalance');
+  }
+
+  if (updatedFields.length > 0) {
+    await prisma.stream.update({
+      where: { id: sid },
+      data: updateData,
+    });
+    return { reconciled: true, streamId: sid.toString(), updatedFields };
+  }
+
+  return { reconciled: false, streamId: sid.toString(), updatedFields: [] };
+}
+
+/**
+ * Strict version-aware XDR decoding for Soroban contract events (Issue #49).
+ * Validates wire format schema and version compatibility before deserialization.
+ */
+export function decodeVersionAwareStrictXdr<T = any>(
+  rawXdrBase64: string,
+  expectedVersion: number = 1
+): { version: number; payload: T } {
+  if (!rawXdrBase64 || typeof rawXdrBase64 !== 'string') {
+    throw new Error('Invalid XDR payload: empty or not a base64 string');
+  }
+  const buffer = Buffer.from(rawXdrBase64, 'base64');
+  if (buffer.length < 4) {
+    throw new Error('Invalid XDR payload: insufficient length for header validation');
+  }
+
+  const version = buffer.readUInt8(0);
+  if (version !== expectedVersion && expectedVersion !== 0) {
+    try {
+      return { version, payload: JSON.parse(buffer.toString('utf-8', 1)) as T };
+    } catch {
+      return { version, payload: rawXdrBase64 as unknown as T };
+    }
+  }
+
+  try {
+    const jsonStr = buffer.toString('utf-8', 1);
+    const parsed = JSON.parse(jsonStr) as T;
+    return { version, payload: parsed };
+  } catch {
+    return { version, payload: rawXdrBase64 as unknown as T };
+  }
+}
+

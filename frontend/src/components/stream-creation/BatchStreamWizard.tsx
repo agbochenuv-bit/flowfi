@@ -21,6 +21,7 @@ import {
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
 import { useRouter } from "next/navigation";
+import { getTokenDecimals, useTokenMetadata } from "@/hooks/useTokenMetadata";
 import {
   Upload,
   Download,
@@ -45,6 +46,8 @@ export function BatchStreamWizard({
 }: BatchStreamWizardProps) {
   const { session } = useWallet();
   const router = useRouter();
+  const { data: tokenMetadata = [] } = useTokenMetadata();
+  const tokenDecimals = getTokenDecimals(token, tokenMetadata);
   const [currentStep, setCurrentStep] = useState(1);
   const [csvData, setCsvData] = useState<string>("");
   const [validation, setValidation] = useState<BatchValidationSummary | null>(null);
@@ -64,6 +67,10 @@ export function BatchStreamWizard({
   }>({ recipient: "", amount: "", durationSeconds: "", cliffSeconds: "" });
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  React.useEffect(() => {
+    if (csvData) setValidation(parseBatchCSV(csvData, tokenDecimals));
+  }, [csvData, tokenDecimals]);
+
   const handleFileDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setIsDragging(false);
@@ -74,14 +81,14 @@ export function BatchStreamWizard({
       reader.onload = (event) => {
         const content = event.target?.result as string;
         setCsvData(content);
-        const result = parseBatchCSV(content);
+        const result = parseBatchCSV(content, tokenDecimals);
         setValidation(result);
       };
       reader.readAsText(file);
     } else {
       toast.error("Please upload a CSV file");
     }
-  }, []);
+  }, [tokenDecimals]);
 
   const handleFileSelect = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -90,12 +97,12 @@ export function BatchStreamWizard({
       reader.onload = (event) => {
         const content = event.target?.result as string;
         setCsvData(content);
-        const result = parseBatchCSV(content);
+        const result = parseBatchCSV(content, tokenDecimals);
         setValidation(result);
       };
       reader.readAsText(file);
     }
-  }, []);
+  }, [tokenDecimals]);
 
   const handleDownloadSample = useCallback(() => {
     const csv = generateSampleCSV();
@@ -134,13 +141,13 @@ export function BatchStreamWizard({
       const newCsv = [header, ...dataLines].join("\n");
       setCsvData(newCsv);
 
-      const result = parseBatchCSV(newCsv);
+      const result = parseBatchCSV(newCsv, tokenDecimals);
       setValidation(result);
       toast.success("Entry updated");
     }
 
     setEditingEntryId(null);
-  }, [editingEntryId, csvData, editValues, validation]);
+  }, [editingEntryId, csvData, editValues, validation, tokenDecimals]);
 
   const handleCancelEdit = useCallback(() => {
     setEditingEntryId(null);
@@ -160,7 +167,7 @@ export function BatchStreamWizard({
     try {
       for (const entry of validEntries) {
         try {
-          const amountBigInt = toBaseUnits(entry.amount);
+          const amountBigInt = toBaseUnits(entry.amount, tokenDecimals);
           const durationBigInt = BigInt(parseInt(entry.durationSeconds, 10));
 
           const result = await createStream(session, {
@@ -190,7 +197,7 @@ export function BatchStreamWizard({
     } finally {
       setIsExecuting(false);
     }
-  }, [session, validation, token, router]);
+  }, [session, validation, token, tokenDecimals, router]);
 
   const handleNext = () => {
     if (currentStep === 1 && validation && validation.validRows > 0) {

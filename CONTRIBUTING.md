@@ -289,6 +289,7 @@ This repository uses GitHub Actions for continuous integration. Workflows are lo
   - Performs:
     - Frontend: lint and build
     - Backend: prisma generation, build, and tests
+    - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
     - Soroban Contracts: build (wasm) and tests
   - View workflow: [CI](.github/workflows/ci.yml)
 
@@ -325,6 +326,82 @@ cargo test                                            # Runs contract tests
 npm run verify-security
 ```
 
+#### 5. Migration Replay Validation
+```bash
+cd backend
+npm run test:migrations   # replays migrations from the previous supported schema
+```
+*Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
+The same check runs in CI as the `migration-replay` job.*
+
+---
+
+## Database Migrations & Rollout
+
+Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
+processes are rolled out independently, so for a window of time the *previous* and
+*new* application versions run against the *same* database. Every migration must
+therefore be backward-compatible with the previously deployed application version.
+
+### Ground Rules
+
+1. **Never edit an existing migration file.** Migration files are immutable once
+   merged. Any schema change — including a fix to a previous migration — must be
+   expressed in a **new** migration file. Editing history breaks `prisma migrate`
+   checksums and can silently skip changes on environments that already applied them.
+2. **No destructive changes in a single step.** Dropping a column/table, renaming,
+   adding a `NOT NULL` constraint without a default, or narrowing a type must be
+   split across releases (see expand/backfill/contract below).
+3. **Pin the previous supported schema.** The migration replay test
+   (`backend/tests/migrations/`) snapshots the schema of the previous supported
+   release and replays all migrations on top of it, asserting no data loss and no
+   errors. Update the pinned snapshot only when a release is promoted to
+   "previous supported".
+4. **Document externally observable behavior.** Each migration PR must state what
+   changes for API consumers, workers, and operators (new/removed fields, changed
+   nullability, index/lock impact, expected downtime, backfill duration).
+
+### Expand / Backfill / Contract Pattern
+
+Changes that overlap active API and worker versions are shipped in three phases,
+each in its own release:
+
+| Phase | What you do | Compatibility |
+| --- | --- | --- |
+| **Expand** | Add new nullable columns, new tables, new indexes (`CREATE INDEX CONCURRENTLY` where supported). Keep old columns intact. | Old and new app versions both work. |
+| **Backfill** | Populate new columns/tables from existing data (batched, idempotent job). Dual-write from the application if reads must stay consistent. | Old version ignores new data; new version tolerates missing data. |
+| **Contract** | Once all running versions use the new shape, drop old columns/tables, add `NOT NULL`/`UNIQUE` constraints, and remove dual-writes. | Only the new version is deployed. |
+
+### Rollout Checklist
+
+Copy this into the migration PR description and tick each item:
+
+- [ ] Change is in a **new** migration file; no existing migration was modified.
+- [ ] Change is classified as **expand**, **backfill**, or **contract** (or is a
+      non-breaking additive change that needs no phasing).
+- [ ] Previous application version still works against the migrated schema
+      (expand/backfill phases only).
+- [ ] Previous supported schema snapshot is pinned/updated in the migration replay
+      test and `npm run test:migrations` passes locally.
+- [ ] CI `migration-replay` job is green.
+- [ ] Backfill (if any) is batched, idempotent, resumable, and safe to re-run.
+- [ ] Locking/index impact assessed; long-running DDL uses concurrent variants or a
+      maintenance window.
+- [ ] Rollback plan documented (forward-fix migration preferred; no data loss).
+- [ ] Externally observable behavior documented: API/worker contract changes,
+      operational impact (downtime, backfill duration, index build time).
+- [ ] Regression and boundary tests added at the owning component's test layer
+      (e.g. `backend/tests/` for API/DB behavior).
+
+### Operational Impact Notes
+
+- **Expand** migrations are additive and should be deployable with zero downtime;
+  note any index build time on large tables.
+- **Backfill** jobs run alongside live traffic; document expected duration, batch
+  size, and how to pause/resume.
+- **Contract** migrations are the only ones allowed to remove or tighten schema;
+  they must ship only after the expand+backfill release is fully rolled out to all
+  API and worker instances.
 
 ---
 
@@ -445,6 +522,8 @@ Your PR must:
 - Follow commit conventions
 - Be properly described
 - Stay focused (avoid large unrelated changes)
+- For database changes: follow the [Database Migrations & Rollout](#database-migrations--rollout)
+  checklist and include the completed checklist in the PR description
 
 ---
 

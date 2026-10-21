@@ -17,14 +17,15 @@ This is the Node.js / Express backend for FlowFi. It provides the REST API for t
 Create a `.env` file with the following variables:
 
 ```env
-DATABASE_URL=postgresql://user:password@localhost:5433/flowfi?schema=public
+DATABASE_URL=postgresql://flowfi:flowfi_dev_password@localhost:5433/flowfi?schema=public
 PORT=3001
-STELLAR_RPC_URL=https://soroban-testnet.stellar.org
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org
 NETWORK_PASSPHRASE="Test SDF Network ; September 2015"
 API_BASE_URL=https://api.staging.flowfi.io
 ```
 
 - `API_BASE_URL`: Overrides the Swagger UI server URL for the deployed environment (e.g., staging or production). When set, Swagger UI targets `<API_BASE_URL>/v1` instead of the hardcoded defaults.
+- `DATABASE_URL` is required before the backend starts. Production additionally requires `JWT_SECRET`, `KEEPER_SECRET_KEY`, `ADMIN_PUBLIC_KEY`, `SOROBAN_RPC_URL`, `STELLAR_NETWORK`, `STREAM_CONTRACT_ID`, `CORS_ALLOWED_ORIGINS`, and an HTTPS `API_BASE_URL`. Production startup rejects placeholders, weak signing keys, invalid Stellar keys, network mismatches, wildcard/insecure origins, and enabled sandbox mode. `SOROBAN_RPC_URLS` may add pool failover endpoints but does not replace the primary URL.
 
 ## Prisma Database
 
@@ -84,6 +85,21 @@ All REST API endpoints are prefixed with `/v1`. Refer to the API Documentation i
 ## Server-Sent Events (SSE)
 
 The backend exposes an SSE endpoint (`/v1/streams/events`) to stream real-time updates to the frontend whenever on-chain stream events are indexed.
+
+## Indexer Startup Preflight
+
+Before the Soroban event worker begins polling, the indexer runs a preflight that validates the configured deployment identity. If any check fails, the worker does not start and no cursor or stream state is read or written — the process fails fast with an actionable diagnostic instead of indexing the wrong deployment.
+
+The preflight verifies, in order:
+
+1. **Network** — `STELLAR_NETWORK` / `NETWORK_PASSPHRASE` is present, well-formed, and matches the network the RPC endpoint reports. A missing, malformed, or mismatched network aborts startup.
+2. **Contract ID** — `STREAM_CONTRACT_ID` is present, is a valid Stellar contract address (`C...`), and corresponds to the expected deployment for the configured network. A missing, malformed, or mismatched contract ID aborts startup.
+3. **RPC availability** — the configured `SOROBAN_RPC_URL` (and any `SOROBAN_RPC_URLS` failover endpoints) is reachable and responds to a health probe. An unreachable RPC aborts startup with the failing endpoint in the message.
+4. **Contract interface compatibility** — the deployed contract exposes the methods and events the indexer expects. A missing or incompatible interface aborts startup.
+
+Each failure is reported with the specific check that failed and the offending value, so operators can correct configuration without inspecting logs. Because preflight runs before the worker touches the database, a failed preflight leaves the indexer cursor and stream state untouched; fixing the configuration and restarting resumes from the previous cursor.
+
+Operational impact: a misconfigured deployment now fails at startup rather than silently indexing the wrong network or contract. No migration is required — existing valid configurations pass preflight unchanged, and the public indexer interfaces are preserved.
 
 ## Logging & Correlation IDs
 

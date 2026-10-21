@@ -15,6 +15,7 @@ import { logger } from "@/lib/logger";
 import {
   withdrawFromStream,
   type SorobanResult,
+  type TransactionStageCallback,
 } from "@/lib/soroban";
 import type { WalletSession } from "@/lib/wallet";
 
@@ -28,6 +29,7 @@ const DEFAULT_INCOMING_STREAMS_REFETCH_INTERVAL: number | false = false;
 
 export interface UseIncomingStreamsOptions {
   refetchInterval?: number | false;
+  authToken?: string | null;
 }
 
 export function useIncomingStreams(
@@ -36,7 +38,7 @@ export function useIncomingStreams(
 ) {
   return useQuery({
     queryKey: incomingStreamsQueryKey(publicKey),
-    queryFn: () => fetchIncomingStreams(publicKey!),
+    queryFn: () => fetchIncomingStreams(publicKey!, undefined, options?.authToken),
     enabled: Boolean(publicKey),
     refetchInterval:
       options?.refetchInterval ?? DEFAULT_INCOMING_STREAMS_REFETCH_INTERVAL,
@@ -46,12 +48,14 @@ export function useIncomingStreams(
 export function useWithdrawIncomingStream(
   session: WalletSession | null,
   publicKey: string | null | undefined,
+  authToken?: string | null,
   options?: {
     onSuccess?: (
       result: SorobanResult,
       stream: IncomingStreamRecord,
     ) => Promise<void> | void;
     onError?: (error: unknown, stream: IncomingStreamRecord) => void;
+    onStage?: TransactionStageCallback;
   },
 ) {
   const queryClient = useQueryClient();
@@ -88,9 +92,10 @@ export function useWithdrawIncomingStream(
         expectedWithdrawn,
         queryClient,
         controller.signal,
+        authToken,
       );
     },
-    [queryClient],
+    [queryClient, authToken],
   );
 
   return useMutation({
@@ -101,7 +106,7 @@ export function useWithdrawIncomingStream(
 
       return withdrawFromStream(session, {
         streamId: BigInt(stream.streamId),
-      });
+      }, options?.onStage);
     },
     onMutate: async (stream) => {
       if (!publicKey) {
@@ -113,42 +118,28 @@ export function useWithdrawIncomingStream(
         queryKey: incomingStreamsQueryKey(publicKey),
       });
 
-      // Snapshot the previous value
-      const previousStreams = queryClient.getQueryData<IncomingStreamRecord[]>(
+      const cachedStreams = queryClient.getQueryData<IncomingStreamRecord[]>(
         incomingStreamsQueryKey(publicKey),
       );
 
       let expectedWithdrawn = stream.withdrawn;
 
-      // Optimistically update the stream in the cache
-      if (previousStreams) {
+      if (cachedStreams) {
         const nowSeconds = Date.now() / 1000;
-        queryClient.setQueryData<IncomingStreamRecord[]>(
-          incomingStreamsQueryKey(publicKey),
-          previousStreams.map((s) => {
-            if (s.id === stream.id) {
-              const elapsed = Math.max(0, nowSeconds - s.lastUpdateTime);
-              const currentPauseDuration =
-                s.isPaused && s.pausedAt ? Math.max(0, nowSeconds - s.pausedAt) : 0;
-              const effectiveElapsed = Math.max(0, elapsed - currentPauseDuration);
-              const accrued = effectiveElapsed * s.ratePerSecond;
-              const maxClaimable = Math.max(0, s.deposited - s.withdrawn);
-              const claimable = Math.min(maxClaimable, accrued);
-
-              expectedWithdrawn = s.withdrawn + claimable;
-
-              return {
-                ...s,
-                withdrawn: expectedWithdrawn,
-                lastUpdateTime: nowSeconds,
-              };
-            }
-            return s;
-          }),
+        const cachedStream = cachedStreams.find((candidate) => candidate.id === stream.id) ?? stream;
+        const elapsed = Math.max(0, nowSeconds - cachedStream.lastUpdateTime);
+        const paused = cachedStream.isPaused && cachedStream.pausedAt
+          ? Math.max(0, nowSeconds - cachedStream.pausedAt)
+          : 0;
+        const accrued = Math.max(0, elapsed - paused) * cachedStream.ratePerSecond;
+        const claimable = Math.min(
+          Math.max(0, cachedStream.deposited - cachedStream.withdrawn),
+          accrued,
         );
+        expectedWithdrawn = cachedStream.withdrawn + claimable;
       }
 
-      return { previousStreams, expectedWithdrawn };
+      return { expectedWithdrawn };
     },
     onSuccess: async (result, stream, context) => {
       if (publicKey) {
@@ -169,16 +160,8 @@ export function useWithdrawIncomingStream(
       await options?.onSuccess?.(result, stream);
     },
     onError: (error, stream, context) => {
-      const ctx = context as {
-        previousStreams?: IncomingStreamRecord[];
-        expectedWithdrawn?: number;
-      };
-      if (publicKey && ctx?.previousStreams) {
-        queryClient.setQueryData(
-          incomingStreamsQueryKey(publicKey),
-          ctx.previousStreams,
-        );
-      }
+      void error;
+      void context;
       options?.onError?.(error, stream);
     },
   });
@@ -191,6 +174,7 @@ async function pollIndexerForWithdraw(
   expectedWithdrawn: number,
   queryClient: ReturnType<typeof useQueryClient>,
   signal?: AbortSignal,
+  authToken?: string | null,
   maxRetries = 6,
   initialDelay = 1000,
 ) {
@@ -206,7 +190,7 @@ async function pollIndexerForWithdraw(
     if (signal?.aborted) return;
 
     try {
-      const streams = await fetchIncomingStreams(publicKey);
+      const streams = await fetchIncomingStreams(publicKey, undefined, authToken);
       if (signal?.aborted) return;
 
       const updatedStream = streams.find((s) => s.streamId === streamId);

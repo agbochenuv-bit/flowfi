@@ -1,16 +1,27 @@
-// OpenTelemetry must be initialised before any instrumented module is loaded —
-// the auto-instrumentations patch http/express/pg at require time.
-import "./lib/otel.js";
-
 import dotenv from "dotenv";
-import app from "./app.js";
-import logger from "./logger.js";
-import { startWorkers, stopWorkers } from "./workers/index.js";
-import { sseService } from "./services/sse.service.js";
-import { connectRedis, disconnectRedis } from "./lib/redis.js";
-import { rpcPool } from "./lib/rpc-pool.js";
+import { validateEnvironment } from "./config/environment.js";
 
 dotenv.config();
+validateEnvironment(process.env);
+
+// OpenTelemetry must be initialised before any instrumented module is loaded.
+await import("./lib/otel.js");
+
+const [
+  { default: app },
+  { default: logger },
+  { startWorkers, stopWorkers },
+  { sseService },
+  { connectRedis, disconnectRedis },
+  { rpcPool },
+] = await Promise.all([
+  import("./app.js"),
+  import("./logger.js"),
+  import("./workers/index.js"),
+  import("./services/sse.service.js"),
+  import("./lib/redis.js"),
+  import("./lib/rpc-pool.js"),
+]);
 
 const SHUTDOWN_TIMEOUT_MS = 30_000;
 
@@ -20,6 +31,9 @@ const startServer = async () => {
     await prisma.$connect();
     await prisma.$queryRaw`SELECT 1`;
     logger.info("Database connection established successfully");
+
+    const { encryptExistingWebhookSecrets } = await import("./services/webhook.service.js");
+    await encryptExistingWebhookSecrets();
 
     // Connect Redis (graceful fallback to single-instance mode when absent)
     await connectRedis();

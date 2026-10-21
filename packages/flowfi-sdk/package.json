@@ -19,6 +19,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "vitest run",
+    "test:smoke:testnet": "vitest run --config vitest.smoke.config.ts",
     "codegen": "../../scripts/generate-sdk.sh"
   },
   "dependencies": {

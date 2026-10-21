@@ -2,14 +2,31 @@ node_modules
 dist
 target
 .env
+.env.local
+.env.*.local
 .DS_Store
 coverage
 e2e-results
 *.log
 
-# Soroban test runner — auto-generated, never commit
+# Soroban / Rust — auto-generated, never commit
 **/test_snapshots/
+**/proptest-regressions/
 .npm-cache/
+**/*.wasm
+**/*.optimized.wasm
+deployment-info.json
+
+# Editor and OS artefacts
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+Thumbs.db
+
+# Proptest auto-generated regression corpus — regenerated on each run, never commit
+**/proptest-regressions/
 
 # Scratch / draft markdown files — never commit
 fix.md
@@ -18,19 +35,22 @@ pr*.md
 ISSUE_*.md
 PR_*.md
 
-# Soroban contract test artifacts
-contracts/stream_contract/test_snapshots/
-contracts/stream_contract/proptest-regressions/
-# Rust build artifacts
-contracts/target/
-# Deployment info
-deployment-info.json
-# Local env files
+# Property-based test regression cases — auto-generated
+**/proptest-regressions/
+
+# Local environment overrides — never commit
 .env.local
 .env.*.local
-# Editor directories
-.idea/
-*.swp
-*.swo
-# OS files
-Thumbs.db
+
+# Test snapshot files
+*.snap
+**/__snapshots__/
+
+# Merge artifacts
+*.orig
+
+# Local Cargo registry cache
+.cargo/
+
+# Rust build artifacts (all workspace members)
+**/target/

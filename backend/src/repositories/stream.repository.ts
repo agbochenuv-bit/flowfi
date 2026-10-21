@@ -31,6 +31,7 @@ export interface FindStreamsParams {
   tokenAddress?: string;
   limit: number;
   offset: number;
+  cursor?: string;
   sortField?: string;
   sortOrder?: 'asc' | 'desc';
 }
@@ -39,6 +40,7 @@ export interface FindStreamsResult {
   streams: unknown[];
   total: number;
   hasMore: boolean;
+  nextCursor: string | null;
 }
 
 export const findStreams = async (params: FindStreamsParams): Promise<FindStreamsResult> => {
@@ -74,9 +76,11 @@ export const findStreams = async (params: FindStreamsParams): Promise<FindStream
   const [streams, total] = await Promise.all([
     prisma.stream.findMany({
       where,
-      orderBy: { [sortField]: sortOrder },
-      take: params.limit,
-      skip: params.offset,
+      orderBy: [{ [sortField]: sortOrder }, { streamId: sortOrder }],
+      take: params.cursor ? params.limit + 1 : params.limit,
+      ...(params.cursor
+        ? { cursor: { streamId: BigInt(params.cursor) }, skip: 1 }
+        : { skip: params.offset }),
       include: {
         senderUser: true,
         recipientUser: true,
@@ -85,5 +89,18 @@ export const findStreams = async (params: FindStreamsParams): Promise<FindStream
     prisma.stream.count({ where }),
   ]);
 
-  return { streams, total, hasMore: params.offset + streams.length < total };
+  const hasMore = params.cursor
+    ? streams.length > params.limit
+    : params.offset + streams.length < total;
+  const page = streams.slice(0, params.limit);
+  const lastStream = page.at(-1) as { streamId?: bigint } | undefined;
+
+  return {
+    streams: page,
+    total,
+    hasMore,
+    nextCursor: hasMore && typeof lastStream?.streamId === 'bigint'
+      ? lastStream.streamId.toString()
+      : null,
+  };
 };

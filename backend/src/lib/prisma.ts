@@ -18,7 +18,9 @@ export const prisma =
   globalForPrisma.prisma ||
   new PrismaClient({
     adapter,
-    log: process.env.NODE_ENV === 'development' ? ['query', 'error', 'warn'] : ['error'],
+    // Query logging can expose bearer tokens, signatures, and webhook secrets
+    // through bound parameters. Keep errors/warnings, never SQL query events.
+    log: ['error', 'warn'],
   });
 
 if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;

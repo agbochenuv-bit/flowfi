@@ -10,6 +10,27 @@ import { Counter, Gauge, Histogram, Registry, collectDefaultMetrics } from 'prom
  *
  * Metric names are prefixed with `flowfi_` so a shared Prometheus instance can
  * scrape several services without collisions.
+ *
+ * Indexer observability metrics (all labels are bounded — never transaction
+ * hashes, wallet addresses, or other unbounded identifiers):
+ *
+ * - `flowfi_indexer_current_ledger` (gauge, ledgers) — last ledger fully indexed.
+ * - `flowfi_indexer_network_ledger` (gauge, ledgers) — network tip as last seen.
+ * - `flowfi_indexer_lag_ledgers` (gauge, ledgers) — network tip minus current.
+ * - `flowfi_indexer_events_per_ledger` (histogram, events/ledger) — events
+ *   dispatched per processed ledger.
+ * - `flowfi_indexer_decode_duration_seconds` (histogram, seconds) — time spent
+ *   decoding a ledger's events; labels: `result` (success|error).
+ * - `flowfi_indexer_persist_duration_seconds` (histogram, seconds) — time spent
+ *   persisting a ledger's events; labels: `result` (success|error).
+ * - `flowfi_indexer_retries_total` (counter, retries) — retry attempts issued
+ *   by the worker; labels: `operation`, `outcome`.
+ * - `flowfi_indexer_last_success_timestamp_seconds` (gauge, unix seconds) —
+ *   wall-clock time of the last successful ledger commit.
+ *
+ * With multiple worker instances, aggregate with `max()` for lag/current-ledger
+ * gauges and `sum()`/`rate()` for counters; histograms aggregate across
+ * instances via `_sum`/`_count`.
  */
 
 /** Default histogram buckets — tuned for both sub-millisecond DB hits and slow RPC calls. */
@@ -63,6 +84,56 @@ export const indexerEventsProcessedTotal = new Counter({
 });
 
 /**
+ * Distribution of the number of events carried by each persistence batch.
+ * Bounded by the worker's configured batch size, so cardinality stays low.
+ * A sustained value at the top bucket means the batch cap is the throughput
+ * limiter; a value of 1 means batching is effectively disabled.
+ */
+export const indexerEventBatchSize = new Histogram({
+  name: 'flowfi_indexer_event_batch_size',
+  help: 'Number of events persisted per indexer batch',
+  buckets: [1, 2, 5, 10, 25, 50, 100, 250, 500],
+  registers: [registry],
+});
+
+/**
+ * Wall-clock duration of a single batched persistence transaction, including
+ * any retries. Compare against `flowfi_db_query_duration_seconds` to see how
+ * much of the batch cost is transaction overhead versus statement time.
+ */
+export const indexerEventBatchDuration = new Histogram({
+  name: 'flowfi_indexer_event_batch_duration_seconds',
+  help: 'Duration of a batched indexer event persistence transaction',
+  labelNames: ['outcome'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/**
+ * Batched persistence attempts by outcome. `retry` counts attempts that failed
+ * transiently and were re-issued; `duplicate` counts events skipped because an
+ * idempotent write found them already present. The invariant to alert on is
+ * `retry` growing without `success` growing alongside it.
+ */
+export const indexerEventBatchAttemptsTotal = new Counter({
+  name: 'flowfi_indexer_event_batch_attempts_total',
+  help: 'Batched indexer event persistence attempts by outcome',
+  labelNames: ['outcome'] as const,
+  registers: [registry],
+});
+
+/**
+ * Events skipped by the idempotency guard because they were already persisted.
+ * Non-zero is normal after a crash/restart replay; a sustained rate indicates
+ * the cursor is not advancing as far as the events it has written.
+ */
+export const indexerEventBatchDuplicatesTotal = new Counter({
+  name: 'flowfi_indexer_event_batch_duplicates_total',
+  help: 'Indexer events skipped as already persisted (idempotent replay)',
+  registers: [registry],
+});
+
+/**
  * Ledger reorg / fork recoveries. Incremented once per recovery so a sustained
  * non-zero rate (or a single spike) can page an operator: on Stellar a reorg
  * means either an RPC node served us a stale fork or the indexer is desynced,
@@ -79,6 +150,47 @@ export const indexerReorgEventsTotal = new Counter({
 export const indexerRevertedLedgers = new Gauge({
   name: 'flowfi_indexer_reverted_ledgers',
   help: 'Ledger count reverted by the most recent indexer rollback',
+  registers: [registry],
+});
+
+/** Events dispatched per processed ledger. */
+export const indexerEventsPerLedger = new Histogram({
+  name: 'flowfi_indexer_events_per_ledger',
+  help: 'Contract events dispatched per processed ledger',
+  buckets: [0, 1, 2, 5, 10, 25, 50, 100, 250, 500, 1000],
+  registers: [registry],
+});
+
+/** Time spent decoding a ledger's events, by result. */
+export const indexerDecodeDuration = new Histogram({
+  name: 'flowfi_indexer_decode_duration_seconds',
+  help: 'Time spent decoding a ledger\'s events by result',
+  labelNames: ['result'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/** Time spent persisting a ledger's events, by result. */
+export const indexerPersistDuration = new Histogram({
+  name: 'flowfi_indexer_persist_duration_seconds',
+  help: 'Time spent persisting a ledger\'s events by result',
+  labelNames: ['result'] as const,
+  buckets: DEFAULT_BUCKETS,
+  registers: [registry],
+});
+
+/** Retry attempts issued by the indexer worker, by operation and outcome. */
+export const indexerRetriesTotal = new Counter({
+  name: 'flowfi_indexer_retries_total',
+  help: 'Indexer retry attempts by operation and outcome',
+  labelNames: ['operation', 'outcome'] as const,
+  registers: [registry],
+});
+
+/** Unix timestamp (seconds) of the last successful ledger commit. */
+export const indexerLastSuccessTimestamp = new Gauge({
+  name: 'flowfi_indexer_last_success_timestamp_seconds',
+  help: 'Unix timestamp of the last successful indexer ledger commit',
   registers: [registry],
 });
 
@@ -112,6 +224,50 @@ export const sseClientsDroppedTotal = new Counter({
 export const sseMaxConnections = new Gauge({
   name: 'flowfi_sse_max_connections',
   help: 'Configured maximum number of concurrent SSE connections',
+  registers: [registry],
+});
+
+/**
+ * Issue 3: Total messages currently enqueued across all slow SSE consumers.
+ * A non-zero value means at least one client is behind on draining its TCP
+ * buffer. Alert when this exceeds a threshold relative to active connections.
+ */
+export const sseSlowConsumerQueueDepth = new Gauge({
+  name: 'flowfi_sse_slow_consumer_queue_depth',
+  help: 'Total messages pending in per-client backpressure queues across all SSE connections',
+  registers: [registry],
+});
+
+/**
+ * Issue 1: Current number of entries in the in-process SSE replay ring buffer.
+ * Allows operators to tune SSE_REPLAY_WINDOW_SIZE.
+ */
+export const sseReplayBufferSize = new Gauge({
+  name: 'flowfi_sse_replay_buffer_size',
+  help: 'Number of events currently held in the SSE in-process replay ring buffer',
+  registers: [registry],
+});
+
+/**
+ * Issue 4: Redis pub/sub reconnect attempts, labelled by outcome.
+ * A sustained failure rate means the SSE service is in single-instance
+ * degraded mode: events are still delivered locally but not cross-instance.
+ */
+export const sseRedisReconnectsTotal = new Counter({
+  name: 'flowfi_sse_redis_reconnects_total',
+  help: 'SSE Redis pub/sub reconnect attempts by outcome (success|failure)',
+  labelNames: ['outcome'] as const,
+  registers: [registry],
+});
+
+/**
+ * Issue 4: Events dropped by the SSE deduplication window.
+ * Non-zero on a reconnect-heavy broker is normal; a sustained rate without
+ * corresponding reconnects suggests duplicate publishing by the indexer.
+ */
+export const sseEventDeduplicatesTotal = new Counter({
+  name: 'flowfi_sse_event_deduplicates_total',
+  help: 'SSE events dropped as duplicate by the per-process deduplication window',
   registers: [registry],
 });
 
@@ -250,6 +406,26 @@ export const dbPoolWaitingRequests = new Gauge({
   },
 });
 
+export const dbPoolSaturationRatio = new Gauge({
+  name: 'flowfi_db_pool_saturation_ratio',
+  help: 'Ratio of actively leased database connections to maximum pool capacity (0.0 to 1.0)',
+  registers: [registry],
+  collect() {
+    const stats = sampleDbPool();
+    const max = dbPoolMaxConnections.get()?.values?.[0]?.value ?? 10;
+    const active = Math.max(0, stats.total - stats.idle);
+    this.set(max > 0 ? Math.min(1.0, active / max) : 0);
+  },
+});
+
+export const dbPoolAcquireDuration = new Histogram({
+  name: 'flowfi_db_pool_acquire_duration_seconds',
+  help: 'Time spent waiting to acquire a PostgreSQL connection from the pool',
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+  registers: [registry],
+});
+
+
 // ─── HTTP ────────────────────────────────────────────────────────────────────
 
 /** Every API request, labelled by low-cardinality route template and status. */
@@ -291,6 +467,34 @@ export function setIndexerLedgers(currentLedger: number, networkLedger: number):
   }
 }
 
+/** Record the number of events dispatched for a single processed ledger. */
+export function recordIndexerEventsPerLedger(count: number): void {
+  indexerEventsPerLedger.observe(count);
+}
+
+/** Record decode latency for a ledger. `result` is success | error. */
+export function recordIndexerDecode(seconds: number, result: string): void {
+  indexerDecodeDuration.observe({ result }, seconds);
+}
+
+/** Record persistence latency for a ledger. `result` is success | error. */
+export function recordIndexerPersist(seconds: number, result: string): void {
+  indexerPersistDuration.observe({ result }, seconds);
+}
+
+/** Record a retry attempt. `operation` and `outcome` must be bounded values. */
+export function recordIndexerRetry(operation: string, outcome: string): void {
+  indexerRetriesTotal.inc({ operation, outcome });
+}
+
+/**
+ * Stamp the last-success gauge. Defaults to "now" so callers can simply call
+ * this after a successful commit; pass an explicit epoch-seconds value in tests.
+ */
+export function markIndexerSuccess(timestampSeconds: number = Date.now() / 1000): void {
+  indexerLastSuccessTimestamp.set(timestampSeconds);
+}
+
 /**
  * Reset every per-topic SSE gauge, then re-publish the supplied counts.
  *
@@ -311,6 +515,30 @@ export function setSseConnectionCounts(countsByTopic: Map<string, number>, total
 export function recordRpcRequest(method: string, seconds: number, outcome: string): void {
   rpcRequestDuration.observe({ method }, seconds);
   rpcRequestsTotal.inc({ method, outcome });
+}
+
+/**
+ * Record one batched persistence attempt. `outcome` is success | retry | error.
+ * `eventCount` is the number of events the batch carried (0 for an attempt that
+ * failed before any event was read) and `seconds` its wall-clock duration.
+ */
+export function recordIndexerEventBatch(
+  eventCount: number,
+  seconds: number,
+  outcome: string,
+): void {
+  indexerEventBatchAttemptsTotal.inc({ outcome });
+  indexerEventBatchDuration.observe({ outcome }, seconds);
+  if (eventCount > 0) {
+    indexerEventBatchSize.observe(eventCount);
+  }
+}
+
+/** Record events skipped by the idempotency guard during a batch write. */
+export function recordIndexerEventBatchDuplicates(count: number): void {
+  if (count > 0) {
+    indexerEventBatchDuplicatesTotal.inc(count);
+  }
 }
 
 export function getMetricsRegistry(): Registry {
