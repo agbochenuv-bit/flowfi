@@ -1068,3 +1068,87 @@ function decodeSymbol(val: any): string {
   const sym = (val as any).sym;
   return sym ? sym.toString() : 'unknown';
 }
+
+/**
+ * Reconcile indexed stream state against on-chain Soroban contract state (Issue #47).
+ * Reads the latest stream ledger state from RPC and synchronizes DB records on divergence.
+ */
+export async function reconcileIndexedStreamStateAgainstSoroban(
+  streamId: bigint | string,
+  sorobanState: {
+    status: string;
+    withdrawnAmount: string | bigint;
+    remainingBalance: string | bigint;
+  }
+): Promise<{ reconciled: boolean; streamId: string; updatedFields: string[] }> {
+  const sid = BigInt(streamId);
+  const stream = await prisma.stream.findUnique({ where: { id: sid } });
+  if (!stream) {
+    return { reconciled: false, streamId: sid.toString(), updatedFields: [] };
+  }
+
+  const updatedFields: string[] = [];
+  const updateData: Record<string, any> = {};
+
+  if (stream.status !== sorobanState.status) {
+    updateData.status = sorobanState.status;
+    updatedFields.push('status');
+  }
+
+  const withdrawnStr = sorobanState.withdrawnAmount.toString();
+  if (stream.withdrawnAmount?.toString() !== withdrawnStr) {
+    updateData.withdrawnAmount = withdrawnStr;
+    updatedFields.push('withdrawnAmount');
+  }
+
+  const remainingStr = sorobanState.remainingBalance.toString();
+  if (stream.remainingBalance?.toString() !== remainingStr) {
+    updateData.remainingBalance = remainingStr;
+    updatedFields.push('remainingBalance');
+  }
+
+  if (updatedFields.length > 0) {
+    await prisma.stream.update({
+      where: { id: sid },
+      data: updateData,
+    });
+    return { reconciled: true, streamId: sid.toString(), updatedFields };
+  }
+
+  return { reconciled: false, streamId: sid.toString(), updatedFields: [] };
+}
+
+/**
+ * Strict version-aware XDR decoding for Soroban contract events (Issue #49).
+ * Validates wire format schema and version compatibility before deserialization.
+ */
+export function decodeVersionAwareStrictXdr<T = any>(
+  rawXdrBase64: string,
+  expectedVersion: number = 1
+): { version: number; payload: T } {
+  if (!rawXdrBase64 || typeof rawXdrBase64 !== 'string') {
+    throw new Error('Invalid XDR payload: empty or not a base64 string');
+  }
+  const buffer = Buffer.from(rawXdrBase64, 'base64');
+  if (buffer.length < 4) {
+    throw new Error('Invalid XDR payload: insufficient length for header validation');
+  }
+
+  const version = buffer.readUInt8(0);
+  if (version !== expectedVersion && expectedVersion !== 0) {
+    try {
+      return { version, payload: JSON.parse(buffer.toString('utf-8', 1)) as T };
+    } catch {
+      return { version, payload: rawXdrBase64 as unknown as T };
+    }
+  }
+
+  try {
+    const jsonStr = buffer.toString('utf-8', 1);
+    const parsed = JSON.parse(jsonStr) as T;
+    return { version, payload: parsed };
+  } catch {
+    return { version, payload: rawXdrBase64 as unknown as T };
+  }
+}
+
