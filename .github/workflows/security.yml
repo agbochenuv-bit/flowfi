@@ -120,7 +120,7 @@ jobs:
         workspace: "contracts -> target"
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@ce5e7eeac396d720fe2d802714996c8ce561e311 # v3
+      uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
       with:
         languages: ${{ matrix.language }}
         
