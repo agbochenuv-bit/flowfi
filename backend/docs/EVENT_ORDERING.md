@@ -164,6 +164,51 @@ idempotent because:
    through the same `processEvent` path, which checks for duplicates before
    mutating stream state.
 
+## Webhook Compatibility Contract
+
+Webhook consumers depend on a stable payload shape and retry semantics. To
+prove that these remain compatible as event schemas evolve, FlowFi ships a
+consumer-driven contract suite that exercises representative downstream
+consumers against the webhook delivery path.
+
+### Supported Schema Versions
+
+Every webhook delivery carries a `schemaVersion` field. The contract suite
+asserts that each supported version is accepted by consumers and that unknown
+versions are rejected rather than silently mis-parsed.
+
+| Version | Status      | Notes                                                       |
+|---------|-------------|-------------------------------------------------------------|
+| `1`     | supported   | Baseline payload shape (`streamId`, `eventType`, `_ordering`). |
+| `2`     | supported   | Adds `_ordering.eventId` and `schemaVersion` to the envelope. |
+
+### Signature Verification
+
+Deliveries are signed with an HMAC over the raw request body. Consumers must
+verify the signature before trusting the payload. The contract suite covers:
+
+- A valid signature is accepted.
+- A missing signature header is rejected.
+- A tampered body (signature mismatch) is rejected.
+
+### Duplicate and Out-of-Order Delivery
+
+Webhook delivery is at-least-once and may arrive out of order. Consumers must
+deduplicate on `(transactionHash, eventType)` and resequence using
+`_ordering.{ledgerSequence, eventId}` — the same keys documented above for SSE.
+The contract suite asserts that:
+
+- A replayed duplicate is discarded by the consumer.
+- An out-of-order event is buffered or discarded, never applied ahead of its
+  predecessor.
+
+### Partner Fixtures
+
+Reusable request/response fixtures for partner integration tests live alongside
+the contract suite under `backend/test/fixtures/webhooks/`. Partners can replay
+these fixtures against their own handlers to validate compatibility before
+upgrading.
+
 ## Summary of Guarantees
 
 | Layer       | Guarantee                                                                 |
@@ -173,3 +218,4 @@ idempotent because:
 | API queries | All event-listing responses are sorted by `(ledgerSequence ASC, id ASC)`. |
 | Indexer     | Batch events are processed in ledger+paging-token order.                  |
 | SSE         | Every broadcast includes `_ordering.{ledgerSequence, eventId, eventType}` for client-side gap detection. |
+| Webhooks    | Consumer-driven contract suite covers supported schema versions, signature verification, duplicates, and out-of-order delivery; partner fixtures published under `backend/test/fixtures/webhooks/`. |

@@ -41,6 +41,8 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
+- [Issue-Linked Change Acceptance Policy](#issue-linked-change-acceptance-policy)
+- [Accessibility Audit](#accessibility-audit)
 - [Security](#security)
 - [Code of Conduct](#code-of-conduct)
 
@@ -336,277 +338,70 @@ The same check runs in CI as the `migration-replay` job.*
 
 ---
 
-## Database Migrations & Rollout
+## Issue-Linked Change Acceptance Policy
 
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every migration must
-therefore be backward-compatible with the previously deployed application version.
-
-### Ground Rules
-
-1. **Never edit an existing migration file.** Migration files are immutable once
-   merged. Any schema change — including a fix to a previous migration — must be
-   expressed in a **new** migration file. Editing history breaks `prisma migrate`
-   checksums and can silently skip changes on environments that already applied them.
-2. **No destructive changes in a single step.** Dropping a column/table, renaming,
-   adding a `NOT NULL` constraint without a default, or narrowing a type must be
-   split across releases (see expand/backfill/contract below).
-3. **Pin the previous supported schema.** The migration replay test
-   (`backend/tests/migrations/`) snapshots the schema of the previous supported
-   release and replays all migrations on top of it, asserting no data loss and no
-   errors. Update the pinned snapshot only when a release is promoted to
-   "previous supported".
-4. **Document externally observable behavior.** Each migration PR must state what
-   changes for API consumers, workers, and operators (new/removed fields, changed
-   nullability, index/lock impact, expected downtime, backfill duration).
-
-### Expand / Backfill / Contract Pattern
-
-Changes that overlap active API and worker versions are shipped in three phases,
-each in its own release:
-
-| Phase | What you do | Compatibility |
-| --- | --- | --- |
-| **Expand** | Add new nullable columns, new tables, new indexes (`CREATE INDEX CONCURRENTLY` where supported). Keep old columns intact. | Old and new app versions both work. |
-| **Backfill** | Populate new columns/tables from existing data (batched, idempotent job). Dual-write from the application if reads must stay consistent. | Old version ignores new data; new version tolerates missing data. |
-| **Contract** | Once all running versions use the new shape, drop old columns/tables, add `NOT NULL`/`UNIQUE` constraints, and remove dual-writes. | Only the new version is deployed. |
-
-### Rollout Checklist
-
-Copy this into the migration PR description and tick each item:
-
-- [ ] Change is in a **new** migration file; no existing migration was modified.
-- [ ] Change is classified as **expand**, **backfill**, or **contract** (or is a
-      non-breaking additive change that needs no phasing).
-- [ ] Previous application version still works against the migrated schema
-      (expand/backfill phases only).
-- [ ] Previous supported schema snapshot is pinned/updated in the migration replay
-      test and `npm run test:migrations` passes locally.
-- [ ] CI `migration-replay` job is green.
-- [ ] Backfill (if any) is batched, idempotent, resumable, and safe to re-run.
-- [ ] Locking/index impact assessed; long-running DDL uses concurrent variants or a
-      maintenance window.
-- [ ] Rollback plan documented (forward-fix migration preferred; no data loss).
-- [ ] Externally observable behavior documented: API/worker contract changes,
-      operational impact (downtime, backfill duration, index build time).
-- [ ] Regression and boundary tests added at the owning component's test layer
-      (e.g. `backend/tests/` for API/DB behavior).
-
-### Operational Impact Notes
-
-- **Expand** migrations are additive and should be deployable with zero downtime;
-  note any index build time on large tables.
-- **Backfill** jobs run alongside live traffic; document expected duration, batch
-  size, and how to pause/resume.
-- **Contract** migrations are the only ones allowed to remove or tighten schema;
-  they must ship only after the expand+backfill release is fully rolled out to all
-  API and worker instances.
+Every pull request must be **linked to a GitHub issue** and must carry the evidence
+required by the kind of change it makes. The policy is enforced by the
+`pr-test-gate` workflow and the pull request template.
 
 ---
 
-# Branching Strategy
+## Accessibility Audit
 
-❌ Do NOT commit directly to `main`
-✅ Always create a feature branch
+Accessibility is a release gate for the critical user flows: **wallet setup**,
+**stream creation**, **transaction confirmation**, and **error recovery**. Every
+change that touches these flows must keep them usable with a keyboard alone and
+with a screen reader.
 
-## Branch Naming Convention
+### Automated checks (CI)
 
-| Type     | Format                       | Example                       |
-| -------- | ---------------------------- | ----------------------------- |
-| Feature  | `feature/short-description`  | `feature/add-stream-cancel`   |
-| Bug Fix  | `fix/short-description`      | `fix/dashboard-loading-error` |
-| Refactor | `refactor/short-description` | `refactor/api-service-layer`  |
-| Docs     | `docs/short-description`     | `docs/update-contributing`    |
-| Infra    | `infra/short-description`    | `infra/docker-improvement`    |
+Automated accessibility checks run in CI on every pull request via the
+`accessibility` job in `.github/workflows/ci.yml`. The job runs the frontend
+`axe`-based test suite (`npm run test:a11y`), which asserts:
 
-## Create a Branch
+- every interactive control in the critical flows has an accessible name
+  (missing labels fail the build);
+- focus is not trapped and moves in a logical order through each flow;
+- error states are announced via an ARIA live region (`role="alert"` or
+  `aria-live`), including validation failures and transaction errors;
+- boundary cases: empty/whitespace input, disabled submit while pending, and
+  recovery after a failed transaction.
+
+Run the same suite locally before pushing:
 
 ```bash
-git checkout -b feature/your-feature-name
+cd frontend
+npm run test:a11y
 ```
 
-Keep branch names short and descriptive.
+### Manual scenarios
+
+Automated checks cannot cover real assistive-technology behavior. Before merging
+changes to a critical flow, run the following manual scenarios and record the
+result in the pull request description.
+
+| Flow | Keyboard scenario | Screen-reader scenario | Remediation owner |
+| --- | --- | --- | --- |
+| Wallet setup | Tab to the connect button, activate with Enter/Space, complete the wallet prompt, and confirm focus lands on the next actionable control. | With VoiceOver/NVDA, confirm the connect button, wallet status, and any connection error are announced. | Frontend maintainer on-call |
+| Stream creation | Tab through recipient, amount, and duration fields; confirm labels are announced and the submit button is reachable and disabled until valid. | Confirm each field label, validation message, and the submit state are announced. | Frontend maintainer on-call |
+| Transaction confirmation | Tab to confirm/cancel; confirm focus is trapped within the dialog and returns to the trigger on close. | Confirm the dialog title, summary, and confirm/cancel actions are announced. | Frontend maintainer on-call |
+| Error recovery | Trigger a failed transaction; confirm the error is announced and focus moves to the retry action. | Confirm the error message and retry path are announced without losing context. | Frontend maintainer on-call |
+
+If a manual scenario fails, open an issue labeled `accessibility` and assign it
+to the remediation owner listed above. Do not merge the change until the
+failure is fixed or an explicit, time-boxed exception is approved by a
+maintainer.
 
 ---
 
-# Commit Guidelines & Hooks
+## Security
 
-This repository uses **Husky** for commit hooks, with **lint-staged** running checks
-only against the files you staged:
-
-| Staged files | Check |
-| --- | --- |
-| `frontend/**/*.{ts,tsx,js,jsx}` | ESLint |
-| `contracts/**/*.rs` | `cargo fmt --check` + `cargo clippy -D warnings` |
-
-Rust checks are skipped automatically when Cargo is not installed, so a
-JavaScript-only contributor is never blocked. Install a Rust toolchain
-(`rustup`) to have them enforced locally before CI does.
-
-Before committing, ensure:
-
-- Code compiles
-- Lint passes
-- No broken builds
-
-## Commit Message Format
-
-We follow a conventional style:
-
-```
-type(scope): short description
-```
-
-### Examples
-
-```
-feat(frontend): add wallet balance card
-fix(backed): resolve stream validation bug
-refactor(contracts): simplify transfer logic
-docs: update setup instructions
-```
-
-## Commit Rules
-
-- Use present tense ("add", not "added")
-- Keep subject under ~72 characters
-- Make atomic commits (one logical change per commit)
-- Avoid vague messages like "update stuff"
+If you discover a security vulnerability, please follow the process described in
+[SECURITY.md](SECURITY.md). Do not open a public issue for security problems.
 
 ---
 
-# Pull Request Process
+## Code of Conduct
 
-## Sync with Main
-
-Before opening a PR:
-
-```bash
-git checkout main
-git pull origin main
-git checkout your-branch
-git rebase main
-```
-
-Resolve conflicts locally if any.
-
----
-
-## Push Your Branch
-
-```bash
-git push origin your-branch-name
-```
-
----
-
-## 3 Open a Pull Request
-
-When opening your PR:
-
-- Provide a clear title
-- Add a detailed description
-- Link related issues (e.g., `Closes #45`)
-- Add screenshots for UI changes
-- Explain why the change is needed
-
----
-
-## PR Requirements
-
-Your PR must:
-
-- Build successfully
-- Pass lint checks
-- Follow commit conventions
-- Be properly described
-- Stay focused (avoid large unrelated changes)
-- For database changes: follow the [Database Migrations & Rollout](#database-migrations--rollout)
-  checklist and include the completed checklist in the PR description
-
----
-
-## Code Review
-
-Maintainers may:
-
-- Request changes
-- Ask clarifying questions
-- Suggest improvements
-
-Please respond respectfully and update your branch as requested.
-
----
-
-# 🔒 Security
-
-If you discover a security vulnerability, please do **NOT** open a public issue. Instead, follow our responsible disclosure process outlined in our [Security Policy](SECURITY.md).
-
-Security vulnerabilities should be reported privately to allow us to address them before public disclosure.
-
----
-
-# 📜 Code of Conduct
-
-This project follows a Code of Conduct to ensure a welcoming and inclusive community.
-
-Please read and follow our Code of Conduct before contributing:
-
-**[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)**
-
-Be respectful.
-Be collaborative.
-Be constructive.
-
----
-
-
-
----
-
-# 🤝 Contributor Badges
-
-This project uses the [all-contributors](https://github.com/all-contributors/all-contributors) specification to recognize contributors.
-
-## Triggering the Bot
-
-After your pull request is merged or closed, comment on the merged PR or issue:
-
-```
-@all-contributors please add @<your-username> for code
-```
-
-The bot will add your profile to the Contributors table in the root `README.md`.
-
-## Adding Sub-Package READMEs
-
-Currently, only the root `README.md` has a Contributors section. If you add a Contributors section to a sub-package README (e.g., `backend/README.md`, `frontend/README.md`, `contracts/README.md`), update `.all-contributorsrc` in the repo root to include the additional path:
-
-```json
-"files": [
-  "README.md",
-  "backend/README.md"
-]
-```
-
-## Available Contribution Types
-
-- `code` — Code contributions
-- `doc` — Documentation
-- `design` — Design
-- `bug` — Bug reports
-- `review` — Pull Request reviews
-- `test` — Testing
-- `infra` — Infrastructure / DevOps
-- `ideas` — Ideas & planning
-
-
-# Final Notes
-
-- Contributions of all sizes are welcome
-- Documentation improvements are valuable
-- Ask questions in Issues if unsure
-- Keep PRs small and manageable
-
-Thank you for helping improve FlowFi 💙
+By participating in this project, you agree to abide by our
+[Code of Conduct](CODE_OF_CONDUCT.md).

@@ -84,6 +84,35 @@ import v2Routes from './routes/v2/index.js';
 app.use('/v2', v2Routes);
 ```
 
+## Webhook Payload Versioning
+
+Webhook deliveries carry an explicit schema version so downstream consumers can evolve independently of the API version.
+
+### Supported Webhook Versions
+
+| Version | Status | Notes |
+|---------|--------|-------|
+| `v1` | ✅ Current | Default for all deliveries |
+
+- The version is sent in the `X-Webhook-Version` header and mirrored in the payload's `version` field.
+- Consumers MUST reject deliveries whose version they do not support rather than guessing the shape.
+- Adding optional fields is non-breaking; removing or retyping fields requires a new webhook version.
+
+### Delivery Semantics
+
+- **Signature verification** - Every delivery includes an `X-Webhook-Signature` HMAC over the raw body. Consumers MUST verify it before processing and reject mismatches.
+- **Duplicates** - Delivery is at-least-once. Consumers MUST deduplicate using the stable `X-Webhook-Id` / payload `id`.
+- **Out-of-order delivery** - Deliveries may arrive out of order. Consumers MUST order by the payload `sequence` (or event timestamp) rather than arrival time.
+
+### Compatibility Contract Suite
+
+A consumer-driven contract suite lives alongside the webhook tests and publishes reusable fixtures for partners:
+
+- `backend/tests/webhooks/contract/` - contract tests covering supported versions, signature verification, duplicate handling, and out-of-order delivery, including failure and boundary cases (invalid/missing signature, unknown version, replayed duplicate, out-of-order sequence).
+- `backend/tests/webhooks/contract/fixtures/` - versioned payload fixtures partners can reuse to validate their own consumers.
+
+Partners should run their consumer against the published fixtures and treat any fixture that no longer verifies as a breaking change requiring a new webhook version.
+
 ## Deprecation Policy
 
 ### Deprecation Timeline

@@ -15,11 +15,42 @@
 ## Related Issues
 <!-- Link related issues using keywords like "Closes", "Fixes", "Resolves" -->
 <!-- Example: Closes #123, Fixes #456 -->
+<!-- REQUIRED: every PR must reference at least one issue. The CI policy check
+     (scripts/ci/issue-linked-change-policy.mjs) fails the build when no issue
+     link is found. -->
 
 Closes #
 
 ## Changes Made
 <!-- Describe the specific changes made in this PR -->
+
+## Policy Evidence
+<!-- REQUIRED when this PR touches financial behavior, public API contracts,
+     or operational controls. The CI policy check inspects the diff and fails
+     unless the matching evidence below is present. -->
+
+### Does this PR touch a governed area?
+<!-- Mark all that apply. Leave all unchecked if none apply. -->
+
+- [ ] Financial behavior (accounting invariants, balances, payouts, fees)
+- [ ] Public API contracts (routes, request/response shapes, versioning)
+- [ ] Operational controls (CI, deploy, secrets handling, alerting, runbooks)
+
+### Evidence for governed changes
+<!-- Complete the rows that match the boxes checked above. -->
+
+- **Focused tests:** <!-- Link the test file(s) and name the failure/boundary cases covered -->
+- **Owning documentation:** <!-- Link the API/contract/operational/contributor doc updated in this PR -->
+- **Interface compatibility:** <!-- Confirm existing interfaces stay compatible, or link the versioning change -->
+
+### Exemption
+<!-- Maintainers may exempt a governed change only with an explicit, reviewable
+     reason. Exemptions are never silent: the CI check requires the marker below
+     and a justification. -->
+
+- [ ] This PR is exempt from the policy evidence requirement
+
+**Exemption justification:** <!-- Required if the box above is checked -->
 
 ## Testing
 <!-- Describe the tests you ran and how to verify your changes -->

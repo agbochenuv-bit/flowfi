@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   contracts-test:
@@ -40,3 +41,115 @@ jobs:
             exit 1
           fi
           echo "CI workflow succeeded for pull request #${PR_NUMBER}; no duplicate backend run is required."
+
+  issue-link-policy:
+    name: Issue-linked change acceptance policy
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Verify CI succeeded for the pull request
+        env:
+          CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          if [ "$CI_CONCLUSION" != "success" ]; then
+            echo "CI workflow failed for pull request #${PR_NUMBER}."
+            exit 1
+          fi
+          echo "CI workflow succeeded for pull request #${PR_NUMBER}; evaluating issue-link policy."
+
+      - name: Checkout pull request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.pull_requests[0].head_sha }}
+          fetch-depth: 0
+
+      - name: Evaluate issue-linked change acceptance policy
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+          PR_TITLE: ${{ github.event.workflow_run.pull_requests[0].title }}
+          PR_BODY: ${{ github.event.workflow_run.pull_requests[0].body }}
+          BASE_SHA: ${{ github.event.workflow_run.pull_requests[0].base.sha }}
+          HEAD_SHA: ${{ github.event.workflow_run.pull_requests[0].head.sha }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Policy: changes touching financial behavior, public API contracts, or
+          # operational controls must (1) link an issue and (2) include test and
+          # documentation evidence. Maintainers can bypass with the
+          # `policy:exempt` label or a `Policy-Exempt: <reason>` line in the body.
+          # Bypasses are always logged, never silent.
+
+          SENSITIVE_PATTERNS='(^|/)(wallet|ledger|accounting|balance|payment|invoice|settlement|transfer|chain|network|indexer|webhook|auth|secret|config|contracts?|api|routes?|controllers?|middleware|migrations?|prisma/schema)(/|\.|$)'
+          TEST_PATTERNS='(^|/)(tests?|__tests__|spec)/|\.(test|spec)\.[a-z]+$'
+          DOC_PATTERNS='(^|/)(docs?|documentation)/|(^|/)(README|CHANGELOG|CONTRIBUTING|API|OPERATIONS|SECURITY)(\.[a-z]+)?$|\.md$'
+
+          echo "Collecting changed files for PR #${PR_NUMBER} (${BASE_SHA}..${HEAD_SHA})"
+          CHANGED=$(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}")
+          if [ -z "${CHANGED}" ]; then
+            echo "No changed files detected; nothing to evaluate."
+            exit 0
+          fi
+          echo "Changed files:"
+          echo "${CHANGED}"
+
+          SENSITIVE=$(echo "${CHANGED}" | grep -Ei "${SENSITIVE_PATTERNS}" || true)
+          if [ -z "${SENSITIVE}" ]; then
+            echo "No sensitive surfaces touched; policy not applicable."
+            exit 0
+          fi
+          echo "Sensitive surfaces touched:"
+          echo "${SENSITIVE}"
+
+          # Exemption mechanism (explicit, logged).
+          EXEMPT_REASON=""
+          if echo "${PR_BODY:-}" | grep -Eiq '^Policy-Exempt:[[:space:]]*\S'; then
+            EXEMPT_REASON=$(echo "${PR_BODY}" | grep -Ei '^Policy-Exempt:' | head -n1)
+          fi
+          if [ -n "${EXEMPT_REASON}" ]; then
+            echo "::warning::Policy exempted via body marker: ${EXEMPT_REASON}"
+            exit 0
+          fi
+          if [ -n "${GITHUB_TOKEN:-}" ] && [ -n "${PR_NUMBER:-}" ]; then
+            LABELS=$(curl -sS -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" \
+              | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\([^"]*\)"$/\1/' || true)
+            if echo "${LABELS}" | grep -qx 'policy:exempt'; then
+              echo "::warning::Policy exempted via 'policy:exempt' label."
+              exit 0
+            fi
+          fi
+
+          FAILED=0
+
+          # 1) Issue linkage.
+          if echo "${PR_TITLE:-} ${PR_BODY:-}" | grep -Eiq '(#[0-9]+|(fixes|closes|resolves|refs)[[:space:]]+#[0-9]+)'; then
+            echo "OK: issue linkage found."
+          else
+            echo "::error::Missing issue linkage. Reference an issue (e.g. 'Closes #123') in the PR title or body."
+            FAILED=1
+          fi
+
+          # 2) Test evidence.
+          if echo "${CHANGED}" | grep -Eqi "${TEST_PATTERNS}"; then
+            echo "OK: test evidence found."
+          else
+            echo "::error::Missing test evidence. Add or update focused tests for the changed behavior (failure and boundary cases)."
+            FAILED=1
+          fi
+
+          # 3) Documentation evidence.
+          if echo "${CHANGED}" | grep -Eqi "${DOC_PATTERNS}"; then
+            echo "OK: documentation evidence found."
+          else
+            echo "::error::Missing documentation evidence. Update the owning API/contract/operational/contributor docs."
+            FAILED=1
+          fi
+
+          if [ "${FAILED}" -ne 0 ]; then
+            echo "Issue-linked change acceptance policy failed. Maintainers may bypass with the 'policy:exempt' label or a 'Policy-Exempt: <reason>' line in the PR body."
+            exit 1
+          fi
+          echo "Issue-linked change acceptance policy passed."

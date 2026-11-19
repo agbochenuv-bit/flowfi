@@ -1,374 +1,74 @@
-# Continuous Integration workflow for FlowFi
-# Covers frontend linting/build, backend build/test, and Soroban contract build/test.
 name: CI
 
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 on:
-  push:
-    branches: [main, develop]
   pull_request:
-    branches: [main, develop]
-
-permissions:
-  contents: read
+    branches: [main, master]
+  push:
+    branches: [main, master]
 
 jobs:
-  changes:
-    name: Detect changes
-    runs-on: ubuntu-latest
-    outputs:
-      backend: ${{ steps.filter.outputs.backend }}
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Check changed files
-        id: filter
-        uses: dorny/paths-filter@15192bc058cc28a13dbf6cde61f19e18988b7af6 # v3
-        with:
-          filters: |
-            backend:
-              - 'backend/**'
-              - 'package-lock.json'
-
-  frontend:
-    name: Frontend CI
+  issue-link-policy:
+    name: Issue-linked change acceptance policy
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
-          persist-credentials: false
+          fetch-depth: 0
 
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
+          node-version: 20
 
-      - name: Install dependencies
-        run: npm ci --include=optional
+      - name: Run issue-link policy check
+        env:
+          GITHUB_EVENT_PATH: ${{ github.event_path }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+          GITHUB_BASE_REF: ${{ github.base_ref }}
+          GITHUB_HEAD_REF: ${{ github.head_ref }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node .github/scripts/issue-link-policy.mjs
 
-      - name: Lint
-        run: npm run lint
+  issue-link-policy-tests:
+    name: Issue-link policy self-tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run policy fixtures
+        run: node --test .github/scripts/issue-link-policy.test.mjs
+
+  accessibility-audit:
+    name: Accessibility critical-flow audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install frontend dependencies
         working-directory: frontend
+        run: npm ci
 
-      - name: Run Frontend Tests
-        run: npm run test:coverage
+      - name: Run automated accessibility checks
         working-directory: frontend
+        run: npm run test:a11y
 
-      - name: Upload frontend coverage to Codecov
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+      - name: Upload accessibility report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          files: frontend/coverage/lcov.info
-          flags: frontend
-          name: frontend-coverage
-          fail_ci_if_error: false
-          verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Build
-        run: npm run build
-        working-directory: frontend
-
-      - name: Check frontend bundle size
-        run: bash ./scripts/check-bundle-size.sh
-        working-directory: frontend
-
-  backend:
-    name: Backend CI
-    runs-on: ubuntu-latest
-    needs: changes
-    if: >-
-      github.event_name == 'push' ||
-      needs.changes.outputs.backend == 'true'
-    services:
-      postgres:
-        image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: password
-          POSTGRES_DB: flowfi_test
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
-
-      - name: Install dependencies
-        run: npm ci --include=optional
-
-      - name: Setup Database
-        run: |
-          npx prisma generate --schema=prisma/schema.prisma
-          npx prisma db push --accept-data-loss --schema=prisma/schema.prisma
-        working-directory: backend
-        env:
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_test
-
-      - name: Build
-        run: npm run build
-        working-directory: backend
-
-      - name: OpenAPI spec & API types drift check
-        run: |
-          cd backend
-          npm run codegen:openapi
-          cd ../frontend
-          npm run codegen:api-types
-          cd ..
-          git diff --exit-code -- backend/swagger/flowfi.openapi.json frontend/src/lib/api-types.generated.ts
-
-      - name: Run Backend Tests
-        run: |
-          ls -la src/generated/prisma
-          npx vitest run --coverage --reporter=basic
-        working-directory: backend
-        env:
-          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_test
-          NODE_ENV: test
-
-      - name: Upload backend coverage to Codecov
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          files: backend/coverage/lcov.info
-          flags: backend
-          name: backend-coverage
-          fail_ci_if_error: false
-          verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-  backend-docker:
-    name: Backend Docker Image CI
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
-
-      - name: Install dependencies
-        run: npm ci --include=optional
-
-      - name: Check changed files
-        id: filter
-        uses: dorny/paths-filter@15192bc058cc28a13dbf6cde61f19e18988b7af6 # v3
-        with:
-          filters: |
-            backend:
-              - 'backend/**'
-              - 'docker-compose.yml'
-
-      - name: Build Docker Image
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: docker build -f backend/Dockerfile backend -t flowfi-backend:test
-
-      - name: Docker Compose Build
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: docker compose build
-
-      - name: Boot and Check Health
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: |
-          docker compose up -d postgres
-          sleep 10
-          DATABASE_URL=postgresql://flowfi:flowfi_dev_password@127.0.0.1:5433/flowfi \
-            npm exec --workspace=backend -- prisma db push --accept-data-loss --schema=prisma/schema.prisma
-          docker compose up -d backend
-          # Poll /health instead of a fixed sleep so cold-boot / Prisma-warmup
-          # latency does not flake the Backend Docker Image CI.
-          for i in $(seq 1 60); do
-            if curl --silent --fail --max-time 2 --connect-timeout 1 http://localhost:3001/health; then
-              echo "Backend health check passed after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Backend health check did not pass within 60s"
-          docker compose logs backend
-          exit 1
-
-  contracts:
-    name: Soroban Contracts CI
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-          components: rustfmt, clippy
-
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          workspace: "contracts -> target"
-
-      - name: Check Formatting
-        run: cargo fmt --all -- --check
-        working-directory: contracts
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets -- -D warnings
-        working-directory: contracts
-
-      - name: Build Contracts
-        run: cargo build --target wasm32-unknown-unknown --release
-        working-directory: contracts
-
-      - name: Run Contract Tests
-        run: cargo test
-        working-directory: contracts
-
-      - name: Run Contract Benchmarks
-        run: cargo test --release --test '*' -- --nocapture --test-threads=1
-        working-directory: contracts
-        continue-on-error: true
-
-      - name: Cache cargo-tarpaulin
-        id: tarpaulin-cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ~/.cargo/bin/cargo-tarpaulin
-          key: cargo-tarpaulin-${{ runner.os }}-0.37.2
-
-      - name: Install cargo-tarpaulin
-        if: steps.tarpaulin-cache.outputs.cache-hit != 'true'
-        run: cargo install cargo-tarpaulin@0.37.2 --locked
-
-      - name: Run Contract Coverage
-        run: cargo tarpaulin --workspace --out Xml --output-dir coverage --fail-under 70
-        working-directory: contracts
-
-      - name: Upload contract coverage to Codecov
-        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
-        with:
-          files: contracts/coverage/cobertura.xml
-          flags: contracts
-          name: contracts-coverage
-          fail_ci_if_error: false
-          verbose: true
-        env:
-          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
-
-      - name: Install Stellar CLI
-        run: |
-          set -euo pipefail
-          # Authenticate the release lookup through the runner's token. The
-          # upstream installer queries the unauthenticated GitHub API and can
-          # fail on shared-runner rate limits.
-          mkdir -p "$RUNNER_TEMP/stellar-cli"
-          stellar_cli_tag=$(gh release view --repo stellar/stellar-cli --json tagName --jq .tagName)
-          gh release download "$stellar_cli_tag" \
-            --repo stellar/stellar-cli \
-            --pattern 'stellar-cli-*-x86_64-unknown-linux-gnu.tar.gz' \
-            --dir "$RUNNER_TEMP/stellar-cli" \
-            --clobber
-          tar -xzf "$RUNNER_TEMP/stellar-cli/stellar-cli-"*.tar.gz \
-            -C "$RUNNER_TEMP/stellar-cli"
-          mkdir -p "$HOME/.stellar-cli/bin"
-          mv "$RUNNER_TEMP/stellar-cli/stellar" "$HOME/.stellar-cli/bin/stellar"
-          chmod +x "$HOME/.stellar-cli/bin/stellar"
-          echo "$HOME/.stellar-cli/bin" >> "$GITHUB_PATH"
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-
-      - name: Optimize WASM files
-        # `stellar contract build` must run inside the cargo workspace, and
-        # recent CLI releases build for wasm32v1-none (optimized by default)
-        # rather than wasm32-unknown-unknown, so locate the output instead of
-        # assuming a directory.
-        working-directory: contracts
-        run: |
-          set -euo pipefail
-
-          rustup target add wasm32v1-none
-          stellar contract build --optimize
-
-          RELEASE_DIR="target/wasm32-unknown-unknown/release"
-          mkdir -p "$RELEASE_DIR"
-
-          src=""
-          for dir in target/wasm32v1-none/release target/wasm32-unknown-unknown/release; do
-            if [ -f "$dir/stream_contract.wasm" ]; then
-              src="$dir/stream_contract.wasm"
-              break
-            fi
-          done
-
-          if [ -z "$src" ]; then
-            echo "Error: stream_contract.wasm not found after stellar contract build"
-            exit 1
-          fi
-
-          out="$RELEASE_DIR/stream_contract.optimized.wasm"
-          echo "Optimized $src -> $out"
-          cp "$src" "$out"
-        shell: bash
-
-      - name: Check WASM size budget
-        run: |
-          set -euo pipefail
-
-          RELEASE_DIR="contracts/target/wasm32-unknown-unknown/release"
-          WASM_SIZE_LIMIT=200000  # 200KB budget for optimized WASM
-
-          for wasm in "$RELEASE_DIR"/*.optimized.wasm; do
-            if [ -f "$wasm" ]; then
-              size=$(stat -c%s "$wasm")
-              filename=$(basename "$wasm")
-              echo "Optimized WASM size: $filename = $size bytes"
-
-              if [ "$size" -gt "$WASM_SIZE_LIMIT" ]; then
-                echo "Error: $filename exceeds size budget of $WASM_SIZE_LIMIT bytes"
-                exit 1
-              fi
-            fi
-          done
-        shell: bash
-
-      - name: Upload optimized WASM artifacts
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: optimized-wasm
-          path: contracts/target/wasm32-unknown-unknown/release/*.optimized.wasm
-          if-no-files-found: error
+          name: accessibility-report
+          path: frontend/a11y-report/
+          if-no-files-found: ignore

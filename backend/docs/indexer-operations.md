@@ -168,36 +168,80 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Metrics
+## 4. Production-scale query regression suite
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+To catch performance regressions before release, the backend ships an
+**opt-in** query regression suite that runs representative stream, event,
+export, and analytics queries against a realistic data volume. It is **not**
+part of the default fast test run; it is scheduled in CI (nightly) and can be
+run on demand.
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+### Running the suite
+
+```bash
+# On demand (requires a reachable PostgreSQL instance)
+QUERY_REGRESSION=1 npm run test:query-regression
+```
+
+- The suite is skipped unless `QUERY_REGRESSION=1` is set, so the default
+  `npm test` run stays fast and hermetic.
+- It seeds a **deterministic** dataset (fixed seed) sized to production-like
+  volume, then runs each recorded query plan and compares measured latency
+  against the recorded baseline.
+
+### Recorded dataset and query plans
+
+The fixtures live alongside the suite and record, for each hot path:
+
+| Fixture | Query | Baseline plan |
+| --- | --- | --- |
+| `stream-list` | Keyset-paginated stream list | Index scan on `streams_created_at_id_idx` |
+| `wallet-history` | Per-wallet stream history | Index scan on `streams_sender_idx` |
+| `stream-events` | Per-stream event history | Index scan on `events_stream_id_ledger_idx` |
+| `cursor-scan` | Ledger range / cursor scan | Index scan on `events_ledger_idx` |
+| `export` | Stream/event export range | Index scan on `events_ledger_idx` |
+| `analytics-by-type` | Event counts grouped by type | Index scan on `events_type_ledger_idx` |
+
+Each fixture records the expected plan shape (e.g. no sequential scan, no
+sort node where an index provides ordering) and a latency baseline captured on
+the reference dataset.
+
+### Regression thresholds
+
+- **Latency:** a query fails the suite if its measured latency exceeds the
+  recorded baseline by more than the bounded threshold (default **2×** the
+  baseline, with a small absolute floor to avoid noise on sub-millisecond
+  queries).
+- **Plan shape:** a query fails if it regresses from an index scan to a
+  sequential scan, or if an unexpected sort node appears on an ordered path.
+- **Boundary cases:** the suite also covers an empty/minimal dataset (queries
+  must succeed and stay within the absolute floor) and a dataset exactly at
+  the threshold (must pass) versus just over it (must fail), so the threshold
+  logic itself is covered.
+
+Thresholds are bounded and recorded with the fixtures; raising a baseline is
+an explicit, reviewable change rather than an implicit drift.
+
+---
+
+## 5. Soroban RPC retry and backoff
+
+*(See the RPC client module for the retry/backoff policy; configuration keys
+are additive and documented alongside the client.)*
+
+---
+
+## 6. Graceful shutdown and poll cancellation
+
+*(See the worker module for shutdown and poll cancellation behavior.)*
+
+---
+
+## 7. Indexer metrics
+
+*(See the metrics module for the full metric list, including lease
+acquisition, renewal failures, and rejected stale writes.)*

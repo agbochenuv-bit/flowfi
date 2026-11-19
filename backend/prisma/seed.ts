@@ -12,6 +12,90 @@ const DEMO_SENDER_PUBLIC_KEY = 'GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTA
 const DEMO_RECIPIENT_PUBLIC_KEY = 'GBJCHUKZMTFSLOMNC7P4TS4VJJBTCYL3XKSOLXAUJSD56C4LHND5TWUC';
 const DEMO_TOKEN_ADDRESS = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 
+// Production-scale regression fixtures (issue #309).
+//
+// These fixtures are OPT-IN: they only run when SEED_REGRESSION_FIXTURES=1 so
+// the default `prisma db seed` stays fast and deterministic. When enabled they
+// generate a repeatable, realistic data volume (streams, events, exports) that
+// the query-regression suite measures against. The dataset is fully derived
+// from a fixed seed so every run produces identical rows and query plans.
+const REGRESSION_ENABLED = process.env.SEED_REGRESSION_FIXTURES === '1';
+const REGRESSION_SEED = Number(process.env.SEED_REGRESSION_SEED ?? '309');
+const REGRESSION_STREAM_COUNT = Number(process.env.SEED_REGRESSION_STREAMS ?? '5000');
+const REGRESSION_EVENTS_PER_STREAM = Number(process.env.SEED_REGRESSION_EVENTS_PER_STREAM ?? '4');
+
+// Deterministic PRNG (mulberry32) so fixture generation is reproducible.
+function createRng(seed: number): () => number {
+    let state = seed >>> 0;
+    return () => {
+        state = (state + 0x6d2b79f5) >>> 0;
+        let t = state;
+        t = Math.imul(t ^ (t >>> 15), t | 1);
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+}
+
+const REGRESSION_EVENT_TYPES = ['CREATED', 'WITHDRAWN', 'CANCELED', 'COMPLETED'] as const;
+
+async function seedRegressionFixtures(): Promise<void> {
+    console.log(
+        `Seeding production-scale regression fixtures (seed=${REGRESSION_SEED}, streams=${REGRESSION_STREAM_COUNT}, eventsPerStream=${REGRESSION_EVENTS_PER_STREAM})...`,
+    );
+
+    const rng = createRng(REGRESSION_SEED);
+    const now = Math.floor(Date.now() / 1000);
+    const baseStreamId = 1_000_000;
+
+    // Batch inserts keep the fixture load bounded while still producing a
+    // realistic row count for query-plan measurement.
+    const BATCH_SIZE = 500;
+    for (let offset = 0; offset < REGRESSION_STREAM_COUNT; offset += BATCH_SIZE) {
+        const batchEnd = Math.min(offset + BATCH_SIZE, REGRESSION_STREAM_COUNT);
+        const streams = [];
+        const events = [];
+
+        for (let i = offset; i < batchEnd; i += 1) {
+            const streamId = baseStreamId + i;
+            const startTime = now - Math.floor(rng() * 90 * 24 * 60 * 60);
+            const isActive = rng() > 0.3;
+            const depositedAmount = String(Math.floor(rng() * 1_000_000_000_000));
+            const withdrawnAmount = String(Math.floor(rng() * Number(depositedAmount)));
+
+            streams.push({
+                streamId,
+                sender: DEMO_SENDER_PUBLIC_KEY,
+                recipient: DEMO_RECIPIENT_PUBLIC_KEY,
+                tokenAddress: DEMO_TOKEN_ADDRESS,
+                ratePerSecond: String(Math.floor(rng() * 1_000_000_000)),
+                depositedAmount,
+                withdrawnAmount,
+                startTime,
+                lastUpdateTime: startTime + Math.floor(rng() * 86_400),
+                isActive,
+            });
+
+            for (let e = 0; e < REGRESSION_EVENTS_PER_STREAM; e += 1) {
+                const eventType = REGRESSION_EVENT_TYPES[e % REGRESSION_EVENT_TYPES.length];
+                events.push({
+                    streamId,
+                    eventType,
+                    amount: String(Math.floor(rng() * 1_000_000_000)),
+                    transactionHash: `regression-${REGRESSION_SEED}-${streamId}-${e}`,
+                    ledgerSequence: 100_000 + i * REGRESSION_EVENTS_PER_STREAM + e,
+                    timestamp: startTime + e * 3_600,
+                    metadata: JSON.stringify({ fixture: 'regression', seed: REGRESSION_SEED }),
+                });
+            }
+        }
+
+        await prisma.stream.createMany({ data: streams, skipDuplicates: true });
+        await prisma.streamEvent.createMany({ data: events, skipDuplicates: true });
+    }
+
+    console.log('Regression fixtures seeded.');
+}
+
 async function main() {
     console.log('Seeding database...');
 
@@ -77,6 +161,10 @@ async function main() {
     });
 
     console.log({ event1 });
+
+    if (REGRESSION_ENABLED) {
+        await seedRegressionFixtures();
+    }
 
     console.log('Seeding finished.');
 }
