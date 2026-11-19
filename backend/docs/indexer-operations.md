@@ -3,10 +3,171 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the read-replica consistency and
+routing policy, the RPC provider cost/quota visibility, and the indexer
+metrics. It is written for operators and on-call engineers. All public
+interfaces described here are additive; existing endpoints and configuration
+keys keep working unless noted.
+
+---
+
+## 0. Read-replica consistency and routing policy
+
+### Routing defaults
+
+API reads are routed by an explicit policy. Each read is classified as either
+**replica-eligible** or **primary-only**. The default is conservative: reads
+that are not explicitly classified as replica-eligible go to the primary.
+
+| Read class | Default route | Rationale |
+| --- | --- | --- |
+| Authorization / auth-sensitive reads (session, wallet ownership, admin checks) | **Primary** | Must never observe stale authorization state |
+| Read-after-write (a client reading data it just wrote) | **Primary** | Preserves read-your-writes for the caller |
+| Financial accounting reads (balances, ledger-derived totals) | **Primary** | Accounting invariants require the authoritative ledger |
+| Chain/network validation reads | **Primary** | Validation must see the canonical chain state |
+| Public list/history/analytics reads (streams, events, pagination) | **Replica** (when a replica is configured and caught up) | Tolerant of bounded lag; documented below |
+
+When no replica is configured, or the replica is behind the required ledger,
+replica-eligible reads transparently fall back to the primary. Callers see no
+interface change.
+
+### Freshness requirement and lag measurement
+
+The indexer cursor records the last fully applied ledger. A replica is
+considered **caught up** when its observed cursor is at or beyond the
+**required ledger** for the read:
+
+- For replica-eligible reads the required ledger is the current primary
+  cursor minus the configured tolerance (`REPLICA_MAX_LAG_LEDGERS`).
+- Reads that require the latest ledger (read-after-write, accounting,
+  authorization, validation) always require the primary cursor and are never
+  served from a replica.
+
+Lag is measured as `primaryCursor - replicaCursor` in ledgers. A replica whose
+lag exceeds the tolerance is treated as **behind**.
+
+### Informing clients when a replica is behind
+
+Replica-eligible reads that cannot be served within tolerance fall back to the
+primary, so responses stay correct. To make staleness observable without
+breaking existing clients, responses served from a replica include an additive
+header:
+
+| Header | Meaning |
+| --- | --- |
+| `X-Read-Source` | `primary` or `replica` |
+| `X-Replica-Lag-Ledgers` | Observed lag in ledgers when served from a replica |
+
+If a caller explicitly requests replica routing (opt-in) and the replica is
+behind the required ledger, the request is served from the primary and the
+headers above reflect `primary`. Existing response bodies and status codes are
+unchanged; the headers are additive and safe to ignore.
+
+### Failover
+
+- If the replica is unreachable or errors, replica-eligible reads fail over to
+  the primary. Failover is logged and counted (see metrics).
+- If the primary is unavailable, primary-only reads fail with the existing
+  error contract; they are **never** silently served from a stale replica.
+- On replica promotion/failover, the new primary is authoritative; routing
+  policy is unchanged and lag is recomputed against the new primary cursor.
+
+### Configuration
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `REPLICA_DATABASE_URL` | Read-replica connection | Unset disables replica routing |
+| `REPLICA_MAX_LAG_LEDGERS` | Max tolerated lag for replica-eligible reads | Defaults are conservative |
+| `REPLICA_ROUTING_ENABLED` | Master switch for replica routing | Defaults to off until a replica is provisioned |
+
+### Guarantees preserved
+
+Replica routing never weakens wallet authorization, chain/network validation,
+financial accounting invariants, or secret handling: those reads are
+primary-only by policy and are not eligible for replica routing.
+
+---
+
+## 0.1 RPC provider cost and quota visibility
+
+The indexer talks to Soroban RPC providers. To let operators manage
+availability and cost, the indexer exposes **aggregate** RPC provider metrics
+grouped by network. Metrics never include request bodies, headers, API keys,
+URLs with credentials, or any other request secret.
+
+### Metrics
+
+All metrics are counters or gauges labeled by `network` (e.g. `testnet`,
+`mainnet`) and `provider` (a stable, non-secret provider identifier such as
+`primary` or `fallback-a`). Provider identifiers are configured names, never
+raw URLs or keys.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `rpc_requests_total` | counter | RPC requests attempted, by `network`, `provider`, `method` |
+| `rpc_request_errors_total` | counter | Failed RPC requests, by `network`, `provider`, `outcome` |
+| `rpc_quota_exhausted_total` | counter | Requests rejected because the provider quota was exhausted |
+| `rpc_quota_remaining` | gauge | Remaining quota reported by the provider, when available |
+| `rpc_failover_total` | counter | Failovers from one provider to another, by `network`, `from`, `to`, `reason` |
+| `rpc_failover_outcome_total` | counter | Result of a failover attempt, by `network`, `outcome` (`success`/`failure`) |
+| `rpc_latency_seconds` | histogram | Request latency, by `network`, `provider` |
+
+`outcome` values are bounded (`success`, `error`, `quota_exhausted`,
+`timeout`). Labels are bounded to configured networks and providers; no
+per-request or per-caller identifiers are emitted.
+
+### Quota transitions
+
+A provider moves through these states per network:
+
+1. **Available** — requests succeed; `rpc_quota_remaining` reflects the
+   provider's reported headroom when available.
+2. **Exhausted** — the provider returns a quota/rate-limit rejection. The
+   request is counted in `rpc_quota_exhausted_total`, the provider is marked
+   exhausted for the current window, and subsequent requests fail over to the
+   next configured provider.
+3. **Recovered** — once the quota window resets (or the provider reports
+   headroom again), the provider returns to **Available** and is eligible for
+   routing again.
+
+Transitions are logged at `warn` (exhausted) and `info` (recovered) with the
+network and provider identifier only. Quota state is per network; exhausting
+one network's provider does not affect another network.
+
+### Failover outcomes
+
+When a provider is exhausted or errors, the indexer fails over to the next
+configured provider for that network. Each attempt increments
+`rpc_failover_total` and its result increments `rpc_failover_outcome_total`.
+If all providers for a network are exhausted, requests fail with the existing
+error contract; the indexer does not silently weaken chain/network validation
+or secret handling to keep serving.
+
+### Provider-specific limits and alerting
+
+Configure per-provider limits so the indexer can fail over before hard
+rejection. Limits are provider-specific; consult each provider's plan.
+
+| Key | Meaning | Notes |
+| --- | --- | --- |
+| `RPC_PROVIDERS` | Ordered provider list per network | Names only; credentials via secret store |
+| `RPC_PROVIDER_QUOTA_LIMIT` | Requests per window per provider | Provider-specific; see plan |
+| `RPC_PROVIDER_QUOTA_WINDOW_MS` | Quota window length | Match the provider's reset window |
+| `RPC_QUOTA_WARN_RATIO` | Fraction of quota that triggers a warning | Defaults conservatively |
+
+Recommended alerts:
+
+- **Quota warning:** `rpc_quota_remaining / RPC_PROVIDER_QUOTA_LIMIT` below
+  `RPC_QUOTA_WARN_RATIO` for a sustained period — page the on-call owner.
+- **Quota exhausted:** any increase in `rpc_quota_exhausted_total` — page;
+  indicates active failover.
+- **Failover failure:** any increase in `rpc_failover_outcome_total{outcome="failure"}`
+  — page; a network may be unable to serve requests.
+- **Error rate:** sustained `rpc_request_errors_total` growth per provider —
+  investigate provider health.
+
+Alerts must reference only `network` and `provider` labels; never include
+request contents or credentials in alert annotations.
 
 ---
 
@@ -90,114 +251,4 @@ result ordering and pagination semantics.
 Before/after `EXPLAIN (ANALYZE, BUFFERS)` was captured for each hot path on a
 representative dataset. Summary:
 
-- **Stream list (keyset pagination):** before — sequential scan + sort;
-  after — index scan on `streams_created_at_id_idx`, no sort node, stable
-  ordering by `(created_at, id)`.
-- **Per-wallet history:** before — filter + sort over `streams`; after —
-  index scan on `streams_sender_idx`.
-- **Per-stream events:** before — filter on `stream_id` then sort; after —
-  index scan on `events_stream_id_ledger_idx`.
-- **Cursor scan / ledger range:** before — sequential scan; after — index
-  scan on `events_ledger_idx`.
-- **Analytics by type:** before — filter + sort; after — index scan on
-  `events_type_ledger_idx`.
-
-### Operational impact
-
-- Index creation takes a brief lock; on large tables run during a low-traffic
-  window or use the provided migration which creates indexes without blocking
-  writes where supported.
-- Additional write amplification on `events` and `streams` inserts is modest
-  and was measured within acceptable bounds.
-- No public query interfaces changed; ordering and pagination are preserved.
-
----
-
-## 3. Admin replay: preview and execution
-
-### Contract
-
-Replay is exposed under the existing admin replay controls. Two operations:
-
-- **Preview** (`preview`): computes the affected ledger range and the expected
-  record changes **without performing any writes**. Safe to call repeatedly.
-- **Execute** (`execute`): performs the replay and returns an execution report.
-  Supports retry.
-
-Both accept the same replay parameters as before (ledger range / target). The
-response is a **report** with the following fields:
-
-| Field | Description |
-| --- | --- |
-| `requestId` | Correlation ID for this preview/execute call |
-| `mode` | `preview` or `execute` |
-| `ledgerRange.from` / `ledgerRange.to` | Affected ledger range (inclusive) |
-| `expectedChanges` | Preview only: counts of records that would be created/updated/deleted |
-| `counts` | Execute only: records created/updated/deleted/skipped |
-| `durationMs` | Wall-clock duration of the operation |
-| `status` | `succeeded` / `failed` / `partial` |
-| `failurePosition` | On failure: the ledger at which execution stopped (null on success) |
-| `liveCursor` | The live indexer cursor after the operation |
-
-### Guarantees
-
-- **Preview performs no writes.** It is read-only and reproducible.
-- **Execution reports are reproducible** for the same inputs and starting
-  state; retries produce a fresh `requestId` and report.
-- **Live cursor is preserved on failure.** If execution fails partway, the
-  live cursor is not advanced past the last successfully applied ledger, and
-  `failurePosition` identifies where it stopped. Retry resumes from there.
-
-### Concurrency: replay vs. live polling
-
-Replay, reset, and normal polling all mutate the same shared cursor and event
-state, so they are **serialized** against each other. The serialization is
-enforced at the database layer (a transaction-scoped advisory lock keyed on the
-indexer cursor row), not in process memory, so it holds **across multiple
-backend instances**.
-
-- **Mutual exclusion.** While a replay (or reset) holds the lock, the live
-  worker cannot advance the cursor; while the live worker holds it, replay
-  waits. Operations queue rather than interleave.
-- **Monotonic cursor.** The cursor never moves backwards as a result of a
-  replay overlapping a poll. A replay that would move the cursor behind the
-  live position is rejected (reported as `status: failed` with a clear
-  message) instead of silently rewinding it.
-- **Deterministic event state.** Because replay and polling never run
-  concurrently, the resulting event state for a given starting state and
-  inputs is deterministic regardless of which replica handled the poll or the
-  replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
-
----
-
-## 4. Metrics
-
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
-
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+- **Stream list (keyset pagination):** be

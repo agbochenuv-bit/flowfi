@@ -60,6 +60,10 @@ scrape_configs:
 | `flowfi_rpc_requests_total` | Counter | `method`, `outcome` | `success` / `error` / `timeout` |
 | `flowfi_rpc_failovers_total` | Counter | `method` | Retries issued after a failed attempt |
 | `flowfi_rpc_circuit_breaker_trips_total` | Counter | `endpoint`, `method` | Calls that hit the deadline or exhausted retries |
+| `flowfi_rpc_provider_requests_total` | Counter | `network`, `provider`, `outcome` | Provider calls: `success` / `error` / `timeout` / `quota_exhausted` |
+| `flowfi_rpc_provider_failovers_total` | Counter | `network`, `from_provider`, `to_provider`, `reason` | Failover transitions between providers |
+| `flowfi_rpc_provider_quota_exhausted_total` | Counter | `network`, `provider` | Calls rejected because the provider quota was exhausted |
+| `flowfi_rpc_provider_quota_remaining` | Gauge | `network`, `provider` | Remaining quota reported by the provider (when known) |
 | `flowfi_db_query_duration_seconds` | Histogram | `operation` | Prisma/pg query latency, labelled `VERB:Table` |
 | `flowfi_db_pool_connections` | Gauge | `state` | `total` / `idle` / `waiting` (legacy aggregate) |
 | `flowfi_db_pool_total_connections` | Gauge | — | Live total connections held by the pg pool (sampled per scrape) |
@@ -73,12 +77,39 @@ scrape_configs:
 Route labels are collapsed to templates (`/streams/:id/events`), so a stream of
 concrete IDs does not explode series cardinality.
 
+RPC provider metrics are aggregated per `network` and `provider` only. They
+never carry request payloads, URLs, API keys, or other request secrets — the
+`provider` label is the operator-assigned name from configuration, not the
+endpoint URL.
+
+### RPC provider limits and quota
+
+Each configured provider has a per-network quota. When a provider reports
+quota exhaustion (HTTP 429 or a provider-specific quota error), the call is
+counted under `outcome="quota_exhausted"`, the provider is skipped for the
+remainder of the quota window, and the next provider in the network's failover
+order is tried. A failover transition is recorded in
+`flowfi_rpc_provider_failovers_total` with `reason="quota_exhausted"`.
+
+Provider-specific limits to watch:
+
+| Provider | Typical limit | Notes |
+| --- | --- | --- |
+| Self-hosted Soroban RPC | Connection/CPU bound | No quota; watch latency and breaker trips |
+| Managed RPC (per-plan) | Requests per second and per billing period | 429s surface as `quota_exhausted`; remaining quota is exposed when the provider returns it |
+
+When every provider for a network is exhausted, calls fail fast and the
+`flowfi_rpc_circuit_breaker_trips_total` counter rises for that endpoint.
+
 ### Alerting starting points
 
 | Alert | Expression |
 | --- | --- |
 | Indexer falling behind | `flowfi_indexer_lag_ledgers > 60 for 5m` |
 | RPC endpoint down | `rate(flowfi_rpc_circuit_breaker_trips_total[5m]) > 0` |
+| RPC quota exhaustion | `increase(flowfi_rpc_provider_quota_exhausted_total[15m]) > 0` |
+| RPC quota running low | `flowfi_rpc_provider_quota_remaining < 0.1 * <plan quota>` |
+| RPC failover storm | `rate(flowfi_rpc_provider_failovers_total[5m]) > 0.1` |
 | SSE saturation | `flowfi_sse_active_connections{topic="total"} / flowfi_sse_max_connections > 0.8` |
 | DB pool contention | `flowfi_db_pool_waiting_requests > 0 for 2m` |
 | Quarantined events | `increase(flowfi_indexer_events_processed_total{result="quarantined"}[1h]) > 0` |

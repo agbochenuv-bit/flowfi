@@ -8,7 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -192,32 +192,48 @@ model IndexerDeadLetterEvent {
   @@index([eventType])
 }
 
-// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
+// OperatorIdentity model - auditable inventory of privileged application and
+// deployment identities (issue #293). Stores only non-secret metadata: the
+// identity label, its kind (application/deployment/operator), and the owning
+// team. Credential material (tokens, private keys, passwords) MUST NEVER be
+// persisted here or emitted by the review workflow.
+model OperatorIdentity {
   id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  label         String   @unique // Human-readable identity name, e.g. "deploy-bot"
+  kind          String   // "application" | "deployment" | "operator"
+  ownerTeam     String   // Team accountable for the identity
+  description   String?
+  isActive      Boolean  @default(true) // false once access has been removed
+  lastReviewedAt DateTime? // Timestamp of the most recent completed review
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
+  reviews       AccessReview[]
+
+  @@index([kind])
+  @@index([ownerTeam])
+  @@index([isActive])
+  @@index([lastReviewedAt])
 }
 
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
+// AccessReview model - records the reviewer, timestamp, and outcome of a
+// periodic access review for an OperatorIdentity (issue #293). Outcomes are
+// constrained to a small vocabulary so stale-identity detection and removal
+// decisions stay auditable. No credential material is ever stored here.
+model AccessReview {
+  id           String   @id @default(uuid())
+  identityId   String
+  reviewer     String   // Reviewer identifier (email or handle), never a secret
+  reviewedAt   DateTime @default(now())
+  outcome      String   // "retained" | "removed" | "flagged_stale"
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  identity     OperatorIdentity @relation(fields: [identityId], references: [id], onDelete: Cascade)
+
+  @@index([identityId])
+  @@index([reviewedAt])
+  @@index([outcome])
 }
+
+// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.

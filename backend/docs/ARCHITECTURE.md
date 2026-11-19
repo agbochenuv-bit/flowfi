@@ -11,6 +11,67 @@ timing, environment variables, and operational runbook) see
 
 ---
 
+## Read-Replica Consistency and Routing Policy
+
+API reads may be served from a read replica, but only when the read is not
+sensitive to replication lag. Authorization-sensitive reads and read-after-write
+reads must always hit the primary. This section defines the routing defaults and
+the client-visible signal used when a replica is behind the required ledger.
+
+### Routing Defaults
+
+| Read category | Route | Rationale |
+|---------------|-------|-----------|
+| Authorization / ownership checks (wallet auth, stream ownership, admin gating) | **Primary** | A stale replica could grant or deny access incorrectly. Never route these to a replica. |
+| Read-after-write (a client reading a resource it just mutated) | **Primary** | Guarantees the client observes its own write. |
+| Financial accounting reads (balances, withdrawn amounts, fee totals) | **Primary** | Preserves accounting invariants; lag could surface inconsistent totals. |
+| Chain/network validation reads (ledger cursor, contract state checks) | **Primary** | Must reflect the latest validated ledger. |
+| Public, non-sensitive listing reads (stream lists, event feeds, protocol stats) | **Replica allowed** | Tolerant of bounded lag; falls back to primary when lag exceeds the threshold. |
+
+When in doubt, route to the primary. Replica routing is opt-in per read, not the
+default.
+
+### Lag Measurement Against the Required Ledger
+
+Each replica read declares a **required ledger** — the minimum ledger the caller
+needs to observe. The replica reports its applied ledger; lag is measured as:
+
+```
+lag = requiredLedger - replicaAppliedLedger
+```
+
+- `lag <= 0` → the replica is caught up; serve the read.
+- `lag > 0` → the replica is behind the required ledger; do **not** serve stale
+data silently.
+
+### Client Signal When a Replica Is Behind
+
+When a replica is behind the required ledger, the API does not return stale data
+as if it were current. Instead it either:
+
+1. **Falls back to the primary** for that read (default for replica-eligible
+   reads), or
+2. **Returns a lag signal** when fallback is not possible, using a documented
+   response header/error so clients can retry against the primary.
+
+This keeps existing response shapes compatible: successful responses are
+unchanged, and the lag signal is additive (header/error code) rather than a
+breaking change to the payload.
+
+### Failover and Read-After-Write
+
+- **Failover:** if the replica is unreachable, replica-eligible reads fall back
+  to the primary. Authorization, accounting, and chain-validation reads already
+  target the primary and are unaffected.
+- **Read-after-write:** reads following a mutation are pinned to the primary for
+  the consistency window so clients always observe their own writes.
+
+These defaults preserve wallet authorization, chain/network validation,
+financial accounting invariants, and secret-handling; replica routing never
+weakens them.
+
+---
+
 ## Indexer Ownership Model
 
 Three files with overlapping names handle indexing and indexer management. Only
@@ -166,26 +227,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
