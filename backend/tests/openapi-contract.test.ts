@@ -97,4 +97,83 @@ describe('OpenAPI Contract Verification Suite', () => {
       }
     });
   });
+
+  describe('Statement Export Contract', () => {
+    const exportPaths = [
+      { path: '/v1/exports', method: 'post' },
+      { path: '/v1/exports/{jobId}', method: 'get' },
+      { path: '/v1/exports/{jobId}/download', method: 'get' },
+      { path: '/v1/exports/{jobId}/cancel', method: 'post' },
+    ];
+
+    it('documents all resumable export endpoints', () => {
+      for (const { path: routePath, method } of exportPaths) {
+        const pathItem = openapiSpec.paths[routePath];
+        expect(pathItem, `missing path ${routePath}`).toBeDefined();
+        expect(pathItem[method], `missing ${method} ${routePath}`).toBeDefined();
+      }
+    });
+
+    it('requires bearer auth on every export endpoint', () => {
+      for (const { path: routePath, method } of exportPaths) {
+        const operation = openapiSpec.paths[routePath][method];
+        expect(operation.security, `missing security on ${method} ${routePath}`).toBeDefined();
+        expect(operation.security).toEqual(
+          expect.arrayContaining([expect.objectContaining({ bearerAuth: expect.any(Array) })]),
+        );
+      }
+    });
+
+    it('defines the ExportJob schema with ownership, expiry, and status fields', () => {
+      const jobSchema = openapiSpec.components.schemas.ExportJob;
+      expect(jobSchema).toBeDefined();
+      const props = jobSchema.properties;
+      expect(props).toBeDefined();
+      for (const field of ['id', 'status', 'format', 'expiresAt', 'createdAt']) {
+        expect(props[field], `ExportJob missing ${field}`).toBeDefined();
+      }
+      expect(jobSchema.required).toEqual(
+        expect.arrayContaining(['id', 'status', 'format', 'expiresAt']),
+      );
+    });
+
+    it('documents the export column schema and timezone rules', () => {
+      const columnSchema =
+        openapiSpec.components.schemas.ExportColumn ??
+        openapiSpec.components.schemas.ExportColumnSchema;
+      expect(columnSchema).toBeDefined();
+      expect(columnSchema.properties).toBeDefined();
+      expect(columnSchema.properties.name).toBeDefined();
+      expect(columnSchema.properties.type).toBeDefined();
+
+      const createOp = openapiSpec.paths['/v1/exports'].post;
+      const description = JSON.stringify(createOp);
+      expect(description).toMatch(/UTC/);
+      expect(description).toMatch(/column/i);
+    });
+
+    it('documents the COST_BUDGET_EXCEEDED error variant', () => {
+      const errorSchema = openapiSpec.components.schemas.Error;
+      expect(errorSchema).toBeDefined();
+      const serialized = JSON.stringify(errorSchema);
+      expect(serialized).toContain('COST_BUDGET_EXCEEDED');
+
+      const createOp = openapiSpec.paths['/v1/exports'].post;
+      expect(createOp.responses['429']).toBeDefined();
+    });
+
+    it('rejects unauthenticated export requests with HTTP 401', async () => {
+      const res = await request(app).post('/v1/exports').send({});
+      expect(res.status).toBe(401);
+      expect(res.headers['content-type']).toMatch(/json/);
+      expect(res.body).toHaveProperty('error');
+    });
+
+    it('produces a structurally valid and reproducible spec', () => {
+      const reparsed = JSON.parse(JSON.stringify(openapiSpec));
+      expect(reparsed).toEqual(openapiSpec);
+      expect(openapiSpec.paths['/v1/exports'].post.responses).toBeDefined();
+      expect(Object.keys(openapiSpec.paths['/v1/exports'].post.responses).length).toBeGreaterThan(0);
+    });
+  });
 });

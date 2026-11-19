@@ -1,4 +1,10 @@
-import type { BackendStream } from "@/lib/api-types";
+import type {
+  BackendStream,
+  RecurringSchedule,
+  RecurringScheduleCreateRequest,
+  ScheduleFundingPreview,
+  ScheduleRun,
+} from "@/lib/api-types";
 import { TOKEN_ADDRESSES } from "@/lib/soroban";
 import { shortenPublicKey } from "@/lib/wallet";
 import {
@@ -106,4 +112,210 @@ export async function fetchIncomingStreams(
   }
 
   throw lastError ?? new Error("Failed to fetch incoming streams from backend.");
+}
+
+// ---------------------------------------------------------------------------
+// Recurring payment schedules
+// ---------------------------------------------------------------------------
+
+export interface RecurringScheduleRecord {
+  id: string;
+  scheduleId: number;
+  sender: string;
+  senderDisplay: string;
+  recipient: string;
+  recipientDisplay: string;
+  token: string;
+  tokenAddress: string;
+  amountPerRun: number;
+  intervalSeconds: number;
+  nextRunAt: number;
+  remainingRuns: number;
+  status: RecurringSchedule["status"];
+  /** Each generated stream is tracked as its own payment obligation. */
+  runs: ScheduleRun[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ScheduleFundingPreviewRecord {
+  scheduleId: number;
+  token: string;
+  tokenAddress: string;
+  requiredAmount: number;
+  availableBalance: number;
+  shortfall: number;
+  sufficient: boolean;
+  nextRunAt: number;
+  checkedAt: number;
+}
+
+interface ScheduleListResponse {
+  data?: RecurringSchedule[];
+}
+
+interface ScheduleFundingPreviewResponse {
+  data?: ScheduleFundingPreview;
+}
+
+function resolveScheduleEndpointCandidates(): string[] {
+  return getStreamsEndpointCandidates().map((endpoint) =>
+    endpoint.replace(/\/streams\/?$/, "/schedules"),
+  );
+}
+
+function mapScheduleRun(run: ScheduleRun): ScheduleRun {
+  return {
+    ...run,
+    amount: toTokenAmount(run.amount),
+  };
+}
+
+function mapRecurringSchedule(schedule: RecurringSchedule): RecurringScheduleRecord {
+  return {
+    id: schedule.id,
+    scheduleId: schedule.scheduleId,
+    sender: schedule.sender,
+    senderDisplay: shortenPublicKey(schedule.sender),
+    recipient: schedule.recipient,
+    recipientDisplay: shortenPublicKey(schedule.recipient),
+    token: resolveTokenLabel(schedule.tokenAddress),
+    tokenAddress: schedule.tokenAddress,
+    amountPerRun: toTokenAmount(schedule.amountPerRun),
+    intervalSeconds: schedule.intervalSeconds,
+    nextRunAt: schedule.nextRunAt,
+    remainingRuns: schedule.remainingRuns,
+    status: schedule.status,
+    runs: (schedule.runs ?? []).map(mapScheduleRun),
+    createdAt: schedule.createdAt,
+    updatedAt: schedule.updatedAt,
+  };
+}
+
+function mapFundingPreview(
+  preview: ScheduleFundingPreview,
+): ScheduleFundingPreviewRecord {
+  return {
+    scheduleId: preview.scheduleId,
+    token: resolveTokenLabel(preview.tokenAddress),
+    tokenAddress: preview.tokenAddress,
+    requiredAmount: toTokenAmount(preview.requiredAmount),
+    availableBalance: toTokenAmount(preview.availableBalance),
+    shortfall: toTokenAmount(preview.shortfall),
+    sufficient: preview.sufficient,
+    nextRunAt: preview.nextRunAt,
+    checkedAt: preview.checkedAt,
+  };
+}
+
+async function requestScheduleEndpoint<T>(
+  path: string,
+  init: RequestInit,
+  timeoutMs: number,
+  authToken?: string | null,
+): Promise<T> {
+  const endpoints = resolveScheduleEndpointCandidates();
+  let lastError: Error | null = null;
+
+  for (const endpoint of endpoints) {
+    const response = await fetchWithTimeout(
+      `${endpoint}${path}`,
+      {
+        ...init,
+        headers: {
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
+          ...(init.headers ?? {}),
+        },
+      },
+      timeoutMs,
+    );
+
+    if (response.ok) {
+      return (await response.json()) as T;
+    }
+
+    if (response.status === 404) {
+      lastError = new Error(`Endpoint not found: ${endpoint}${path}`);
+      continue;
+    }
+
+    lastError = new Error(
+      `Schedule request failed (${response.status}) from ${endpoint}${path}`,
+    );
+  }
+
+  throw lastError ?? new Error("Failed to reach schedule backend.");
+}
+
+export async function fetchRecurringSchedules(
+  ownerPublicKey: string,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord[]> {
+  const params = new URLSearchParams({
+    owner: ownerPublicKey,
+    sort: "nextRunAt",
+    order: "asc",
+    limit: "100",
+  });
+  const payload = await requestScheduleEndpoint<
+    RecurringSchedule[] | ScheduleListResponse
+  >(`?${params.toString()}`, { method: "GET" }, timeoutMs, authToken);
+  const schedules = Array.isArray(payload) ? payload : payload.data ?? [];
+  return schedules.map(mapRecurringSchedule);
+}
+
+export async function createRecurringSchedule(
+  request: RecurringScheduleCreateRequest,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    "",
+    { method: "POST", body: JSON.stringify(request) },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function pauseRecurringSchedule(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    `/${scheduleId}/pause`,
+    { method: "POST" },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function cancelRecurringSchedule(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<RecurringScheduleRecord> {
+  const payload = await requestScheduleEndpoint<RecurringSchedule>(
+    `/${scheduleId}/cancel`,
+    { method: "POST" },
+    timeoutMs,
+    authToken,
+  );
+  return mapRecurringSchedule(payload);
+}
+
+export async function fetchScheduleFundingPreview(
+  scheduleId: number,
+  timeoutMs: number = DEFAULT_FETCH_TIMEOUT_MS,
+  authToken?: string | null,
+): Promise<ScheduleFundingPreviewRecord> {
+  const payload = await requestScheduleEndpoint<
+    ScheduleFundingPreview | ScheduleFundingPreviewResponse
+  >(`/${scheduleId}/funding-preview`, { method: "GET" }, timeoutMs, authToken);
+  const preview = "data" in payload && payload.data ? payload.data : payload;
+  return mapFundingPreview(preview as ScheduleFundingPreview);
 }

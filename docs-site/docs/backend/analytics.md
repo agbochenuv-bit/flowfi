@@ -135,6 +135,147 @@ network's data.
   aggregates continue to be used; only query boundary computation and the
   caching layer change.
 
+## Asynchronous statement exports (#238)
+
+Large activity and payment statements are generated as **bounded background
+jobs** instead of being streamed from a long-lived HTTP request. Clients
+create a job, poll its status, and download the finished artifact; they may
+also cancel it.
+
+### Lifecycle
+
+| Step | Endpoint | Notes |
+|---|---|---|
+| Create | `POST /api/v1/exports` | Returns `202` with `{ id, status, expiresAt }` |
+| Status | `GET /api/v1/exports/:id` | Returns job state, progress and, when ready, `downloadUrl` |
+| Download | `GET /api/v1/exports/:id/download` | Streams the artifact once `status = completed` |
+| Cancel | `DELETE /api/v1/exports/:id` | Transitions a pending/running job to `cancelled` |
+
+Job states: `pending → running → completed | failed | cancelled | expired`.
+
+### Ownership and authorization
+
+- Every job is bound to the **authenticated wallet** that created it. The
+  owner is recorded at creation time and never derived from request
+  parameters.
+- Status, download and cancel requests are authorized against the job owner.
+  A caller that does not own the job receives `404` (not `403`) so job ids
+  cannot be probed for existence.
+- Download authorization is re-checked at download time, not only at creation
+  time, so a revoked session cannot fetch an artifact created earlier.
+
+### Expiry and cleanup
+
+- Each job has an `expiresAt` (TTL from completion, or from creation for jobs
+  that never complete). Expired jobs are no longer downloadable and report
+  `status = expired`.
+- A background sweeper deletes expired job rows and their stored artifacts.
+  Operators should monitor sweeper lag; artifacts are not retained past the
+  TTL.
+
+### Cancellation semantics
+
+- Cancelling a `pending` job prevents it from starting.
+- Cancelling a `running` job signals the worker to stop at the next page
+  boundary; the job ends `cancelled` and no partial artifact is downloadable.
+- Cancelling a terminal job is a no-op that returns the current state.
+
+### Snapshot consistency and retries
+
+- A job captures a **snapshot boundary** (a high-water mark of indexed
+  events) at creation. All pages are read against that boundary, so a
+  multi-page export is internally consistent even if new events are indexed
+  while the job runs.
+- Workers process the export in bounded pages. If a page fails transiently,
+  the worker retries that page from its last committed cursor; already
+  committed pages are not re-read, so retries cannot duplicate or drop rows.
+- A job that exhausts its retry budget ends `failed`; the client may create a
+  new job (which takes a fresh snapshot).
+
+## Accounting-friendly wallet activity export (#239)
+
+The wallet activity export produces a reproducible statement of stream
+lifecycle and payment records suitable for accounting import.
+
+### Column schema
+
+| Column | Type | Units / format |
+|---|---|---|
+| `event_id` | string | Stable event identifier |
+| `occurred_at` | ISO-8601 | **UTC**, explicit `Z` suffix |
+| `event_type` | enum | `stream_created`, `stream_cancelled`, `stream_completed`, `payment` |
+| `stream_id` | string | Stream reference |
+| `network` | string | Network identifier the event belongs to |
+| `tx_hash` | string | Transaction reference (chain hash) |
+| `tx_index` | integer | Log index within the transaction |
+| `token` | string | Token/asset identifier |
+| `amount_raw` | string | Integer base units, **no decimals applied** |
+| `decimals` | integer | Decimals for `token`; apply to `amount_raw` to get display units |
+| `amount_display` | string | `amount_raw` scaled by `decimals` (decimal string) |
+
+### Units and timezone rules
+
+- Amounts are exported in **raw base units** with an explicit `decimals`
+  column; consumers must not assume a fixed number of decimals. The
+  `amount_display` column is provided for convenience and is a decimal string,
+  never a float.
+- All timestamps are **UTC** with an explicit `Z` suffix; no local-time
+  conversion is performed server-side.
+- Every row carries its `network` and `tx_hash`/`tx_index` so records can be
+  reconciled against the chain.
+
+### Limits and ownership
+
+- Exports are scoped to the requesting wallet; rows for wallets the caller
+  does not own are never included.
+- Large result sets are bounded by the export page/row limits; requests that
+  exceed the configured maximum are rejected with a cost-budget error (see
+  below) rather than silently truncated.
+- The export is round-trip parseable: the documented schema is stable and
+  machine-readable (CSV/JSON) so a consumer can re-import it losslessly.
+
+## Request cost budgets (#250)
+
+Expensive read operations (analytics, exports, multi-resource queries) are
+governed by a **complexity budget** in addition to per-request rate limits.
+
+### Cost units
+
+Each route declares a cost in abstract units; the request's total cost is
+compared against the caller's budget for the window.
+
+| Route | Cost units |
+|---|---|
+| `GET /api/v1/analytics/tvl` | 1 |
+| `GET /api/v1/analytics/historical` | 2 |
+| `GET /api/v1/analytics/defillama` | 1 |
+| `POST /api/v1/exports` | 10 |
+| `GET /api/v1/exports/:id` | 1 |
+| `GET /api/v1/exports/:id/download` | 5 |
+
+Cheap requests (single-resource reads, status polls) cost 1 unit and remain
+unaffected by the budget under normal usage.
+
+### Client-facing limit errors
+
+When a request would exceed the budget, the API responds `429` with:
+
+```json
+{ "error": "COST_BUDGET_EXCEEDED", "retryAfter": 30 }
+```
+
+Clients should back off for `retryAfter` seconds before retrying.
+
+## Operational notes
+
+- **Worker processing.** Export jobs are processed by a bounded worker pool;
+  concurrency and page size are configurable. A backlog of jobs does not
+  affect interactive endpoints.
+- **Expiry cleanup.** A periodic sweeper removes expired jobs and artifacts.
+  Monitor job age and sweeper lag; artifacts are deleted at expiry.
+- **Budgets.** Cost budgets are enforced per caller per window; tune the
+  window and per-route costs via configuration if exposed.
+
 ## Degradation
 
 If the TimescaleDB extension or the hypertable is missing, `/tvl` falls back

@@ -50,6 +50,26 @@ const errorResponses = {
     description: 'Rate limit exceeded',
     content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
   },
+  CostBudgetExceeded: {
+    description:
+      'Request exceeds the per-route complexity budget (HTTP 429, `error.code = COST_BUDGET_EXCEEDED`). ' +
+      'The `Retry-After` header indicates when the budget window resets. Cheap requests are unaffected.',
+    headers: {
+      'Retry-After': {
+        description: 'Seconds until the cost budget window resets',
+        schema: { type: 'integer', example: 30 },
+      },
+      'X-Cost-Budget-Limit': {
+        description: 'Cost units allowed for this route within the window',
+        schema: { type: 'integer', example: 100 },
+      },
+      'X-Cost-Budget-Remaining': {
+        description: 'Cost units remaining in the current window',
+        schema: { type: 'integer', example: 0 },
+      },
+    },
+    content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
+  },
   InternalServerError: {
     description: 'Unexpected server error',
     content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
@@ -85,7 +105,31 @@ FlowFi API supports sandbox mode for testing without affecting production data.
 
 See [Sandbox Mode Documentation](../docs/SANDBOX_MODE.md) for details.
 
+## Exports (resumable, asynchronous)
+
+Large activity and payment statements are generated as bounded background jobs so clients never
+hold a long HTTP request open:
+
+1. \`POST /v1/exports\` creates a job owned by the authenticated wallet.
+2. \`GET /v1/exports/{jobId}\` polls status; clients resume from \`nextPage\` after a disconnect.
+3. \`GET /v1/exports/{jobId}/download\` streams the artifact (or a single page) once \`completed\`.
+4. \`DELETE /v1/exports/{jobId}\` cancels a non-terminal job.
+
+Jobs are wallet-scoped (cross-wallet access returns \`404\`), expire after a bounded TTL, and are
+computed against a single snapshot so multi-page downloads are consistent. See the
+\`ExportJob\` and \`ExportColumn\` schemas for the full contract, including the UTC timestamp rule
+and the amount/unit/decimals rule.
+
+## Request cost budgets
+
+Expensive read routes (analytics, exports, multi-resource queries) enforce a per-route
+complexity budget in addition to request-count rate limits. When a request would exceed the
+budget the API returns \`429\` with \`error.code = "COST_BUDGET_EXCEEDED"\`, a \`Retry-After\`
+header, and a \`limit\` object describing the route, cost, limit and remaining units. Cheap
+requests are unaffected.
+
 ## Error Envelope (v1)
+=======
 
 All REST endpoints return a stable, versioned error envelope on failure:
 
@@ -151,6 +195,13 @@ consumers are unaffected. Unknown codes should be treated as generic failures.`,
       {
         name: 'Observability',
         description: 'Prometheus metrics scrape endpoint',
+      },
+      {
+        name: 'Exports',
+        description:
+          'Resumable, asynchronous wallet activity and payment statement exports. ' +
+          'Jobs are owned by the authenticated wallet, expire after a bounded TTL, can be cancelled, ' +
+          'and downloads require the same wallet authorization as the creating request.',
       },
     ],
     components: {
@@ -521,6 +572,143 @@ consumers are unaffected. Unknown codes should be treated as generic failures.`,
             createdAt: { type: 'string', format: 'date-time' },
           },
         },
+        ExportJobStatus: {
+          type: 'string',
+          enum: ['queued', 'running', 'completed', 'failed', 'cancelled', 'expired'],
+          description:
+            'Lifecycle of an export job. Terminal states are `completed`, `failed`, `cancelled` and `expired`; ' +
+            '`expired` is reached when the job outlives its TTL before completion.',
+          example: 'running',
+        },
+        ExportFormat: {
+          type: 'string',
+          enum: ['csv', 'json'],
+          description: 'Serialization of the export artifact. CSV uses the documented column schema.',
+          example: 'csv',
+        },
+        ExportJob: {
+          type: 'object',
+          description: `A resumable asynchronous export job.
+
+**Ownership:** a job is bound to the wallet that created it. Any request for the job
+(status, download, cancel) from a different wallet returns \`404 NOT_FOUND\` so job existence
+is not leaked.
+
+**Expiry:** jobs expire after \`expiresAt\`. Expired jobs cannot be downloaded and are reported
+with \`status = "expired"\`.
+
+**Cancellation:** \`DELETE /v1/exports/{jobId}\` moves a non-terminal job to \`cancelled\`.
+Cancelling a terminal job is idempotent.
+
+**Snapshot consistency:** the export is computed against a single snapshot taken when the job
+starts, so multi-page downloads never observe rows added or removed mid-export.`,
+          required: ['jobId', 'wallet', 'status', 'format', 'createdAt', 'expiresAt'],
+          properties: {
+            jobId: { type: 'string', format: 'uuid', description: 'Stable identifier used to resume polling and download' },
+            wallet: { type: 'string', description: 'Stellar public key that owns the job' },
+            status: { $ref: '#/components/schemas/ExportJobStatus' },
+            format: { $ref: '#/components/schemas/ExportFormat' },
+            createdAt: { type: 'string', format: 'date-time', description: 'Job creation time (UTC)' },
+            startedAt: { type: 'string', format: 'date-time', nullable: true, description: 'When processing began (UTC)' },
+            completedAt: { type: 'string', format: 'date-time', nullable: true, description: 'When the job reached a terminal state (UTC)' },
+            expiresAt: { type: 'string', format: 'date-time', description: 'After this instant the job can no longer be downloaded' },
+            snapshotAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'Instant the underlying data snapshot was taken; all pages of the export are consistent with it',
+            },
+            rowCount: { type: 'integer', nullable: true, description: 'Number of rows in the completed export' },
+            pageCount: { type: 'integer', nullable: true, description: 'Number of pages in the completed export' },
+            nextPage: {
+              type: 'integer',
+              nullable: true,
+              description: 'Next page to fetch when resuming a partially downloaded export; null when complete',
+            },
+            downloadUrl: {
+              type: 'string',
+              nullable: true,
+              description: 'Relative URL to download the artifact; only present while status is `completed` and the job has not expired',
+              example: '/v1/exports/3f1c2b9e-8a4d-4c6e-9f2a-1b7d5e0c9a83/download',
+            },
+            error: {
+              type: 'object',
+              nullable: true,
+              description: 'Present when status is `failed`',
+              properties: {
+                code: { type: 'string', example: 'EXPORT_FAILED' },
+                message: { type: 'string', description: 'Safe failure summary; internal exception text is never exposed' },
+              },
+            },
+          },
+        },
+        CreateExportRequest: {
+          type: 'object',
+          required: ['kind'],
+          properties: {
+            kind: {
+              type: 'string',
+              enum: ['activity', 'payments'],
+              description: '`activity` exports stream lifecycle events; `payments` exports payment records',
+              example: 'activity',
+            },
+            format: { $ref: '#/components/schemas/ExportFormat' },
+            from: { type: 'string', format: 'date-time', description: 'Inclusive lower bound on event time (UTC)' },
+            to: { type: 'string', format: 'date-time', description: 'Exclusive upper bound on event time (UTC)' },
+            networkId: {
+              type: 'string',
+              description: 'Stellar network identifier the export is scoped to (e.g. `testnet`, `pubnet`)',
+              example: 'testnet',
+            },
+          },
+        },
+        ExportColumn: {
+          type: 'object',
+          description: `Column schema for accounting-friendly exports. Every export carries explicit units,
+network identifiers and transaction references so it can be reproduced and reconciled.
+
+**Timezone rule:** all timestamps are emitted in UTC, ISO-8601 with a trailing \`Z\`
+(e.g. \`2024-02-21T16:00:00Z\`). No local-time conversion is performed.
+
+**Amount rule:** amounts are emitted as integer base units in a string field, with the token
+decimals and unit recorded alongside so the value can be reconstructed exactly.`,
+          required: ['timestamp', 'streamId', 'eventType', 'direction', 'amount', 'unit', 'decimals', 'networkId', 'txHash'],
+          properties: {
+            timestamp: { type: 'string', format: 'date-time', description: 'Event time in UTC (ISO-8601, trailing Z)' },
+            streamId: { type: 'integer', description: 'On-chain stream ID' },
+            eventType: {
+              type: 'string',
+              enum: ['CREATED', 'TOPPED_UP', 'WITHDRAWN', 'CANCELLED', 'COMPLETED', 'PAUSED', 'RESUMED', 'FEE_COLLECTED'],
+              description: 'Stream lifecycle event type',
+            },
+            direction: {
+              type: 'string',
+              enum: ['in', 'out'],
+              description: 'Whether the record credits (`in`) or debits (`out`) the exporting wallet',
+            },
+            amount: { type: 'string', description: 'Amount in integer base units (i128 as string)' },
+            unit: { type: 'string', description: 'Token unit/symbol the amount is denominated in', example: 'USDC' },
+            decimals: { type: 'integer', description: 'Number of decimals for the unit', example: 7 },
+            networkId: { type: 'string', description: 'Stellar network identifier', example: 'testnet' },
+            txHash: { type: 'string', description: 'Stellar transaction hash for the record' },
+            ledgerSequence: { type: 'integer', description: 'Ledger sequence number' },
+          },
+        },
+        ExportPage: {
+          type: 'object',
+          required: ['jobId', 'page', 'pageCount', 'rows'],
+          properties: {
+            jobId: { type: 'string', format: 'uuid' },
+            page: { type: 'integer', description: 'Zero-based page index' },
+            pageCount: { type: 'integer', description: 'Total number of pages in the export' },
+            nextPage: { type: 'integer', nullable: true, description: 'Next page index, or null when this is the last page' },
+            rows: {
+              type: 'array',
+              description: 'Rows for this page, each conforming to the export column schema',
+              items: { $ref: '#/components/schemas/ExportColumn' },
+            },
+          },
+        },
         HealthResponse: {
           type: 'object',
           required: ['status', 'db', 'indexerEnabled', 'uptime', 'checks'],
@@ -595,6 +783,7 @@ rely on \`error.requestId\` for correlation and \`error.details\` for structured
                     'NOT_FOUND',
                     'CONFLICT',
                     'RATE_LIMITED',
+                    'COST_BUDGET_EXCEEDED',
                     'PAYLOAD_TOO_LARGE',
                     'UNSUPPORTED_MEDIA_TYPE',
                     'UPSTREAM_UNAVAILABLE',
@@ -606,6 +795,19 @@ rely on \`error.requestId\` for correlation and \`error.details\` for structured
                   type: 'string',
                   description: 'Safe human-readable message; never contains internal exception text',
                   example: 'Resource not found',
+                },
+                limit: {
+                  type: 'object',
+                  nullable: true,
+                  description:
+                    'Present when `code = COST_BUDGET_EXCEEDED`. Describes the per-route cost budget that was exceeded.',
+                  properties: {
+                    route: { type: 'string', description: 'Route whose cost budget was exceeded', example: 'GET /v1/exports' },
+                    cost: { type: 'integer', description: 'Cost units the request would have consumed', example: 120 },
+                    limit: { type: 'integer', description: 'Cost units allowed for this route within the window', example: 100 },
+                    remaining: { type: 'integer', description: 'Cost units remaining in the current window', example: 0 },
+                    retryAfterSeconds: { type: 'integer', description: 'Seconds until the budget window resets', example: 30 },
+                  },
                 },
                 requestId: {
                   type: 'string',

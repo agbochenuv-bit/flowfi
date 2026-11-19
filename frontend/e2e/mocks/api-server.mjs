@@ -24,6 +24,101 @@ const WITHDRAW_BATCH = BigInt("100000000"); // 10 USDC per simulated withdrawal
 
 const accountSequence = ["1"];
 
+// ── Recurring payment schedule fixtures ──────────────────────────────────────
+// Each schedule generates one stream (payment obligation) per run. The mock
+// keeps a small deterministic set of schedules covering the happy path plus the
+// failure states the e2e suite must exercise: missed run, insufficient funds,
+// cancellation, and wallet/network mismatch.
+
+const SCHEDULE_INTERVAL_SECONDS = 86400; // daily
+const SCHEDULE_FUNDING_AMOUNT = "500000000"; // 50 USDC per run (7 decimals)
+const SCHEDULE_FUNDING_FEE = "100000"; // 0.01 USDC network fee estimate
+
+function createSchedule(overrides = {}) {
+  const base = {
+    id: "sched-1",
+    owner: SESSION_PUBLIC_KEY,
+    recipient: RECIPIENT_PUBLIC_KEY,
+    tokenAddress: USDC_ADDRESS,
+    amountPerRun: SCHEDULE_FUNDING_AMOUNT,
+    intervalSeconds: SCHEDULE_INTERVAL_SECONDS,
+    networkPassphrase: Networks.TESTNET,
+    status: "active",
+    nextRunAt: nowSec() + SCHEDULE_INTERVAL_SECONDS,
+    lastRunAt: nowSec() - SCHEDULE_INTERVAL_SECONDS,
+    runCount: 1,
+    missedRuns: 0,
+    availableBalance: "10000000000", // 1,000 USDC
+    createdAt: new Date(Date.now() - 2 * SCHEDULE_INTERVAL_SECONDS * 1000).toISOString(),
+    updatedAt: new Date().toISOString(),
+    streams: [
+      {
+        id: "42",
+        streamId: 42,
+        runIndex: 0,
+        status: "active",
+        amount: SCHEDULE_FUNDING_AMOUNT,
+        createdAt: new Date(Date.now() - SCHEDULE_INTERVAL_SECONDS * 1000).toISOString(),
+      },
+    ],
+  };
+  return { ...base, ...overrides };
+}
+
+let schedules = [
+  createSchedule(),
+  createSchedule({
+    id: "sched-missed",
+    status: "active",
+    nextRunAt: nowSec() - 7200,
+    lastRunAt: nowSec() - SCHEDULE_INTERVAL_SECONDS - 7200,
+    missedRuns: 1,
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-insufficient",
+    status: "active",
+    availableBalance: "10000000", // 1 USDC — below the 50 USDC run cost
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-cancelled",
+    status: "cancelled",
+    nextRunAt: null,
+    streams: [],
+  }),
+  createSchedule({
+    id: "sched-network-mismatch",
+    status: "active",
+    networkPassphrase: Networks.PUBLIC,
+    streams: [],
+  }),
+];
+
+function findSchedule(id) {
+  return schedules.find((s) => s.id === id) ?? null;
+}
+
+function scheduleFundingPreview(schedule) {
+  const amount = BigInt(schedule.amountPerRun);
+  const fee = BigInt(SCHEDULE_FUNDING_FEE);
+  const available = BigInt(schedule.availableBalance);
+  const required = amount + fee;
+  return {
+    scheduleId: schedule.id,
+    amountPerRun: schedule.amountPerRun,
+    estimatedFee: SCHEDULE_FUNDING_FEE,
+    totalRequired: required.toString(),
+    availableBalance: schedule.availableBalance,
+    sufficientFunds: available >= required,
+    nextRunAt: schedule.nextRunAt,
+    missedRuns: schedule.missedRuns,
+    networkPassphrase: schedule.networkPassphrase,
+    expectedNetworkPassphrase: Networks.TESTNET,
+    networkMatches: schedule.networkPassphrase === Networks.TESTNET,
+  };
+}
+
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 function createStream() {
@@ -193,6 +288,96 @@ function handleRest(req, res) {
     });
   }
 
+  // ── Recurring schedules ────────────────────────────────────────────────────
+
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/v1/schedules" || url.pathname === "/api/v1/schedules")
+  ) {
+    return sendJson(res, 200, { data: schedules });
+  }
+
+  if (
+    req.method === "POST" &&
+    (url.pathname === "/v1/schedules" || url.pathname === "/api/v1/schedules")
+  ) {
+    return readBody(req)
+      .then((body) => {
+        if (!body || typeof body !== "object") {
+          return sendJson(res, 400, { error: "invalid body" });
+        }
+        if (body.networkPassphrase && body.networkPassphrase !== Networks.TESTNET) {
+          return sendJson(res, 422, {
+            error: "wallet_network_mismatch",
+            message: "Wallet network does not match the schedule network",
+          });
+        }
+        const amountPerRun = String(body.amountPerRun ?? SCHEDULE_FUNDING_AMOUNT);
+        const available = BigInt(body.availableBalance ?? "10000000000");
+        if (available < BigInt(amountPerRun) + BigInt(SCHEDULE_FUNDING_FEE)) {
+          return sendJson(res, 422, {
+            error: "insufficient_funds",
+            message: "Available balance does not cover the next run",
+          });
+        }
+        const created = createSchedule({
+          id: `sched-${schedules.length + 1}`,
+          amountPerRun,
+          recipient: body.recipient ?? RECIPIENT_PUBLIC_KEY,
+          intervalSeconds: Number(body.intervalSeconds ?? SCHEDULE_INTERVAL_SECONDS),
+          availableBalance: available.toString(),
+          streams: [],
+        });
+        schedules = [...schedules, created];
+        return sendJson(res, 201, created);
+      })
+      .catch(() => sendJson(res, 400, { error: "invalid json" }));
+  }
+
+  const scheduleDetail = url.pathname.match(/^\/v1\/schedules\/([^/]+)$/);
+  if (req.method === "GET" && scheduleDetail) {
+    const schedule = findSchedule(decodeURIComponent(scheduleDetail[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    return sendJson(res, 200, schedule);
+  }
+
+  const scheduleFunding = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/funding$/);
+  if (req.method === "GET" && scheduleFunding) {
+    const schedule = findSchedule(decodeURIComponent(scheduleFunding[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    return sendJson(res, 200, scheduleFundingPreview(schedule));
+  }
+
+  const schedulePause = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/pause$/);
+  if (req.method === "POST" && schedulePause) {
+    const schedule = findSchedule(decodeURIComponent(schedulePause[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    if (schedule.status === "cancelled") {
+      return sendJson(res, 409, { error: "schedule_cancelled" });
+    }
+    const updated = {
+      ...schedule,
+      status: "paused",
+      updatedAt: new Date().toISOString(),
+    };
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
+  }
+
+  const scheduleCancel = url.pathname.match(/^\/v1\/schedules\/([^/]+)\/cancel$/);
+  if (req.method === "POST" && scheduleCancel) {
+    const schedule = findSchedule(decodeURIComponent(scheduleCancel[1]));
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+    const updated = {
+      ...schedule,
+      status: "cancelled",
+      nextRunAt: null,
+      updatedAt: new Date().toISOString(),
+    };
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
+  }
+
   if (req.method === "GET" && url.pathname === "/v1/events/subscribe") {
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -225,6 +410,36 @@ function handleRest(req, res) {
     };
     broadcast("stream.withdrawn", { streamId: 42 });
     return sendJson(res, 200, { ok: true, withdrawnAmount: stream.withdrawnAmount });
+  }
+
+  // Deterministic control hooks for schedule failure states.
+  const scheduleControl = url.pathname.match(/^\/__e2e\/schedule\/([^/]+)\/(miss|fund|reset)$/);
+  if (req.method === "POST" && scheduleControl) {
+    const id = decodeURIComponent(scheduleControl[1]);
+    const action = scheduleControl[2];
+    const schedule = findSchedule(id);
+    if (!schedule) return sendJson(res, 404, { error: "schedule not found" });
+
+    let updated = schedule;
+    if (action === "miss") {
+      updated = {
+        ...schedule,
+        nextRunAt: nowSec() - 3600,
+        missedRuns: schedule.missedRuns + 1,
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (action === "fund") {
+      updated = {
+        ...schedule,
+        availableBalance: "0",
+        updatedAt: new Date().toISOString(),
+      };
+    } else if (action === "reset") {
+      updated = createSchedule({ id: schedule.id });
+    }
+
+    schedules = schedules.map((s) => (s.id === updated.id ? updated : s));
+    return sendJson(res, 200, updated);
   }
 
   return sendJson(res, 404, { error: "not found" });

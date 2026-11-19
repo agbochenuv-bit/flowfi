@@ -14,6 +14,7 @@ import { sandboxMiddleware } from "./middleware/sandbox.middleware.js";
 import { globalRateLimiter, healthRateLimiter } from "./middleware/rate-limiter.middleware.js";
 import { metricsMiddleware } from "./middleware/metrics.middleware.js";
 import { requestIdMiddleware } from "./middleware/requestId.js";
+import { requestCostBudget } from "./middleware/request-cost-budget.middleware.js";
 import v1Routes from "./routes/v1/index.js";
 import healthRoutes from "./routes/health.routes.js";
 import metricsRoutes from "./routes/metrics.routes.js";
@@ -163,9 +164,22 @@ app.get("/api-docs.json", (req: Request, res: Response) => {
 // All versioned routes must include version prefix (e.g., /v1/streams)
 app.use(apiVersionMiddleware);
 
+// Request cost budgets for expensive read operations (analytics, exports,
+// multi-resource queries). Runs after the global rate limiter, request ID,
+// metrics, and versioning middleware so those keep their existing ordering,
+// and before the versioned routers so a request that exceeds its per-route
+// cost budget is rejected before any handler or auth work is performed.
+// Cheap routes have no configured budget and pass through untouched.
+app.use(requestCostBudget);
+
 // Versioned API routes
 // After versioning middleware, /v1/streams becomes /streams, so we mount v1Routes at root
 // But only handle requests that had a version prefix (apiVersion is set)
+//
+// The v1 router also mounts the asynchronous statement export routes
+// (/v1/exports/...). Export creation payloads are small (a date range and a
+// statement type), so they stay on the standard 100kb JSON parser and do not
+// need an entry in BULK_JSON_PATHS. Export downloads are GETs and carry no body.
 app.use((req: Request, res: Response, next: NextFunction) => {
   const versionedReq = req as VersionedRequest;
   if (versionedReq.apiVersion) {

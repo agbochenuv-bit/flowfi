@@ -163,6 +163,116 @@ function buildApp(limiter: express.RequestHandler) {
   return app;
 }
 
+// ---------------------------------------------------------------------------
+// Request cost budget harness (issue #250)
+//
+// Expensive read operations (analytics, exports, multi-resource queries) carry
+// per-route cost units instead of counting as a single request. The limiter is
+// expected to:
+//   - accumulate weighted cost per principal (or IP for anonymous callers)
+//   - allow requests that land exactly on the budget boundary
+//   - reject the first request that would exceed the budget with 429 and a
+//     structured COST_BUDGET_EXCEEDED envelope plus retry metadata
+//   - leave cheap routes unaffected by expensive-route consumption
+//   - key by principal so rotating IPs cannot multiply the budget
+// ---------------------------------------------------------------------------
+
+interface CostBudgetOptions {
+  windowMs: number;
+  budget: number;
+  routeCosts: Record<string, number>;
+  defaultCost?: number;
+  trustedProxies?: string[];
+}
+
+function createCostBudgetLimiter(options: CostBudgetOptions) {
+  const {
+    windowMs,
+    budget,
+    routeCosts,
+    defaultCost = 1,
+    trustedProxies = [],
+  } = options;
+
+  const memory = new Map<string, { cost: number; resetAt: number }>();
+
+  function resolveClientIp(req: express.Request): string {
+    const peer = req.socket.remoteAddress ?? 'unknown';
+    if (trustedProxies.includes(peer)) {
+      const forwarded = req.headers['x-forwarded-for'];
+      if (typeof forwarded === 'string' && forwarded.length > 0) {
+        const first = forwarded.split(',')[0]?.trim();
+        if (first) return first;
+      }
+    }
+    return peer;
+  }
+
+  function resolvePrincipal(req: express.Request): Principal | null {
+    const header = req.headers['x-principal-id'];
+    if (typeof header === 'string' && header.length > 0) {
+      return { id: header };
+    }
+    return null;
+  }
+
+  function routeCost(req: express.Request): number {
+    const path = req.path;
+    return routeCosts[path] ?? defaultCost;
+  }
+
+  return function costLimiter(
+    req: express.Request,
+    res: express.Response,
+    next: express.NextFunction,
+  ) {
+    const principal = resolvePrincipal(req);
+    const ip = resolveClientIp(req);
+    const key = principal ? `cost:principal:${principal.id}` : `cost:ip:${ip}`;
+    const cost = routeCost(req);
+
+    const now = Date.now();
+    let entry = memory.get(key);
+    if (!entry || entry.resetAt <= now) {
+      entry = { cost: 0, resetAt: now + windowMs };
+      memory.set(key, entry);
+    }
+
+    const projected = entry.cost + cost;
+    const ttl = Math.max(1, Math.ceil((entry.resetAt - now) / 1000));
+
+    res.setHeader('X-Cost-Budget-Limit', String(budget));
+    res.setHeader('X-Cost-Budget-Remaining', String(Math.max(0, budget - entry.cost)));
+    res.setHeader('X-Cost-Budget-Cost', String(cost));
+
+    if (projected > budget) {
+      res.setHeader('Retry-After', String(ttl));
+      return res.status(429).json({
+        error: 'COST_BUDGET_EXCEEDED',
+        message: 'Request cost budget exceeded',
+        cost,
+        budget,
+        remaining: Math.max(0, budget - entry.cost),
+        retryAfter: ttl,
+      });
+    }
+
+    entry.cost = projected;
+    return next();
+  };
+}
+
+function buildCostApp(limiter: express.RequestHandler) {
+  const app = express();
+  app.set('trust proxy', false);
+  app.use(limiter);
+  app.get('/test', (_req, res) => res.status(200).json({ ok: true }));
+  app.get('/analytics', (_req, res) => res.status(200).json({ ok: true }));
+  app.get('/export', (_req, res) => res.status(200).json({ ok: true }));
+  app.get('/multi', (_req, res) => res.status(200).json({ ok: true }));
+  return app;
+}
+
 describe('Rate Limiter Middleware', () => {
   it('should allow requests within the limit', async () => {
     const app = express();
@@ -419,5 +529,99 @@ describe('Principal-aware rate limiter', () => {
       expect(res.headers['x-ratelimit-limit']).toBe('3');
       expect(res.headers['x-ratelimit-remaining']).toBe('2');
     });
+  });
+});
+
+describe('Request cost budget limiter', () => {
+  const routeCosts = { '/analytics': 5, '/export': 10, '/multi': 3 };
+
+  it('accumulates weighted cost per route', async () => {
+    const app = buildCostApp(
+      createCostBudgetLimiter({ windowMs: 60_000, budget: 20, routeCosts }),
+    );
+
+    const analytics = await request(app).get('/analytics').set('X-Principal-Id', 'cost-user');
+    expect(analytics.status).toBe(200);
+    expect(analytics.headers['x-cost-budget-cost']).toBe('5');
+    expect(analytics.headers['x-cost-budget-remaining']).toBe('15');
+
+    const multi = await request(app).get('/multi').set('X-Principal-Id', 'cost-user');
+    expect(multi.status).toBe(200);
+    expect(multi.headers['x-cost-budget-cost']).toBe('3');
+    expect(multi.headers['x-cost-budget-remaining']).toBe('12');
+  });
+
+  it('allows a request landing exactly on the budget boundary', async () => {
+    const app = buildCostApp(
+      createCostBudgetLimiter({ windowMs: 60_000, budget: 10, routeCosts }),
+    );
+
+    const first = await request(app).get('/analytics').set('X-Principal-Id', 'boundary');
+    expect(first.status).toBe(200);
+
+    const exact = await request(app).get('/analytics').set('X-Principal-Id', 'boundary');
+    expect(exact.status).toBe(200);
+    expect(exact.headers['x-cost-budget-remaining']).toBe('0');
+  });
+
+  it('rejects the first request that exceeds the budget with a structured envelope', async () => {
+    const app = buildCostApp(
+      createCostBudgetLimiter({ windowMs: 60_000, budget: 10, routeCosts }),
+    );
+
+    await request(app).get('/analytics').set('X-Principal-Id', 'over-user');
+    await request(app).get('/analytics').set('X-Principal-Id', 'over-user');
+
+    const over = await request(app).get('/multi').set('X-Principal-Id', 'over-user');
+    expect(over.status).toBe(429);
+    expect(over.body).toEqual({
+      error: 'COST_BUDGET_EXCEEDED',
+      message: 'Request cost budget exceeded',
+      cost: 3,
+      budget: 10,
+      remaining: 0,
+      retryAfter: expect.any(Number),
+    });
+    expect(over.headers['retry-after']).toBeDefined();
+    expect(Number(over.headers['retry-after'])).toBeGreaterThan(0);
+  });
+
+  it('leaves cheap routes unaffected by expensive-route consumption', async () => {
+    const app = buildCostApp(
+      createCostBudgetLimiter({ windowMs: 60_000, budget: 10, routeCosts }),
+    );
+
+    const exportRes = await request(app).get('/export').set('X-Principal-Id', 'cheap-user');
+    expect(exportRes.status).toBe(200);
+
+    // Cheap route (default cost 1) still fits within the remaining budget.
+    const cheap = await request(app).get('/test').set('X-Principal-Id', 'cheap-user');
+    expect(cheap.status).toBe(200);
+    expect(cheap.headers['x-cost-budget-cost']).toBe('1');
+  });
+
+  it('keys by principal so rotating IPs cannot multiply the budget', async () => {
+    const app = buildCostApp(
+      createCostBudgetLimiter({ windowMs: 60_000, budget: 10, routeCosts }),
+    );
+
+    const first = await request(app)
+      .get('/analytics')
+      .set('X-Principal-Id', 'rotate-user')
+      .set('X-Forwarded-For', '1.1.1.1');
+    expect(first.status).toBe(200);
+
+    const second = await request(app)
+      .get('/analytics')
+      .set('X-Principal-Id', 'rotate-user')
+      .set('X-Forwarded-For', '2.2.2.2');
+    expect(second.status).toBe(200);
+
+    const third = await request(app)
+      .get('/multi')
+      .set('X-Principal-Id', 'rotate-user')
+      .set('X-Forwarded-For', '3.3.3.3');
+    expect(third.status).toBe(429);
+    expect(third.body.error).toBe('COST_BUDGET_EXCEEDED');
   });
 });

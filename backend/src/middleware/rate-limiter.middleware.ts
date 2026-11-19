@@ -178,6 +178,124 @@ export const expensiveOperationBudgets = {
 export type ExpensiveOperation = keyof typeof expensiveOperationBudgets;
 
 /**
+ * Per-route cost units for the request cost-budget layer (issue #250).
+ *
+ * Request-count limits treat a cheap `GET /account/:id` and an expensive
+ * analytics aggregation or export as equal. Cost units weight each operation
+ * by its real resource footprint so a caller can make many cheap reads but
+ * only a few expensive ones within the same budget.
+ *
+ * The registry is exported so routes and documentation can reference the same
+ * numbers. `cheap` is the baseline unit for ordinary reads.
+ */
+export const COST_UNITS = {
+  cheap: 1,
+  analytics: 5,
+  'multi-resource': 10,
+  export: 20,
+} as const;
+
+export type CostOperation = keyof typeof COST_UNITS;
+
+/**
+ * Default per-principal cost budget per window. Expressed in cost units, so
+ * e.g. 100 units allows 100 cheap reads, 20 analytics queries or 5 exports.
+ */
+export const DEFAULT_COST_BUDGET = {
+  windowMs: 60 * 1000,
+  limit: 100,
+} as const;
+
+export interface CostBudgetOptions {
+  /** Window length in milliseconds. Defaults to {@link DEFAULT_COST_BUDGET}. */
+  windowMs?: number;
+  /** Maximum accumulated cost units per window per principal. */
+  limit?: number;
+  /** Override the cost charged for this operation (defaults to the registry). */
+  cost?: number;
+}
+
+interface CostBucket {
+  cost: number;
+  resetAt: number;
+}
+
+/**
+ * In-memory cost buckets keyed by principal. Used when no Redis store is
+ * supplied; mirrors express-rate-limit's in-memory fallback semantics.
+ */
+const costBuckets = new Map<string, CostBucket>();
+
+/** Reset the in-memory cost buckets. Intended for tests. */
+export function resetCostBuckets(): void {
+  costBuckets.clear();
+}
+
+function buildCostBudgetExceededResponse(
+  cost: number,
+  limit: number,
+  windowMs: number,
+  retryAfter: number,
+) {
+  return (_req: Request, res: Response) => {
+    res.setHeader('Retry-After', String(retryAfter));
+    res.status(429).json({
+      error: {
+        code: 'COST_BUDGET_EXCEEDED',
+        message: 'Request cost budget exceeded, please try again later.',
+        cost,
+        limit,
+        windowMs,
+        retryAfter,
+      },
+      status: 429,
+    });
+  };
+}
+
+/**
+ * Create a middleware that enforces a weighted cost budget per principal.
+ *
+ * Each request charges the operation's cost unit (see {@link COST_UNITS})
+ * against a per-principal, per-window bucket keyed by
+ * {@link resolveRateLimitKey}. Requests are rejected with a structured
+ * `COST_BUDGET_EXCEEDED` 429 once the accumulated cost would exceed the limit;
+ * cheap routes mounted without this middleware are unaffected.
+ *
+ * The bucket is charged before the handler runs so a request that is rejected
+ * never consumes budget, and the charge is rolled back if the handler fails.
+ */
+export function createCostBudgetMiddleware(
+  operation: CostOperation,
+  options: CostBudgetOptions = {},
+) {
+  const windowMs = options.windowMs ?? DEFAULT_COST_BUDGET.windowMs;
+  const limit = options.limit ?? DEFAULT_COST_BUDGET.limit;
+  const cost = options.cost ?? COST_UNITS[operation];
+
+  return (req: Request, res: Response, next: (err?: unknown) => void) => {
+    const key = resolveRateLimitKey(req as AuthenticatedRequest);
+    const now = Date.now();
+    const existing = costBuckets.get(key);
+    const bucket: CostBucket =
+      existing && existing.resetAt > now ? existing : { cost: 0, resetAt: now + windowMs };
+
+    if (bucket.cost + cost > limit) {
+      const retryAfter = Math.max(1, Math.ceil((bucket.resetAt - now) / 1000));
+      buildCostBudgetExceededResponse(cost, limit, windowMs, retryAfter)(req, res);
+      return;
+    }
+
+    bucket.cost += cost;
+    costBuckets.set(key, bucket);
+    res.setHeader('RateLimit-Limit', String(limit));
+    res.setHeader('RateLimit-Remaining', String(Math.max(0, limit - bucket.cost)));
+    res.setHeader('RateLimit-Reset', String(Math.max(1, Math.ceil((bucket.resetAt - now) / 1000))));
+    next();
+  };
+}
+
+/**
  * Create a principal-aware limiter for an expensive operation using its
  * documented budget. Pass a Redis store to make counters multi-instance safe;
  * omit it to fall back to the in-memory store.
