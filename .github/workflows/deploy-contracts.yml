@@ -4,6 +4,11 @@
 # and deploys + initializes the contract on Stellar Testnet on demand (or on
 # Mainnet for release tags). The resulting contract ID is surfaced in the job
 # summary and published as a release artifact.
+#
+# Before any build or publish step, the workflow validates the requested
+# environment against the approved network, domain, and secret policy
+# (see scripts/validate-env-policy.sh). Failures are reported without ever
+# printing secret values.
 name: Deploy Soroban Contracts
 
 on:
@@ -28,15 +33,48 @@ permissions:
   contents: read
 
 jobs:
+  policy:
+    name: Validate environment policy
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      network: ${{ steps.policy.outputs.network }}
+      environment: ${{ steps.policy.outputs.environment }}
+    env:
+      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      TARGET_ENVIRONMENT: ${{ github.event_name == 'release' && 'production' || 'staging' }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Validate network, domain, and secret policy
+        id: policy
+        env:
+          # Presence-only flags: values are never echoed. The validator only
+          # checks that required secrets are configured for the environment.
+          HAS_DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET != '' }}
+          HAS_ADMIN_ADDRESS: ${{ secrets.ADMIN_ADDRESS != '' }}
+          HAS_TREASURY_ADDRESS: ${{ secrets.TREASURY_ADDRESS != '' }}
+          HAS_FEE_RATE_BPS: ${{ secrets.FEE_RATE_BPS != '' }}
+        run: |
+          set -euo pipefail
+          bash scripts/validate-env-policy.sh \
+            --network "$NETWORK" \
+            --environment "$TARGET_ENVIRONMENT"
+          echo "network=$NETWORK" >> "$GITHUB_OUTPUT"
+          echo "environment=$TARGET_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+
   deploy:
     name: Build & Deploy stream_contract
+    needs: policy
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'release' && 'production' || 'staging' }}
+    environment: ${{ needs.policy.outputs.environment }}
     permissions:
       contents: write
 
     env:
-      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      NETWORK: ${{ needs.policy.outputs.network }}
 
     steps:
       - name: Checkout code

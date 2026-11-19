@@ -9,6 +9,10 @@ For the full project-wide architecture (event type data flows, pause/resume
 timing, environment variables, and operational runbook) see
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
+For the multi-region read failover runbook (promotion/rollback conditions,
+simulated regional loss rehearsal, and write consistency limitations) see
+[`MULTI_REGION_FAILOVER.md`](./MULTI_REGION_FAILOVER.md).
+
 ---
 
 ## Indexer Ownership Model
@@ -166,26 +170,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow

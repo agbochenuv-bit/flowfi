@@ -12,8 +12,23 @@ permissions:
   contents: read
 
 jobs:
+  policy:
+    name: Environment policy validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate preview/deploy environment policy
+        run: |
+          node .github/scripts/validate-env-policy.mjs
+
   preview:
     name: Ephemeral full-stack preview
+    needs: policy
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -112,6 +127,7 @@ jobs:
               ``,
               `| Check | Result |`,
               `|---|---|`,
+              `| Environment policy | Approved networks, domains, and secret references |`,
               `| Frontend | Build passed |`,
               `| Backend | Local container health check passed |`,
               ``,

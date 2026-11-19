@@ -22,7 +22,11 @@
     "prisma:studio": "prisma studio",
     "codegen:openapi": "tsx scripts/export-openapi.mts",
     "check:api-compat": "tsx scripts/check-api-compatibility.ts",
-    "check:schema-compat": "tsx scripts/check-schema-compat.ts"
+    "check:schema-compat": "tsx scripts/check-schema-compat.ts",
+    "db:cutover:check": "tsx scripts/db-cutover.ts check",
+    "db:cutover:apply": "tsx scripts/db-cutover.ts apply",
+    "db:cutover:rollback": "tsx scripts/db-cutover.ts rollback",
+    "secrets:check": "tsx scripts/check-secrets.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

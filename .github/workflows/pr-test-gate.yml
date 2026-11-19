@@ -40,3 +40,101 @@ jobs:
             exit 1
           fi
           echo "CI workflow succeeded for pull request #${PR_NUMBER}; no duplicate backend run is required."
+
+  environment-policy:
+    name: PR environment policy validation
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.event == 'pull_request'
+    steps:
+      - name: Checkout pull request head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          persist-credentials: false
+
+      - name: Validate preview and deployment workflow policies
+        env:
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+
+          # Approved policy allowlists. Keep in sync with the owning runbook.
+          APPROVED_NETWORKS="mainnet testnet devnet localhost"
+          APPROVED_DOMAIN_SUFFIXES="example.com example.org localhost"
+          APPROVED_SECRET_REFS="secrets. secrets: "
+
+          # Workflow files that publish or deploy environments.
+          WORKFLOW_DIR=".github/workflows"
+          TARGETS=$(grep -rlE 'environment:|deploy|preview' "$WORKFLOW_DIR" 2>/dev/null || true)
+
+          if [ -z "$TARGETS" ]; then
+            echo "No preview/deployment workflows found; nothing to validate."
+            exit 0
+          fi
+
+          failures=0
+          fail() {
+            # Never echo raw values; only file, line, and rule.
+            echo "::error file=$1,line=$2::$3"
+            failures=$((failures + 1))
+          }
+
+          for wf in $TARGETS; do
+            lineno=0
+            while IFS= read -r line; do
+              lineno=$((lineno + 1))
+
+              # Network policy: reject unapproved network identifiers.
+              if printf '%s' "$line" | grep -qiE 'network[_-]?(name|id)?\s*[:=]'; then
+                value=$(printf '%s' "$line" | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d '"'"'"' | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+                if [ -n "$value" ]; then
+                  approved=0
+                  for net in $APPROVED_NETWORKS; do
+                    if [ "$value" = "$net" ]; then approved=1; fi
+                  done
+                  if [ "$approved" -ne 1 ]; then
+                    fail "$wf" "$lineno" "network '$value' is not in the approved network policy"
+                  fi
+                fi
+              fi
+
+              # Domain policy: reject unapproved hostnames.
+              if printf '%s' "$line" | grep -qiE '(domain|host|url)\s*[:=]'; then
+                value=$(printf '%s' "$line" | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d '"'"'"' | tr -d '[:space:]')
+                if [ -n "$value" ]; then
+                  host=$(printf '%s' "$value" | sed -E 's#^[a-z]+://##; s#/.*$##; s#:.*$##' | tr '[:upper:]' '[:lower:]')
+                  approved=0
+                  for suffix in $APPROVED_DOMAIN_SUFFIXES; do
+                    case "$host" in
+                      "$suffix"|"$suffix".*|*."$suffix") approved=1 ;;
+                    esac
+                  done
+                  if [ "$approved" -ne 1 ]; then
+                    fail "$wf" "$lineno" "domain '$host' is not in the approved domain policy"
+                  fi
+                fi
+              fi
+
+              # Secret policy: secrets must be referenced via the secrets context,
+              # never inlined as literals.
+              if printf '%s' "$line" | grep -qiE '(secret|token|password|api[_-]?key)\s*[:=]'; then
+                value=$(printf '%s' "$line" | sed -E 's/^[^:=]*[:=][[:space:]]*//' | tr -d '[:space:]')
+                if [ -n "$value" ]; then
+                  case "$value" in
+                    \$\{\{*secrets.*\}\}) ::
+                      ;;
+                    *)
+                      fail "$wf" "$lineno" "secret value must be referenced via the secrets context, not inlined"
+                      ;;
+                  esac
+                fi
+              fi
+            done < "$wf"
+          done
+
+          if [ "$failures" -gt 0 ]; then
+            echo "Environment policy validation failed with $failures violation(s) for pull request #${PR_NUMBER}."
+            exit 1
+          fi
+          echo "Environment policy validation passed for pull request #${PR_NUMBER}."

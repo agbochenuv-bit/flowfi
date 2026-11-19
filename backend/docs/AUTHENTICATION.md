@@ -91,29 +91,41 @@ Challenges issued by `/v1/auth/challenge` are **single-use** and bound to a spec
 - Clients that previously reused a signed challenge (or cached a nonce across requests) **must** request a fresh challenge for every login. Reuse now returns `401 CHALLENGE_ALREADY_USED`.
 - Clients must send the same `network` and `audience` they used when requesting the challenge; mismatches are rejected.
 - If `AUTH_CHALLENGE_TTL_SECONDS` is lowered, clients should request and submit challenges promptly rather than pre-generating them.
-======>>> REPLACE
 
-<<<<<<< SEARCH
-## Error Responses
+## Secret Resolution (External Secret Manager)
 
-### 401 Unauthorized - Missing Token
+Signing keys and database credentials can be sourced from an external secret manager instead of long-lived plaintext environment variables. Environment variables remain supported as a fallback, so existing deployments keep working without changes.
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
-}
-```
+### Configuration
 
-### 401 Unauthorized - Invalid Signature
+| Variable | Purpose |
+| --- | --- |
+| `SECRET_MANAGER_PROVIDER` | Provider to use (`env` default, or an external provider name). When unset, secrets resolve from environment variables only. |
+| `SECRET_MANAGER_REFRESH_SECONDS` | Interval for periodic re-fetch of managed secrets (default `300`). Set to `0` to disable periodic refresh. |
+| `SECRET_MANAGER_REQUIRED` | When `true`, startup fails if the provider cannot resolve required secrets. When `false`, startup proceeds in degraded mode using cached/env values. |
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-=======
+### Startup Semantics
+
+- On boot the resolver fetches all required secrets (signing key, database credentials) from the configured provider.
+- If `SECRET_MANAGER_REQUIRED=true` and the provider is unavailable or a required key is missing, startup **fails fast** with a redacted error naming only the missing key path.
+- If `SECRET_MANAGER_REQUIRED=false`, startup proceeds in **degraded mode**: it falls back to environment values and logs a redacted warning. Requests that require an unresolved secret fail with `503 SECRET_UNAVAILABLE`.
+
+### Refresh / Rotation
+
+- Managed secrets are re-fetched every `SECRET_MANAGER_REFRESH_SECONDS` and swapped **atomically**; in-flight requests continue using the previous value until the swap completes.
+- A rotated value is picked up on the next refresh cycle without a restart. Rotation never logs the secret material — only the key path and a version/etag when the provider supplies one.
+
+### Failure Semantics (Provider Unavailable)
+
+- **At startup**: governed by `SECRET_MANAGER_REQUIRED` (fail-fast vs. degraded, see above).
+- **Mid-run outage**: the last successfully resolved value is retained (cached) and continues to be used. Refresh retries with exponential backoff and surfaces a redacted error (`SECRET_REFRESH_FAILED`) in logs and health output.
+- **Missing key**: resolution fails for that key only; the error names the key path, never the value.
+- **Malformed provider response**: treated as a resolution failure (same handling as unavailable provider); the raw response is never logged.
+
+### Redaction Guarantees
+
+Resolved secret values are never written to logs, error messages, health endpoints, or test output. Errors reference key paths and provider status only. Tests assert on redacted output to prevent accidental leakage.
+
 ## Error Responses
 
 All errors share a predictable envelope produced by centralized validation and error mapping:
@@ -196,21 +208,25 @@ Unexpected failures return a generic message with no stack trace or internal ide
 }
 ```
 
+### 503 Service Unavailable - Secret Unavailable
+
+Returned when a required secret could not be resolved (degraded startup or mid-run outage with no cached value). The message names the key path only, never the value.
+
+```json
+{
+  "error": "Service Unavailable",
+  "code": "SECRET_UNAVAILABLE",
+  "message": "Required secret is unavailable",
+  "requestId": "b1f2c3d4-..."
+}
+```
+
 ### Migration Notes (Errors)
 
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
 - New `details` arrays appear only on `400 VALIDATION_ERROR` responses.
 - `requestId` is additive; clients may log it for support escalation.
-======>>> REPLACE
 
-<<<<<<< SEARCH
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-=======
 ## Security Features
 
 1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
@@ -219,6 +235,7 @@ Unexpected failures return a generic message with no stack trace or internal ide
 4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
 5. **Network Validation**: Ensures transactions match the configured Stellar network
 6. **No Password Storage**: No sensitive credentials stored on the server
+7. **External Secret Resolution**: Signing and database secrets can be sourced from a secret manager with atomic rotation and redacted errors
 
 ## Endpoint-Specific Wallet Authorization Scopes
 
@@ -232,217 +249,4 @@ Authenticated endpoints enforce ownership at the route/service boundary. The ser
 | Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
 | Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
 
-Violations return `403 WALLET_SCOPE_FORBIDDEN`. Cross-wallet enumeration attempts (e.g. listing another wallet's streams by spoofing a query parameter) are rejected rather than silently filtered.
-
-### Migration Notes (Scopes)
-
-- Clients that previously passed `sender`/`recipient` addresses in request bodies to act on behalf of another wallet must instead authenticate as that wallet. Such fields are ignored for authorization and may be rejected by validation.
-- Admin operations require the caller's wallet to be present in the admin allowlist (`ADMIN_PUBLIC_KEYS`).
-- Public endpoints remain unauthenticated; no client change is required for them.
-======>>> REPLACE
-
-<<<<<<< SEARCH
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-=======
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-
-# Challenge lifetime in seconds (default 300)
-AUTH_CHALLENGE_TTL_SECONDS=300
-
-# Intended audience bound into each challenge
-AUTH_AUDIENCE=flowfi-api
-
-# Comma-separated admin wallet public keys
-ADMIN_PUBLIC_KEYS=GADMIN1...,GADMIN2...
-```
-
-## Example: Creating a Signed Transaction (Client Side)
-
-```javascript
-import * as StellarSdk from '@stellar/stellar-sdk';
-
-// Create a keypair (in real app, this comes from the user's wallet)
-const keypair = StellarSdk.Keypair.fromSecret('S...');
-
-// Get the current network passphrase
-const networkPassphrase = StellarSdk.Networks.TESTNET;
-
-// Create a simple transaction for authentication
-const account = await server.loadAccount(keypair.publicKey());
-const transaction = new StellarSdk.TransactionBuilder(account, {
-  fee: StellarSdk.BASE_FEE,
-  networkPassphrase,
-})
-  .addOperation(
-    StellarSdk.Operation.manageData({
-      name: 'auth',
-      value: crypto.randomBytes(32), // Random challenge
-    })
-  )
-  .setTimeout(300) // 5 minutes validity
-  .build();
-
-// Sign the transaction
-transaction.sign(keypair);
-
-// Encode to XDR for the Bearer token
-const xdr = transaction.toEnvelope().toXDR('base64');
-
-// Use in Authorization header
-const response = await fetch('http://localhost:3001/v1/users/me', {
-  headers: {
-    'Authorization': `Bearer ${xdr}`
-  }
-});
-```
-
-## Error Responses
-
-### 401 Unauthorized - Missing Token
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
-}
-```
-
-### 401 Unauthorized - Invalid Signature
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-
-### Network Passphrases
-
-- **Testnet**: `Test SDF Network ; September 2015`
-- **Mainnet**: `Public Global Stellar Network ; September 2015`
-
-## Independence from Database
-
-Per issue #74 requirements, the middleware operates independently of the database:
-
-- **User Exists**: Returns user data from database
-- **User Missing**: Returns in-memory user object with `publicKey` and empty arrays
-- **Never Blocks**: Authentication succeeds based solely on valid signature
-
-Example in-memory response:
-
-```json
-{
-  "publicKey": "GABC123...",
-  "sentStreams": [],
-  "receivedStreams": [],
-  "inMemory": true
-}
-```
-
-## TypeScript Types
-
-### AuthUser
-
-```typescript
-interface AuthUser {
-  publicKey: string;
-  id?: string;
-}
-```
-
-### AuthenticatedRequest
-
-```typescript
-interface AuthenticatedRequest extends Request {
-  user: AuthUser;
-}
-```
-
-### Usage in Controllers
-
-```typescript
-import type { AuthenticatedRequest } from '../types/auth.types.js';
-
-export const getCurrentUser = async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const { publicKey } = authReq.user;
-
-  // Use publicKey...
-};
-```
-
-## Testing
-
-Test the middleware with a valid signed transaction:
-
-```bash
-# 1. Create a test transaction (use stellar-sdk)
-# 2. Sign it with a test keypair
-# 3. Encode to XDR
-# 4. Send request
-
-curl -X GET http://localhost:3001/v1/users/me \
-  -H "Authorization: Bearer <your_signed_transaction_xdr>"
-```
-
-## OpenAPI Parity in CI
-
-`backend/swagger/flowfi.openapi.json` is generated from the route definitions and validated in CI. The pipeline fails when:
-
-- The committed spec differs from the generated artifact (drift)
-- A route is missing from the spec, or the spec documents a route that no longer exists
-- Documented request/response schemas, status codes, or auth requirements diverge from the implementation
-- Error responses (`400`, `401`, `403`, `500`) are not documented for protected endpoints
-
-Generated artifacts are reproducible: running the generator twice produces byte-identical output. All versioned endpoints (`/v1/*`) and their error responses are included.
-
-### Operational Impact
-
-- Contributors must regenerate the spec (`npm run openapi:generate`) and commit the result when changing routes, schemas, status codes, or auth.
-- A deliberate spec mismatch fails CI, preventing undocumented API changes from merging.
-- No runtime behavior changes; this is a build/CI gate only.
-
-## Related Documentation
-
-- [Stellar SEP-10 Specification](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md)
-- [Stellar SDK Documentation](https://stellar.github.io/js-stellar-sdk/)
-- [Swagger API Docs](http://localhost:3001/api-docs)
+Violations return `403 WALLET_SCOPE_FORBIDDEN` without disclosing resource existence.

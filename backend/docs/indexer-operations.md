@@ -3,10 +3,11 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, the
+blue-green database connection cutover procedure, and the multi-region read
+failover runbook. It is written for operators and on-call engineers. All
+public interfaces described here are additive; existing endpoints and
+configuration keys keep working unless noted.
 
 ---
 
@@ -167,37 +168,133 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+- **Fencing still applies.** The advisory lock is layered on top of the lease
+  fencing described in §1; a stale owner cannot advance the cursor even if it
+  somehow acquires the lock.
 
 ---
 
-## 4. Metrics
+## 4. Multi-region read failover runbook
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+This section covers failing **read traffic** over between regional
+deployments while preserving network identity and making stale data visible.
+Writes are **not** failed over (see §4.5).
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+### 4.1 Topology and network identity
+
+- Each region runs a full backend deployment (API + read replica of the
+  primary database) behind a regional load balancer.
+- A global DNS/edge layer routes read traffic to the **active read region**.
+  The active region is a single named target; clients always resolve the same
+  hostname, so **network identity (hostname, TLS certificate, and API base
+  URL) is preserved** across failover. No client reconfiguration is required.
+- The **primary region** owns writes and the indexer lease (§1). Secondary
+  regions serve reads from their replica only.
+
+### 4.2 Promotion conditions (secondary → active read region)
+
+Promote a secondary region to serve reads only when **all** of the following
+hold:
+
+1. **Primary read health degraded beyond threshold.** Primary read error rate
+   exceeds the configured threshold (default: > 5% of read requests over a
+   5-minute window) **or** primary read p99 latency exceeds the threshold
+   (default: > 2s over 5 minutes), sustained for at least two consecutive
+   evaluation windows.
+2. **Replication lag within bound.** The candidate secondary's replication lag
+   is at or below the configured bound (default: ≤ 30s behind primary).
+3. **Secondary verified healthy.** The candidate secondary passes its read
+   health check (error rate and latency within thresholds) and can reach its
+   replica.
+
+If any condition is unmet, do **not** promote; keep serving from the current
+active region and escalate.
+
+### 4.3 Rollback conditions (active read region → primary)
+
+Roll back to the primary region when **either**:
+
+1. **Primary recovered and stable.** Primary read health has been within
+   thresholds for at least the configured stability window (default: 10
+   minutes), **or**
+2. **Secondary serving stale data beyond tolerance.** The active secondary's
+   replication lag exceeds the stale-data tolerance (default: > 60s) — reads
+   are more correct from a recovered primary than from a badly lagged
+   secondary.
+
+Rollback uses the same DNS/edge switch, so network identity is preserved.
+
+### 4.4 Simulated regional loss rehearsal
+
+Rehearse quarterly (and before any topology change) using the following
+scripted scenario in a non-production environment:
+
+1. **Baseline.** Confirm primary is active read region; record read error
+   rate, p99 latency, and secondary replication lag.
+2. **Inject loss.** Block read traffic to the primary region (firewall/edge
+   rule) to simulate regional loss. Do **not** stop the primary database.
+3. **Observe promotion.** Expect: primary read health crosses threshold →
+   promotion conditions evaluated → secondary promoted → DNS/edge switch →
+   clients continue hitting the same hostname. Record time-to-promote.
+4. **Verify stale-data visibility.** Confirm responses from the secondary
+   carry the staleness signal (§4.6) and that the reported lag matches the
+   observed replication lag.
+5. **Restore primary.** Remove the block; wait for the stability window.
+6. **Observe rollback.** Expect rollback to primary once stable; confirm
+   network identity unchanged and staleness signal cleared.
+
+Record the rehearsal outcome (time-to-promote, time-to-rollback, any
+threshold breaches) in the operations log.
+
+### 4.5 Consistency limitations for writes during failover
+
+- **No cross-region write failover.** Writes continue to target the primary
+  region only. If the primary is truly lost (not just read-degraded), writes
+  fail until the primary recovers; this runbook does not promote a secondary
+  to accept writes.
+- **Read-after-write anomalies.** A client that writes to the primary and
+  immediately reads from a promoted secondary may not see its own write until
+  replication catches up (bounded by the replication lag at promotion time).
+- **Replication lag window.** Reads served by a secondary reflect the primary
+  as of up to the lag bound (default 30s) in the past. Data newer than that
+  window may be missing from secondary reads.
+- **Indexer cursor.** The indexer lease remains on the primary; secondary
+  reads may lag the live cursor by the replication lag.
+
+### 4.6 Surfacing stale data to clients
+
+When reads are served by a non-primary region, responses include a staleness
+signal so clients can decide whether to retry against the primary or tolerate
+the lag:
+
+- A response header (e.g. `X-Data-Staleness-Seconds`) reporting the current
+  replication lag in seconds, and
+- A boolean flag (e.g. `X-Read-From-Secondary: true`) indicating the response
+  came from a secondary region.
+
+When serving from the primary, the staleness header is `0` and the secondary
+flag is absent/false. These are additive headers; existing clients that ignore
+unknown headers are unaffected.
+
+### 4.7 Checks and automated coverage
+
+Focused automated coverage validates the failover decision logic:
+
+- **Promotion:** promotes when primary is degraded, lag is within bound, and
+  secondary is healthy.
+- **Failure — primary unavailable:** promotion proceeds when primary read
+  health is fully unavailable (treated as degraded).
+- **Failure — replication lag exceeded:** promotion is refused when the
+  candidate secondary's lag exceeds the bound.
+- **Boundary — lag exactly at threshold:** lag equal to the bound is treated
+  as within bound (promotes).
+- **Boundary — partial recovery:** rollback is refused while primary health is
+  recovering but has not yet met the stability window.
+- **Rollback — stale secondary:** rollback triggers when the active secondary's
+  lag exceeds the stale-data tolerance.
+
+---
+
+## 5. Soroban RPC retry and backoff
+
+*(unchanged — see existing sections below)*
