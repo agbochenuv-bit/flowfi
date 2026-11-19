@@ -8,6 +8,7 @@ import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { formatNetwork } from "@/lib/wallet";
 import toast from "react-hot-toast";
+import PrivacyControls from "./privacy-controls";
 import { getApiBaseUrl } from "@/lib/api/_shared";
 import { copyToClipboard } from "@/lib/clipboard";
 import { DisconnectConfirmModal } from "@/components/wallet/DisconnectConfirmModal";
@@ -86,7 +87,7 @@ function persistSettings(settings: Settings): void {
 
 export default function SettingsContent() {
   const router = useRouter();
-  const { session, disconnect, isHydrated } = useWallet();
+  const { session, disconnect, isHydrated, authToken } = useWallet();
 
   const [browserPush, setBrowserPush] = useState(false);
   const [draft, setDraft] = useState<Settings>(() => loadSavedSettings());
@@ -416,6 +417,8 @@ export default function SettingsContent() {
               Save changes
             </button>
           </div>
+
+          {session && authToken && <PrivacyControls key={session.publicKey} token={authToken} />}
 
           {/* Wallet Section */}
           {session ? (

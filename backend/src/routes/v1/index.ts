@@ -3,6 +3,7 @@ import authRoutes from './auth.routes.js';
 import streamRoutes from './stream.routes.js';
 import eventsRoutes from './events.routes.js';
 import webhookRoutes from './webhook.routes.js';
+import privacyRoutes from './privacy.routes.js';
 import userRoutes from './user.routes.js';
 import analyticsRoutes from './analytics.routes.js';
 import tokenRoutes from './token.routes.js';
@@ -29,6 +30,7 @@ router.use('/events', eventsRoutes);
 
 // Webhooks — CRUD and delivery management
 router.use('/webhooks', webhookRoutes);
+router.use('/privacy', privacyRoutes);
 
 // Users — per-wallet aggregates
 router.use('/users', userRoutes);

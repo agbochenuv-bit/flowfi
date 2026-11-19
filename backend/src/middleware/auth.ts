@@ -231,7 +231,7 @@ function decodeJwtHeader(header: string): { kid?: unknown } | null {
   }
 }
 
-export function verifyJwt(token: string): { publicKey: string } | null {
+export function verifyJwt(token: string, unscopedOnly = false): { publicKey: string } | null {
   try {
     const [header, body, sig] = token.split('.');
     if (!header || !body || !sig) return null;
@@ -279,6 +279,9 @@ export function verifyJwt(token: string): { publicKey: string } | null {
     if (payload.iss !== JWT_ISSUER || payload.aud !== JWT_AUDIENCE) {
       return null;
     }
+
+    if (unscopedOnly && (payload.scope !== undefined || typeof payload.sub !== 'string' ||
+      !StellarSdk.StrKey.isValidEd25519PublicKey(payload.sub))) return null;
 
     return { publicKey: payload.sub };
   } catch {

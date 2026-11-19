@@ -114,7 +114,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
+          node-version: "24.22.2"
           cache: "npm"
           cache-dependency-path: package-lock.json
 
@@ -124,10 +124,17 @@ jobs:
       - name: Setup Database
         run: |
           npx prisma generate --schema=prisma/schema.prisma
-          npx prisma db push --accept-data-loss --schema=prisma/schema.prisma
+          npx prisma db push --schema=prisma/schema.prisma
         working-directory: backend
         env:
           DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_test
+
+      - name: Verify privacy retention and authorization
+        run: npx vitest run --coverage.enabled=false tests/integration/privacy.test.ts
+        working-directory: backend
+        env:
+          DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_test
+          NODE_ENV: test
 
       - name: Build
         run: npm run build
@@ -145,7 +152,7 @@ jobs:
       - name: Run Backend Tests
         run: |
           ls -la src/generated/prisma
-          npx vitest run --coverage --reporter=basic
+          npx vitest run --coverage
         working-directory: backend
         env:
           DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_test

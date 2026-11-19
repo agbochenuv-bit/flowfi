@@ -8,7 +8,6 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -220,4 +219,16 @@ enum BackfillStatus {
   COMPLETED
   FAILED
   CANCELLED
+}
+
+// Minimal completion receipts for authenticated privacy requests.
+model PrivacyReceipt {
+  id            String   @id @default(uuid())
+  walletAddress String
+  operation     String
+  subscriptions Int
+  deliveries    Int
+  completedAt   DateTime @default(now())
+
+  @@index([walletAddress, completedAt])
 }

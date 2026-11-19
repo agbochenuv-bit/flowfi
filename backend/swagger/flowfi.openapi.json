@@ -2652,6 +2652,115 @@
         ]
       }
     },
+    "/v1/privacy/deletion": {
+      "post": {
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "properties": {
+                  "confirm": {
+                    "enum": [
+                      true
+                    ],
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "confirm"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Completion receipt with deletion counts"
+          },
+          "400": {
+            "description": "Missing deletion confirmation"
+          },
+          "401": {
+            "description": "A valid wallet access token is required"
+          },
+          "503": {
+            "description": "Operation unavailable. Retry the request."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Delete eligible off-chain data",
+        "tags": [
+          "Privacy"
+        ]
+      }
+    },
+    "/v1/privacy/export": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Download containing a completion receipt and webhook records"
+          },
+          "401": {
+            "description": "A valid wallet access token is required"
+          },
+          "503": {
+            "description": "Operation unavailable. Retry the request."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Export eligible off-chain data",
+        "tags": [
+          "Privacy"
+        ]
+      }
+    },
+    "/v1/privacy/receipts/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Completion receipt"
+          },
+          "401": {
+            "description": "A valid wallet access token is required"
+          },
+          "404": {
+            "description": "Receipt not found"
+          },
+          "503": {
+            "description": "Operation unavailable. Retry the request."
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Look up a privacy receipt",
+        "tags": [
+          "Privacy"
+        ]
+      }
+    },
     "/v1/streams": {
       "get": {
         "description": "Returns a paginated list of streams optionally filtered by sender,\nrecipient, status, or token address.\n",
