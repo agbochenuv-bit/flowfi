@@ -6,6 +6,8 @@ import { withdraw as sorobanWithdraw } from '../../../services/sorobanService.js
 import type { AuthenticatedRequest } from '../../../types/auth.types.js';
 import { parseStreamId } from '../../../lib/stream-id.js';
 import { sendApiError } from '../../../types/api-error.js';
+import { sendStreamVersionConflict } from '../../../lib/stream-version.js';
+import { streamRepository } from '../../../repositories/stream.repository.js';
 
 /**
  * @openapi
@@ -15,6 +17,9 @@ import { sendApiError } from '../../../types/api-error.js';
  *       - Streams
  *     summary: Withdraw claimable balance from a payment stream
  *     description: Withdraws the currently claimable amount. Only the recipient can withdraw.
+ *       Clients may submit the stream version they reviewed via `expectedVersion`; if the
+ *       stream has changed since then the request is rejected with a 409 conflict carrying
+ *       the current version metadata. The withdrawal itself is still signed by the wallet.
  *     parameters:
  *       - in: path
  *         name: streamId
@@ -22,6 +27,16 @@ import { sendApiError } from '../../../types/api-error.js';
  *         schema:
  *           type: integer
  *         description: On-chain stream ID
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               expectedVersion:
+ *                 type: integer
+ *                 description: Stream version the client reviewed; omit to skip the check
  *     security:
  *       - bearerAuth: []
  *     responses:
@@ -32,7 +47,7 @@ import { sendApiError } from '../../../types/api-error.js';
  *             schema:
  *               $ref: '#/components/schemas/WithdrawResponse'
  *       400:
- *         description: Invalid streamId or contract revert
+ *         description: Invalid streamId, invalid expectedVersion, or contract revert
  *       401:
  *         description: Unauthorized - missing or invalid authentication
  *       403:
@@ -40,7 +55,11 @@ import { sendApiError } from '../../../types/api-error.js';
  *       404:
  *         description: Stream not found
  *       409:
- *         description: Conflict - no claimable balance available
+ *         description: Conflict - no claimable balance available, or stale expectedVersion
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  *       500:
  *         description: Internal server error
  */
@@ -53,6 +72,24 @@ export const withdrawHandler = async (req: AuthenticatedRequest, res: Response) 
 
     if (parsedStreamId === null) {
       return sendApiError(res, 400, 'INVALID_STREAM_ID', 'Invalid streamId parameter');
+    }
+
+    const rawExpectedVersion = (req.body as { expectedVersion?: unknown } | undefined)?.expectedVersion;
+    let expectedVersion: number | undefined;
+    if (rawExpectedVersion !== undefined && rawExpectedVersion !== null) {
+      if (
+        typeof rawExpectedVersion !== 'number' ||
+        !Number.isInteger(rawExpectedVersion) ||
+        rawExpectedVersion < 0
+      ) {
+        return sendApiError(
+          res,
+          400,
+          'INVALID_EXPECTED_VERSION',
+          'expectedVersion must be a non-negative integer',
+        );
+      }
+      expectedVersion = rawExpectedVersion;
     }
 
     const stream = await prisma.stream.findUnique({
@@ -72,11 +109,16 @@ export const withdrawHandler = async (req: AuthenticatedRequest, res: Response) 
         pausedAt: true,
         totalPausedDuration: true,
         updatedAt: true,
+        version: true,
       },
     });
 
     if (!stream) {
       return sendApiError(res, 404, 'NOT_FOUND', 'Stream not found');
+    }
+
+    if (expectedVersion !== undefined && stream.version !== expectedVersion) {
+      return sendStreamVersionConflict(res, parsedStreamId, stream.version);
     }
 
     // Verify the caller is the stream recipient
@@ -152,6 +194,25 @@ export const withdrawHandler = async (req: AuthenticatedRequest, res: Response) 
         update: {},
       });
 
+      // Bump the stream version with a compare-and-set so concurrent mutations
+      // that reviewed the same version are rejected rather than silently applied.
+      const versionBumped = await streamRepository.compareAndSetVersion(
+        parsedStreamId,
+        stream.version,
+        stream.version + 1,
+      );
+
+      if (!versionBumped) {
+        const current = await prisma.stream.findUnique({
+          where: { streamId: parsedStreamId },
+          select: { version: true },
+        });
+        logger.warn(
+          `Stream ${parsedStreamId} version changed concurrently during withdraw by ${req.user.publicKey}`,
+        );
+        return sendStreamVersionConflict(res, parsedStreamId, current?.version ?? stream.version);
+      }
+
       logger.info(`Stream ${parsedStreamId} withdrawn by ${req.user.publicKey}`);
 
       return res.status(200).json({
@@ -159,6 +220,7 @@ export const withdrawHandler = async (req: AuthenticatedRequest, res: Response) 
         streamId: parsedStreamId,
         txHash: result.txHash,
         amount: claimable.claimableAmount,
+        version: stream.version + 1,
         stream: updatedStream,
       });
     } catch (sorobanError) {

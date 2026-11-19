@@ -15,6 +15,42 @@ export const updateStatus = async (streamId: bigint, status: 'ACTIVE' | 'CANCELL
   });
 };
 
+/**
+ * Compare-and-set status update.
+ *
+ * Applies the status change only when the stream's current `version` matches
+ * `expectedVersion`, incrementing the version atomically. Returns whether the
+ * update was applied so callers can emit a 409 conflict when it was not.
+ */
+export const updateStatusIfVersion = async (
+  streamId: bigint,
+  expectedVersion: number,
+  status: 'ACTIVE' | 'CANCELLED' | 'COMPLETED' | 'PAUSED',
+): Promise<boolean> => {
+  const result = await prisma.stream.updateMany({
+    where: { streamId, version: expectedVersion },
+    data: {
+      isActive: status === 'ACTIVE' || status === 'PAUSED',
+      version: { increment: 1 },
+    },
+  });
+
+  return result.count > 0;
+};
+
+/**
+ * Fetch the current version of a stream, or null if the stream does not exist.
+ * Used to build conflict payloads.
+ */
+export const getStreamVersion = async (streamId: bigint): Promise<number | null> => {
+  const stream = await prisma.stream.findUnique({
+    where: { streamId },
+    select: { version: true },
+  });
+
+  return stream?.version ?? null;
+};
+
 type StreamWhere = {
   sender?: string;
   recipient?: string;

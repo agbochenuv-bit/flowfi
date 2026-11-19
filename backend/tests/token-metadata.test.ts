@@ -10,6 +10,8 @@ import {
   resetTokenMetadata,
   upsertTokenMetadata,
   listVerifiedTokens,
+  resolveTokenMetadata,
+  TOKEN_METADATA_STALE_AFTER_MS,
 } from '../src/lib/token-metadata.js';
 import tokenRoutes, { TOKEN_CACHE_CONTROL } from '../src/routes/v1/token.routes.js';
 
@@ -142,5 +144,123 @@ describe('token metadata store', () => {
 
     expect(listVerifiedTokens().find((t) => t.symbol === 'USDC')).toBeDefined();
     expect(listVerifiedTokens().filter((t) => t.symbol === 'USDC')).toHaveLength(1);
+  });
+});
+
+describe('token metadata provenance and staleness', () => {
+  const RAW_AMOUNT = '12345678901234567890';
+
+  beforeEach(() => resetTokenMetadata());
+
+  it('reports a verified source for curated metadata', () => {
+    const resolved = resolveTokenMetadata('USDC', { now: Date.now() });
+
+    expect(resolved).not.toBeNull();
+    expect(resolved!.trustLevel).toBe('verified');
+    expect(resolved!.source).toBe('curated');
+    expect(resolved!.stale).toBe(false);
+    expect(resolved!.name).toBe('USD Coin');
+    expect(resolved!.decimals).toBe(7);
+  });
+
+  it('reports a cached source when metadata comes from the cache layer', () => {
+    const now = Date.now();
+    upsertTokenMetadata({
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 7,
+      contractAddress: 'CUSD',
+      type: 'credit_alphanum4',
+      verified: true,
+      source: 'cache',
+      updatedAt: now,
+    });
+
+    const resolved = resolveTokenMetadata('USDC', { now });
+    expect(resolved!.trustLevel).toBe('cached');
+    expect(resolved!.source).toBe('cache');
+    expect(resolved!.stale).toBe(false);
+  });
+
+  it('reports a fallback source with hint trust level', () => {
+    const resolved = resolveTokenMetadata('UNKNOWN', {
+      now: Date.now(),
+      fallback: { name: 'Unknown Token', decimals: 7 },
+    });
+
+    expect(resolved).not.toBeNull();
+    expect(resolved!.trustLevel).toBe('hint');
+    expect(resolved!.source).toBe('fallback');
+    expect(resolved!.name).toBe('Unknown Token');
+    expect(resolved!.decimals).toBe(7);
+  });
+
+  it('returns null when no metadata source is available and no fallback is given', () => {
+    expect(resolveTokenMetadata('UNKNOWN', { now: Date.now() })).toBeNull();
+  });
+
+  it('rejects malformed metadata and falls back without touching raw amounts', () => {
+    upsertTokenMetadata({
+      symbol: 'BAD',
+      name: '',
+      decimals: -1,
+      contractAddress: 'CBAD',
+      type: 'credit_alphanum4',
+      verified: true,
+    });
+
+    const resolved = resolveTokenMetadata('BAD', {
+      now: Date.now(),
+      fallback: { name: 'BAD', decimals: 7 },
+    });
+
+    expect(resolved!.trustLevel).toBe('hint');
+    expect(resolved!.source).toBe('fallback');
+    expect(resolved!.decimals).toBe(7);
+    expect(RAW_AMOUNT).toBe('12345678901234567890');
+  });
+
+  it('marks metadata stale exactly at the threshold boundary', () => {
+    const now = Date.now();
+    upsertTokenMetadata({
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 7,
+      contractAddress: 'CUSD',
+      type: 'credit_alphanum4',
+      verified: true,
+      source: 'curated',
+      updatedAt: now - TOKEN_METADATA_STALE_AFTER_MS,
+    });
+
+    const atBoundary = resolveTokenMetadata('USDC', { now });
+    expect(atBoundary!.stale).toBe(true);
+    expect(atBoundary!.trustLevel).toBe('verified');
+
+    upsertTokenMetadata({
+      symbol: 'USDC',
+      name: 'USD Coin',
+      decimals: 7,
+      contractAddress: 'CUSD',
+      type: 'credit_alphanum4',
+      verified: true,
+      source: 'curated',
+      updatedAt: now - TOKEN_METADATA_STALE_AFTER_MS + 1,
+    });
+
+    const justFresh = resolveTokenMetadata('USDC', { now });
+    expect(justFresh!.stale).toBe(false);
+  });
+
+  it('keeps raw on-chain amounts unchanged regardless of metadata trust', () => {
+    const verified = resolveTokenMetadata('USDC', { now: Date.now() });
+    const fallback = resolveTokenMetadata('UNKNOWN', {
+      now: Date.now(),
+      fallback: { name: 'Unknown', decimals: 7 },
+    });
+
+    expect(verified!.trustLevel).toBe('verified');
+    expect(fallback!.trustLevel).toBe('hint');
+    expect(RAW_AMOUNT).toBe('12345678901234567890');
   });
 });

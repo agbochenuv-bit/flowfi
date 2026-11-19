@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from 'express';
 import { requireAuth, verifyJwt } from './auth.js';
 import type { AuthenticatedRequest } from '../types/auth.types.js';
+import { isSessionActive } from '../services/session.service.js';
 
 /**
  * Extract Bearer token from Authorization header
@@ -21,14 +22,64 @@ function extractBearerToken(req: Request): string | null {
 }
 
 /**
- * Authentication middleware alias
+ * Stable error code returned when a wallet session has been revoked or has
+ * expired. Clients can use this to distinguish revocation from other 401s.
+ */
+export const SESSION_REVOKED_CODE = 'SESSION_REVOKED';
+
+/**
+ * Attach the session identifier carried by a verified JWT payload onto the
+ * authenticated request user, when present.
+ */
+function attachSession(req: Request, payload: { publicKey: string; sessionId?: string }): void {
+  const user: AuthenticatedRequest['user'] = { publicKey: payload.publicKey };
+  if (payload.sessionId) {
+    user.sessionId = payload.sessionId;
+  }
+  (req as AuthenticatedRequest).user = user;
+}
+
+/**
+ * Authentication middleware
  *
  * Uses JWT authentication via the standard challenge/verify flow.
  * Verification is kid-aware: tokens are validated against the active
  * verification-key set (active overlap keys plus any still-valid keys),
  * and tokens signed by retired or unknown keys are rejected.
+ *
+ * After signature verification the session identifier embedded in the token
+ * is checked against the session inventory. Revoked or expired sessions are
+ * rejected with 401 and the stable {@link SESSION_REVOKED_CODE} code. The
+ * session id is propagated onto `req.user.sessionId` for downstream handlers.
  */
-export const authMiddleware = requireAuth;
+export const authMiddleware = (
+  req: Request,
+  res: Response,
+  next: NextFunction
+): void => {
+  requireAuth(req, res, (error?: unknown) => {
+    if (error) {
+      next(error);
+      return;
+    }
+
+    const user = (req as AuthenticatedRequest).user;
+    if (!user) {
+      // requireAuth already responded with 401.
+      return;
+    }
+
+    if (user.sessionId && !isSessionActive(user.sessionId)) {
+      res.status(401).json({
+        error: 'Session has been revoked or has expired',
+        code: SESSION_REVOKED_CODE,
+      });
+      return;
+    }
+
+    next();
+  });
+};
 
 /**
  * Optional authentication middleware
@@ -49,7 +100,11 @@ export const optionalAuthMiddleware = (
   if (token) {
     const payload = verifyJwt(token);
     if (payload) {
-      (req as AuthenticatedRequest).user = { publicKey: payload.publicKey };
+      // Revoked or expired sessions are treated as unauthenticated for
+      // optional routes rather than producing an error.
+      if (!payload.sessionId || isSessionActive(payload.sessionId)) {
+        attachSession(req, payload);
+      }
     }
   }
 

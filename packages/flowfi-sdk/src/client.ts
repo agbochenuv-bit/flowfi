@@ -39,8 +39,12 @@ import { abortable, runWithCancellation, throwIfAborted, withAbortSignal } from 
 import type { OperationOptions } from './cancellation.js';
 import type { Signer } from './signers/index.js';
 import type {
+  ActionReadiness,
   CreateStreamParams,
   FlowFiClientConfig,
+  FlowFiSession,
+  FlowFiSessionList,
+  StreamConflict,
   StreamDetails,
   StreamResult,
   SubmitResult,
@@ -48,6 +52,43 @@ import type {
 } from './types.js';
 
 export type { FlowFiClientConfig };
+
+/**
+ * Error thrown when a mutation is rejected because the stream changed since the
+ * caller reviewed it (HTTP 409). Carries the current version metadata so the
+ * caller can re-read the stream and retry with a fresh `expectedVersion`.
+ *
+ * Wallet-signed transaction semantics are unchanged: the conflict is detected
+ * before any transaction is built/signed, so no signature is ever produced for
+ * a stale mutation.
+ */
+export class StreamConflictError extends Error {
+  readonly code = 'STREAM_VERSION_CONFLICT' as const;
+  readonly streamId: bigint;
+  readonly expectedVersion: bigint;
+  readonly currentVersion: bigint;
+  readonly current: StreamDetails | null;
+
+  constructor(conflict: StreamConflict) {
+    super(
+      `FlowFiClient: stream ${conflict.streamId} changed (expected version ${conflict.expectedVersion}, current ${conflict.currentVersion})`,
+    );
+    this.name = 'StreamConflictError';
+    this.streamId = conflict.streamId;
+    this.expectedVersion = conflict.expectedVersion;
+    this.currentVersion = conflict.currentVersion;
+    this.current = conflict.current ?? null;
+  }
+}
+
+/** Options accepted by every mutating write path. */
+export interface MutationOptions extends OperationOptions {
+  /**
+   * State version the caller reviewed. When provided, the mutation is rejected
+   * with a {@link StreamConflictError} if the stream has since changed.
+   */
+  expectedVersion?: bigint;
+}
 
 export class FlowFiClient {
   private config: Required<Pick<FlowFiClientConfig, 'rpcUrl' | 'networkPassphrase' | 'contractId'>> &
@@ -118,10 +159,11 @@ export class FlowFiClient {
   }
 
   /** Top up an active stream with additional tokens (sender-signed). */
-  async topUpStream(streamId: bigint, amount: bigint, signer: Signer, opts?: OperationOptions): Promise<SubmitResult> {
+  async topUpStream(streamId: bigint, amount: bigint, signer: Signer, opts?: MutationOptions): Promise<SubmitResult> {
     return runWithCancellation(opts, async (signal) => {
       if (amount <= 0n) throw new Error('topUpStream: amount must be > 0');
       const sender = await abortable(Promise.resolve(signer.getPublicKey({ signal })), signal);
+      await this.assertFresh(streamId, opts?.expectedVersion, signal);
       const unsigned = await buildTopUpXdr(streamId, sender, amount, this.baseBuildArgs(sender));
       const { transactionHash } = await this.signAndSubmit(unsigned, signer, signal);
       return { transactionHash };
@@ -129,9 +171,10 @@ export class FlowFiClient {
   }
 
   /** Cancel an active stream (sender-signed; settles + refunds). */
-  async cancelStream(streamId: bigint, signer: Signer, opts?: OperationOptions): Promise<SubmitResult> {
+  async cancelStream(streamId: bigint, signer: Signer, opts?: MutationOptions): Promise<SubmitResult> {
     return runWithCancellation(opts, async (signal) => {
       const sender = await abortable(Promise.resolve(signer.getPublicKey({ signal })), signal);
+      await this.assertFresh(streamId, opts?.expectedVersion, signal);
       const unsigned = await buildCancelXdr(streamId, sender, this.baseBuildArgs(sender));
       const { transactionHash } = await this.signAndSubmit(unsigned, signer, signal);
       return { transactionHash };
@@ -139,12 +182,88 @@ export class FlowFiClient {
   }
 
   /** Prune a fully settled stream's storage entry (sender/recipient/admin). */
-  async closeStream(streamId: bigint, signer: Signer, opts?: OperationOptions): Promise<SubmitResult> {
+  async closeStream(streamId: bigint, signer: Signer, opts?: MutationOptions): Promise<SubmitResult> {
     return runWithCancellation(opts, async (signal) => {
       const caller = await abortable(Promise.resolve(signer.getPublicKey({ signal })), signal);
+      await this.assertFresh(streamId, opts?.expectedVersion, signal);
       const unsigned = await buildCloseXdr(streamId, caller, this.baseBuildArgs(caller));
       const { transactionHash } = await this.signAndSubmit(unsigned, signer, signal);
       return { transactionHash };
+    });
+  }
+
+  // ─── Preflight readiness (no signing, no submission) ───────────────────────
+
+  /**
+   * Return machine-readable readiness checks for a stream action.
+   *
+   * Results are advisory only: a `ready` result does NOT promise the
+   * transaction will succeed (state can change between the check and the
+   * submission). `blockers` must be resolved before attempting the action;
+   * `warnings` are informational.
+   */
+  async getActionReadiness(
+    streamId: bigint,
+    action: 'withdraw' | 'top_up' | 'cancel' | 'close',
+    opts?: OperationOptions & { expectedVersion?: bigint },
+  ): Promise<ActionReadiness> {
+    return runWithCancellation(opts, async (signal) => {
+      if (this.rpcClient && typeof (this.rpcClient as { getActionReadiness?: unknown }).getActionReadiness === 'function') {
+        return abortable(
+          (this.rpcClient as {
+            getActionReadiness: (
+              id: bigint,
+              action: string,
+              opts?: { expectedVersion?: bigint },
+            ) => Promise<ActionReadiness>;
+          }).getActionReadiness(streamId, action, { expectedVersion: opts?.expectedVersion }),
+          signal,
+        );
+      }
+      // Without a backend shim we cannot evaluate authorization/network/asset
+      // checks locally; surface a single explicit blocker rather than guessing.
+      return {
+        streamId,
+        action,
+        ready: false,
+        blockers: [{ code: 'READINESS_UNAVAILABLE', message: 'Readiness checks require a backend RPC shim' }],
+        warnings: [],
+      };
+    });
+  }
+
+  // ─── Wallet sessions (inventory + revocation) ──────────────────────────────
+
+  /**
+   * List active wallet-authenticated sessions for the current wallet.
+   * Session identifiers are opaque; signing secrets are never returned.
+   */
+  async listSessions(opts?: OperationOptions): Promise<FlowFiSessionList> {
+    return runWithCancellation(opts, async (signal) => {
+      if (this.rpcClient && typeof (this.rpcClient as { listSessions?: unknown }).listSessions === 'function') {
+        return abortable(
+          (this.rpcClient as { listSessions: () => Promise<FlowFiSessionList> }).listSessions(),
+          signal,
+        );
+      }
+      throw new Error('FlowFiClient: listSessions requires a backend RPC shim');
+    });
+  }
+
+  /**
+   * Revoke a single wallet session by its opaque session ID. Revocation takes
+   * effect immediately for both API calls and SSE streams.
+   */
+  async revokeSession(sessionId: string, opts?: OperationOptions): Promise<FlowFiSession> {
+    return runWithCancellation(opts, async (signal) => {
+      if (!sessionId) throw new Error('revokeSession: sessionId is required');
+      if (this.rpcClient && typeof (this.rpcClient as { revokeSession?: unknown }).revokeSession === 'function') {
+        return abortable(
+          (this.rpcClient as { revokeSession: (id: string) => Promise<FlowFiSession> }).revokeSession(sessionId),
+          signal,
+        );
+      }
+      throw new Error('FlowFiClient: revokeSession requires a backend RPC shim');
     });
   }
 
@@ -172,6 +291,28 @@ export class FlowFiClient {
   }
 
   // ─── Internals ─────────────────────────────────────────────────────────────
+
+  /**
+   * Reject a mutation when the caller supplied an `expectedVersion` that no
+   * longer matches the stream's current version. Runs before any transaction is
+   * built or signed, so wallet authorization semantics are untouched.
+   */
+  private async assertFresh(streamId: bigint, expectedVersion: bigint | undefined, signal: AbortSignal): Promise<void> {
+    if (expectedVersion === undefined) return;
+    const current = await this.getStream(streamId, { signal });
+    if (current === null) {
+      throw new StreamConflictError({
+        streamId,
+        expectedVersion,
+        currentVersion: 0n,
+        current: null,
+      });
+    }
+    const currentVersion = current.version ?? 0n;
+    if (currentVersion !== expectedVersion) {
+      throw new StreamConflictError({ streamId, expectedVersion, currentVersion, current });
+    }
+  }
 
   private baseBuildArgs(sourceAccount: string): {
     sourceAccount: string;

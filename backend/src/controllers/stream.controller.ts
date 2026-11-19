@@ -651,7 +651,64 @@ const topUpBodySchema = z.object({
       TOP_UP_AMOUNT_MAX_DIGITS,
       `amount must be at most ${TOP_UP_AMOUNT_MAX_DIGITS} digits long`,
     ),
+  // Issue #237: optional optimistic-concurrency precondition. When supplied,
+  // the mutation is rejected with a stable 409 if the stream's version has
+  // advanced since the client reviewed it.
+  expectedVersion: z.number().int().nonnegative().optional(),
 });
+
+/**
+ * Issue #237: parse an optional `expectedVersion` precondition from a request
+ * body. Returns `undefined` when the field is absent (backwards compatible),
+ * `null` when present but malformed, or the parsed integer otherwise.
+ */
+function parseExpectedVersion(body: unknown): number | undefined | null {
+  if (body === null || typeof body !== "object") return undefined;
+  const raw = (body as Record<string, unknown>)["expectedVersion"];
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 0) return null;
+  return raw;
+}
+
+/**
+ * Issue #237: stable conflict response for stale stream mutations. Includes the
+ * current version metadata so clients can re-read, re-review and retry.
+ */
+function sendVersionConflict(
+  res: Response,
+  streamId: string,
+  currentVersion: number,
+  expectedVersion: number,
+) {
+  return res.status(409).json({
+    error: "VERSION_CONFLICT",
+    code: "VERSION_CONFLICT",
+    message:
+      "The stream changed since it was reviewed. Re-fetch the stream and retry with the current version.",
+    streamId,
+    expectedVersion,
+    currentVersion,
+    currentVersionMetadata: {
+      streamId,
+      version: currentVersion,
+    },
+  });
+}
+
+/**
+ * Issue #237: atomically bump a stream's version, but only if it still matches
+ * the version the caller reviewed. Returns true when the bump succeeded.
+ */
+async function bumpStreamVersion(
+  streamId: string,
+  expectedVersion: number,
+): Promise<boolean> {
+  const result = await prisma.stream.updateMany({
+    where: { streamId, version: expectedVersion },
+    data: { version: { increment: 1 } },
+  });
+  return result.count === 1;
+}
 
 /**
  * POST /v1/streams/:streamId/top-up
@@ -677,6 +734,16 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
     return sendApiError(res, 400, "INVALID_AMOUNT", "amount must be a positive integer");
   }
 
+  const expectedVersion = parseExpectedVersion(req.body);
+  if (expectedVersion === null) {
+    return sendApiError(
+      res,
+      400,
+      "INVALID_EXPECTED_VERSION",
+      "expectedVersion must be a non-negative integer",
+    );
+  }
+
   const callerAddress = (req as AuthenticatedRequest).user?.publicKey;
   if (!callerAddress) {
     return sendApiError(res, 401, "UNAUTHORIZED", "Authentication required");
@@ -698,6 +765,11 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
       return sendApiError(res, 409, "CONFLICT", "Cannot top up a paused stream");
     }
 
+    // Issue #237: reject stale mutations before touching the chain.
+    if (expectedVersion !== undefined && stream.version !== expectedVersion) {
+      return sendVersionConflict(res, streamId, stream.version, expectedVersion);
+    }
+
     const txHash = await topUpStream(streamId, amount, callerAddress);
 
     // Use raw SQL atomic increment to prevent concurrent top-ups from
@@ -707,7 +779,7 @@ export const topUpStreamHandler = async (req: Request, res: Response) => {
     // directly in a single SQL statement.
     const now = BigInt(Math.floor(Date.now() / 1000));
     await prisma.$executeRawUnsafe(
-      `UPDATE "Stream" SET "depositedAmount" = ("depositedAmount"::bigint + $1::bigint)::text, "lastUpdateTime" = $2 WHERE "streamId" = $3`,
+      `UPDATE "Stream" SET "depositedAmount" = ("depositedAmount"::bigint + $1::bigint)::text, "lastUpdateTime" = $2, "version" = "version" + 1 WHERE "streamId" = $3`,
       amount.toString(),
       now,
       streamId,
@@ -768,12 +840,56 @@ export const pauseStream = async (req: Request, res: Response) => {
       return sendApiError(res, 409, "CONFLICT", "Cannot pause an inactive stream");
     }
 
+    // Issue #237: reject stale mutations before touching the chain.
+    const expectedVersion = parseExpectedVersion(req.body);
+    if (expectedVersion === null) {
+      return sendApiError(
+        res,
+        400,
+        "INVALID_EXPECTED_VERSION",
+        "expectedVersion must be a non-negative integer",
+      );
+    }
+    if (expectedVersion !== undefined && stream.version !== expectedVersion) {
+      return sendVersionConflict(
+        res,
+        String(parsedStreamId),
+        stream.version,
+        expectedVersion,
+      );
+    }
+
     try {
       // Call Soroban service to verify the pause operation would succeed
       const result = await sorobanPauseStream(
         authReq.user.publicKey,
         parsedStreamId,
       );
+
+      // Issue #237: bump the version atomically after a successful mutation.
+      if (expectedVersion !== undefined) {
+        const bumped = await bumpStreamVersion(
+          String(parsedStreamId),
+          expectedVersion,
+        );
+        if (!bumped) {
+          const current = await prisma.stream.findUnique({
+            where: { streamId: parsedStreamId },
+            select: { version: true },
+          });
+          return sendVersionConflict(
+            res,
+            String(parsedStreamId),
+            current?.version ?? stream.version + 1,
+            expectedVersion,
+          );
+        }
+      } else {
+        await prisma.stream.update({
+          where: { streamId: parsedStreamId },
+          data: { version: { increment: 1 } },
+        });
+      }
 
       logger.info(
         `Stream ${parsedStreamId} pause simulated by ${authReq.user.publicKey}`,
@@ -837,12 +953,56 @@ export const resumeStream = async (req: Request, res: Response) => {
       return sendApiError(res, 409, "CONFLICT", "Stream is not paused");
     }
 
+    // Issue #237: reject stale mutations before touching the chain.
+    const expectedVersion = parseExpectedVersion(req.body);
+    if (expectedVersion === null) {
+      return sendApiError(
+        res,
+        400,
+        "INVALID_EXPECTED_VERSION",
+        "expectedVersion must be a non-negative integer",
+      );
+    }
+    if (expectedVersion !== undefined && stream.version !== expectedVersion) {
+      return sendVersionConflict(
+        res,
+        String(parsedStreamId),
+        stream.version,
+        expectedVersion,
+      );
+    }
+
     try {
       // Call Soroban service to verify the resume operation would succeed
       const result = await sorobanResumeStream(
         authReq.user.publicKey,
         parsedStreamId,
       );
+
+      // Issue #237: bump the version atomically after a successful mutation.
+      if (expectedVersion !== undefined) {
+        const bumped = await bumpStreamVersion(
+          String(parsedStreamId),
+          expectedVersion,
+        );
+        if (!bumped) {
+          const current = await prisma.stream.findUnique({
+            where: { streamId: parsedStreamId },
+            select: { version: true },
+          });
+          return sendVersionConflict(
+            res,
+            String(parsedStreamId),
+            current?.version ?? stream.version + 1,
+            expectedVersion,
+          );
+        }
+      } else {
+        await prisma.stream.update({
+          where: { streamId: parsedStreamId },
+          data: { version: { increment: 1 } },
+        });
+      }
 
       logger.info(
         `Stream ${parsedStreamId} resume simulated by ${authReq.user.publicKey}`,
@@ -863,6 +1023,181 @@ export const resumeStream = async (req: Request, res: Response) => {
     }
   } catch (error) {
     logger.error("Error resuming stream:", error);
+    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
+  }
+};
+
+/**
+ * Issue #248: machine-readable action readiness checks.
+ *
+ * Returns preflight results for common stream actions. Each check carries a
+ * stable `code`, a `severity` of `warning` or `blocker`, and a human-readable
+ * message. Blockers mean the action would fail the API's own preconditions;
+ * warnings are advisory (e.g. stale indexer data).
+ *
+ * IMPORTANT: readiness is a best-effort preflight. It does NOT guarantee that
+ * a wallet-signed transaction will succeed on-chain — state can change between
+ * this check and execution (race conditions), and the chain remains the source
+ * of truth. Clients must still handle on-chain failures and version conflicts.
+ */
+export const getStreamReadiness = async (req: Request, res: Response) => {
+  try {
+    const streamIdParam = Array.isArray(req.params.streamId)
+      ? req.params.streamId[0]
+      : req.params.streamId;
+    const parsedStreamId = parseStreamId(streamIdParam);
+    if (parsedStreamId === null) {
+      return sendApiError(res, 400, "INVALID_STREAM_ID", "Invalid streamId parameter");
+    }
+
+    const callerAddress = (req as AuthenticatedRequest).user?.publicKey;
+    const configuredNetwork = getConfiguredStellarNetwork();
+    const requestedNetwork =
+      typeof req.query.network === "string" ? req.query.network : undefined;
+
+    const stream = await prisma.stream.findUnique({
+      where: { streamId: parsedStreamId },
+    });
+
+    if (!stream) {
+      return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
+    }
+
+    type Severity = "warning" | "blocker";
+    interface ReadinessCheck {
+      code: string;
+      severity: Severity;
+      message: string;
+    }
+    const checks: ReadinessCheck[] = [];
+
+    // --- Network check ---
+    if (requestedNetwork !== undefined && requestedNetwork !== configuredNetwork) {
+      checks.push({
+        code: "NETWORK_MISMATCH",
+        severity: "blocker",
+        message: `This indexer serves ${configuredNetwork}, not ${requestedNetwork}.`,
+      });
+    } else {
+      checks.push({
+        code: "NETWORK_OK",
+        severity: "warning",
+        message: `Network matches the configured indexer (${configuredNetwork}).`,
+      });
+    }
+
+    // --- Authorization check ---
+    if (!callerAddress) {
+      checks.push({
+        code: "UNAUTHORIZED",
+        severity: "blocker",
+        message: "Authentication required to perform sender actions.",
+      });
+    } else if (stream.sender !== callerAddress) {
+      checks.push({
+        code: "NOT_SENDER",
+        severity: "blocker",
+        message: "Only the stream sender may perform this action.",
+      });
+    } else {
+      checks.push({
+        code: "AUTHORIZED",
+        severity: "warning",
+        message: "Authenticated wallet matches the stream sender.",
+      });
+    }
+
+    // --- Asset validity check ---
+    if (!stream.tokenAddress || stream.tokenAddress.trim() === "") {
+      checks.push({
+        code: "INVALID_ASSET",
+        severity: "blocker",
+        message: "Stream has no valid token address.",
+      });
+    } else {
+      checks.push({
+        code: "ASSET_OK",
+        severity: "warning",
+        message: "Stream token address is present.",
+      });
+    }
+
+    // --- Freshness check ---
+    if (isStale(stream.updatedAt)) {
+      checks.push({
+        code: "STALE_INDEX",
+        severity: "warning",
+        message:
+          "Indexed stream data is stale; re-fetch before submitting a transaction.",
+      });
+    } else {
+      checks.push({
+        code: "FRESH",
+        severity: "warning",
+        message: "Indexed stream data is fresh.",
+      });
+    }
+
+    // --- Action-specific state checks ---
+    const action = typeof req.query.action === "string" ? req.query.action : undefined;
+    if (action === "top-up") {
+      if (!stream.isActive) {
+        checks.push({
+          code: "STREAM_INACTIVE",
+          severity: "blocker",
+          message: "Cannot top up an inactive stream.",
+        });
+      }
+      if (stream.isPaused) {
+        checks.push({
+          code: "STREAM_PAUSED",
+          severity: "blocker",
+          message: "Cannot top up a paused stream.",
+        });
+      }
+    } else if (action === "pause") {
+      if (stream.isPaused) {
+        checks.push({
+          code: "ALREADY_PAUSED",
+          severity: "blocker",
+          message: "Stream is already paused.",
+        });
+      }
+      if (!stream.isActive) {
+        checks.push({
+          code: "STREAM_INACTIVE",
+          severity: "blocker",
+          message: "Cannot pause an inactive stream.",
+        });
+      }
+    } else if (action === "resume") {
+      if (!stream.isPaused) {
+        checks.push({
+          code: "NOT_PAUSED",
+          severity: "blocker",
+          message: "Stream is not paused.",
+        });
+      }
+    }
+
+    const blockers = checks.filter((c) => c.severity === "blocker");
+    const warnings = checks.filter((c) => c.severity === "warning");
+
+    return res.status(200).json({
+      streamId: String(parsedStreamId),
+      action: action ?? null,
+      ready: blockers.length === 0,
+      version: stream.version,
+      checks,
+      blockers,
+      warnings,
+      // Explicitly document that readiness is advisory only.
+      guaranteesTransactionSuccess: false,
+      note:
+        "Readiness is a best-effort preflight. It does not guarantee that a wallet-signed transaction will succeed; state may change before execution.",
+    });
+  } catch (error) {
+    logger.error("Error computing stream readiness:", error);
     return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
   }
 };

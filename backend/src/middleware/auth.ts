@@ -231,7 +231,7 @@ function decodeJwtHeader(header: string): { kid?: unknown } | null {
   }
 }
 
-export function verifyJwt(token: string): { publicKey: string } | null {
+export function verifyJwt(token: string): { publicKey: string; sessionId?: string } | null {
   try {
     const [header, body, sig] = token.split('.');
     if (!header || !body || !sig) return null;
@@ -278,6 +278,18 @@ export function verifyJwt(token: string): { publicKey: string } | null {
     // Verify issuer and audience
     if (payload.iss !== JWT_ISSUER || payload.aud !== JWT_AUDIENCE) {
       return null;
+    }
+
+    // Session binding: tokens issued for a wallet session carry a `sid` claim.
+    // Reject tokens whose session has been revoked or has expired so that
+    // revocation takes effect immediately across every API route.
+    if (payload.sid !== undefined) {
+      if (typeof payload.sid !== 'string' || payload.sid === '') return null;
+      const session = getWalletSession(payload.sid);
+      if (!session) return null;
+      if (session.publicKey !== payload.sub) return null;
+      if (isWalletSessionRevoked(session)) return null;
+      return { publicKey: payload.sub, sessionId: payload.sid };
     }
 
     return { publicKey: payload.sub };
@@ -334,6 +346,146 @@ export function verifySseTicket(token: string): SseTicket | null {
   }
 }
 
+// ─── Wallet session store ───────────────────────────────────────────────────
+//
+// A wallet session is created on successful challenge verification. Only the
+// opaque session id (a random 32-byte hex string) is persisted — never the
+// signing secret or the JWT itself. The session id is embedded in the JWT as
+// the `sid` claim; `verifyJwt` consults this store on every request so that
+// revoking a session invalidates its tokens immediately.
+//
+// Sessions expire at `expiresAt` (absolute wall-clock time, milliseconds). A
+// session is considered revoked once `revokedAt` is set. Expired sessions are
+// swept periodically; revocation is checked lazily on every verification so a
+// sweep is only needed to reclaim memory.
+
+export interface WalletSession {
+  /** Opaque session identifier (also the JWT `sid` claim). */
+  id: string;
+  /** Stellar public key (G...) of the wallet that owns the session. */
+  publicKey: string;
+  /** Creation time (ms since epoch). */
+  createdAt: number;
+  /** Last time the session was seen on an authenticated request (ms). */
+  lastSeenAt: number;
+  /** Absolute expiry time (ms since epoch). */
+  expiresAt: number;
+  /** Set when the session is revoked (ms since epoch). */
+  revokedAt?: number;
+  /** Free-form metadata: user agent, IP, client label, etc. */
+  metadata: Record<string, unknown>;
+}
+
+const WALLET_SESSION_TTL_MS = JWT_EXPIRY_SECONDS * 1000;
+
+// session id -> session record
+const walletSessions = new Map<string, WalletSession>();
+
+const DEFAULT_SESSION_SWEEP_INTERVAL_MS = 5 * 60 * 1000;
+let sessionSweepTimer: NodeJS.Timeout | undefined;
+
+function resolveSessionSweepIntervalMs(): number {
+  const raw = process.env.AUTH_SESSION_SWEEP_INTERVAL_MS;
+  if (!raw) return DEFAULT_SESSION_SWEEP_INTERVAL_MS;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_SESSION_SWEEP_INTERVAL_MS;
+}
+
+export function isWalletSessionRevoked(
+  session: WalletSession,
+  now = Date.now(),
+): boolean {
+  return session.revokedAt !== undefined || session.expiresAt <= now;
+}
+
+export function getWalletSession(id: string): WalletSession | undefined {
+  const session = walletSessions.get(id);
+  return session ? { ...session, metadata: { ...session.metadata } } : undefined;
+}
+
+export function createWalletSession(
+  publicKey: string,
+  metadata: Record<string, unknown> = {},
+  now = Date.now(),
+): WalletSession {
+  const session: WalletSession = {
+    id: crypto.randomBytes(32).toString('hex'),
+    publicKey,
+    createdAt: now,
+    lastSeenAt: now,
+    expiresAt: now + WALLET_SESSION_TTL_MS,
+    metadata: { ...metadata },
+  };
+  walletSessions.set(session.id, session);
+  return { ...session, metadata: { ...session.metadata } };
+}
+
+/**
+ * Mark a session revoked. Returns `true` if the session existed and was not
+ * already revoked. Revocation is immediate: subsequent `verifyJwt` calls for
+ * tokens carrying this `sid` will fail.
+ */
+export function revokeWalletSession(id: string, now = Date.now()): boolean {
+  const session = walletSessions.get(id);
+  if (!session) return false;
+  if (session.revokedAt !== undefined) return false;
+  session.revokedAt = now;
+  return true;
+}
+
+/** Record that a session was used on an authenticated request. */
+export function touchWalletSession(id: string, now = Date.now()): void {
+  const session = walletSessions.get(id);
+  if (!session) return;
+  if (isWalletSessionRevoked(session, now)) return;
+  session.lastSeenAt = now;
+}
+
+/** List active (non-revoked, non-expired) sessions for a wallet. */
+export function listWalletSessions(
+  publicKey: string,
+  now = Date.now(),
+): WalletSession[] {
+  const out: WalletSession[] = [];
+  for (const session of walletSessions.values()) {
+    if (session.publicKey !== publicKey) continue;
+    if (isWalletSessionRevoked(session, now)) continue;
+    out.push({ ...session, metadata: { ...session.metadata } });
+  }
+  return out.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+}
+
+export function sweepExpiredWalletSessions(now = Date.now()): number {
+  let deleted = 0;
+  for (const [id, session] of walletSessions.entries()) {
+    if (session.expiresAt <= now) {
+      walletSessions.delete(id);
+      deleted += 1;
+    }
+  }
+  return deleted;
+}
+
+export function startWalletSessionSweep(
+  intervalMs = resolveSessionSweepIntervalMs(),
+): void {
+  if (sessionSweepTimer) return;
+  sessionSweepTimer = setInterval(() => {
+    sweepExpiredWalletSessions();
+  }, intervalMs);
+  sessionSweepTimer.unref?.();
+}
+
+export function stopWalletSessionSweep(): void {
+  if (!sessionSweepTimer) return;
+  clearInterval(sessionSweepTimer);
+  sessionSweepTimer = undefined;
+}
+
+startWalletSessionSweep();
+
 // ─── Challenge / Verify handlers ────────────────────────────────────────────
 
 function resolveNetworkPassphrase(): string {
@@ -381,6 +533,24 @@ export const __authChallengeTestUtils = {
     challenges.clear();
   },
   CHALLENGE_TTL_MS,
+};
+
+export const __authSessionTestUtils = {
+  sessions: walletSessions,
+  createWalletSession,
+  getWalletSession,
+  revokeWalletSession,
+  touchWalletSession,
+  listWalletSessions,
+  sweepExpiredWalletSessions,
+  startWalletSessionSweep,
+  stopWalletSessionSweep,
+  isWalletSessionRevoked,
+  /** Remove all session records (test isolation). */
+  clearWalletSessions(): void {
+    walletSessions.clear();
+  },
+  WALLET_SESSION_TTL_MS,
 };
 
 export const __authKeyTestUtils = {
@@ -484,8 +654,24 @@ export function verifyChallenge(req: Request, res: Response): void {
     }
 
     const now = Math.floor(Date.now() / 1000);
-    const token = signJwt({ sub: publicKey, iat: now, exp: now + JWT_EXPIRY_SECONDS, iss: JWT_ISSUER, aud: JWT_AUDIENCE });
-    res.json({ token, expiresIn: JWT_EXPIRY_SECONDS });
+    const session = createWalletSession(publicKey, {
+      userAgent: req.headers['user-agent'],
+      ip: req.ip,
+    });
+    const token = signJwt({
+      sub: publicKey,
+      sid: session.id,
+      iat: now,
+      exp: now + JWT_EXPIRY_SECONDS,
+      iss: JWT_ISSUER,
+      aud: JWT_AUDIENCE,
+    });
+    res.json({
+      token,
+      expiresIn: JWT_EXPIRY_SECONDS,
+      sessionId: session.id,
+      sessionExpiresAt: session.expiresAt,
+    });
   } catch (err) {
     logger.error('[Auth] verifyChallenge error:', err);
     res.status(401).json({ error: 'Invalid signed transaction' });
@@ -505,7 +691,13 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
     res.status(401).json({ error: 'Unauthorized', message: 'Invalid or expired token' });
     return;
   }
-  (req as AuthenticatedRequest).user = { publicKey: payload.publicKey };
+  if (payload.sessionId) {
+    touchWalletSession(payload.sessionId);
+  }
+  (req as AuthenticatedRequest).user = {
+    publicKey: payload.publicKey,
+    sessionId: payload.sessionId,
+  };
   next();
 }
 

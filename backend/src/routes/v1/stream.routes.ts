@@ -13,6 +13,7 @@ import {
 } from '../../controllers/stream.controller.js';
 import { cancelStreamHandler } from '../../controllers/stream/cancel.js';
 import { simulateStreamHandler } from '../../controllers/stream/simulate.js';
+import { getStreamReadinessHandler } from '../../controllers/stream/readiness.js';
 import { withdrawHandler } from './streams/withdraw.js';
 
 const router = Router();
@@ -214,12 +215,84 @@ router.get('/:streamId/claimable', getStreamClaimableAmount);
 
 /**
  * @openapi
+ * /v1/streams/{streamId}/readiness:
+ *   get:
+ *     tags: [Streams]
+ *     summary: Preflight readiness checks for common stream actions
+ *     description: |
+ *       Returns machine-readable readiness results for the actions available on
+ *       a stream (cancel, withdraw, top-up, pause, resume). Each check carries a
+ *       stable `code` and a `severity` of `blocker` or `warning`.
+ *
+ *       This is a best-effort preflight only. Results reflect state at the time
+ *       of the request and do NOT guarantee that a subsequent transaction will
+ *       succeed: the stream may change between this check and execution (for
+ *       example a concurrent cancel, a pause, or a balance change). Clients
+ *       should submit the returned `version` as `expectedVersion` on mutations
+ *       and handle `409 STREAM_VERSION_CONFLICT` by re-running readiness.
+ *
+ *       Readiness never authorizes a transaction; wallet signatures and
+ *       on-chain validation remain the source of truth.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: streamId
+ *         required: true
+ *         schema: { type: integer }
+ *     responses:
+ *       200:
+ *         description: Readiness report
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamReadinessResponse'
+ *       400:
+ *         description: Invalid streamId
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Stream not found
+ */
+router.get('/:streamId/readiness', requireAuth, getStreamReadinessHandler);
+
+/**
+ * @openapi
  * /v1/streams/{streamId}/top-up:
  *   post:
  *     tags: [Streams]
  *     summary: Add tokens to a running stream
+ *     description: |
+ *       Optionally accepts `expectedVersion` (the stream `version` the client
+ *       reviewed). If provided and the stream has changed since, the request is
+ *       rejected with `409 STREAM_VERSION_CONFLICT` and the current version
+ *       metadata. The wallet signature is still required and validated
+ *       independently; a matching version does not authorize the mutation.
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/StreamMutationRequest'
+ *     responses:
+ *       200:
+ *         description: Stream topped up
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Stream not found
+ *       409:
+ *         description: Stale stream version (STREAM_VERSION_CONFLICT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  */
 router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
 
@@ -229,8 +302,34 @@ router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
  *   post:
  *     tags: [Streams]
  *     summary: Pause a running stream
+ *     description: |
+ *       Optionally accepts `expectedVersion`. A stale version is rejected with
+ *       `409 STREAM_VERSION_CONFLICT`; wallet authorization is still enforced.
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/StreamMutationRequest'
+ *     responses:
+ *       200:
+ *         description: Stream paused
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Stream not found
+ *       409:
+ *         description: Stale stream version (STREAM_VERSION_CONFLICT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  */
 router.post('/:streamId/pause', requireAuth, pauseStream);
 
@@ -240,8 +339,34 @@ router.post('/:streamId/pause', requireAuth, pauseStream);
  *   post:
  *     tags: [Streams]
  *     summary: Resume a paused stream
+ *     description: |
+ *       Optionally accepts `expectedVersion`. A stale version is rejected with
+ *       `409 STREAM_VERSION_CONFLICT`; wallet authorization is still enforced.
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/StreamMutationRequest'
+ *     responses:
+ *       200:
+ *         description: Stream resumed
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Stream not found
+ *       409:
+ *         description: Stale stream version (STREAM_VERSION_CONFLICT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  */
 router.post('/:streamId/resume', requireAuth, resumeStream);
 
@@ -251,8 +376,34 @@ router.post('/:streamId/resume', requireAuth, resumeStream);
  *   post:
  *     tags: [Streams]
  *     summary: Cancel an active stream
+ *     description: |
+ *       Optionally accepts `expectedVersion`. A stale version is rejected with
+ *       `409 STREAM_VERSION_CONFLICT`; wallet authorization is still enforced.
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/StreamMutationRequest'
+ *     responses:
+ *       200:
+ *         description: Stream cancelled
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Stream not found
+ *       409:
+ *         description: Stale stream version (STREAM_VERSION_CONFLICT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  */
 router.post('/:streamId/cancel', requireAuth, cancelStreamHandler);
 
@@ -262,8 +413,34 @@ router.post('/:streamId/cancel', requireAuth, cancelStreamHandler);
  *   post:
  *     tags: [Streams]
  *     summary: Withdraw claimable balance from a stream
+ *     description: |
+ *       Optionally accepts `expectedVersion`. A stale version is rejected with
+ *       `409 STREAM_VERSION_CONFLICT`; wallet authorization is still enforced.
  *     security:
  *       - bearerAuth: []
+ *     requestBody:
+ *       required: false
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/StreamMutationRequest'
+ *     responses:
+ *       200:
+ *         description: Withdrawal recorded
+ *       400:
+ *         description: Validation error
+ *       401:
+ *         description: Unauthorized
+ *       403:
+ *         description: Forbidden
+ *       404:
+ *         description: Stream not found
+ *       409:
+ *         description: Stale stream version (STREAM_VERSION_CONFLICT)
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/StreamVersionConflict'
  */
 router.post('/:streamId/withdraw', requireAuth, withdrawHandler);
 

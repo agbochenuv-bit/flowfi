@@ -232,6 +232,47 @@ describe('SSEService — Issue 2: auth revalidation', () => {
     expect(service.getClientCount()).toBe(0);
   });
 
+  it('revokeSessionConnections evicts only connections bound to the revoked session', () => {
+    service = new SSEService();
+    const revokedRes = createMockResponse();
+    const otherRes = createMockResponse();
+
+    service.addClient('c1', revokedRes, [], '127.0.0.1', 'GUSER1', undefined, 'session-a');
+    service.addClient('c2', otherRes, [], '127.0.0.1', 'GUSER1', undefined, 'session-b');
+
+    service.revokeSessionConnections('session-a');
+    (service as any)._revalidateConnections();
+
+    expect(service.getClientCount()).toBe(1);
+    expect((service as any).clients.has('c2')).toBe(true);
+    expect(revokedRes.end).toHaveBeenCalled();
+    expect(otherRes.end).not.toHaveBeenCalled();
+  });
+
+  it('revokeSessionConnections is immediate and sends event: reconnect before closing', () => {
+    service = new SSEService();
+    const res = createMockResponse();
+    service.addClient('c1', res, [], '127.0.0.1', 'GUSER1', undefined, 'session-now');
+
+    service.revokeSessionConnections('session-now');
+
+    // No revalidation tick required — eviction happens synchronously.
+    expect(service.getClientCount()).toBe(0);
+    expect(res.written.join('')).toContain('event: reconnect');
+    expect(res.end).toHaveBeenCalled();
+  });
+
+  it('revokeSessionConnections leaves connections without a session id untouched', () => {
+    service = new SSEService();
+    const res = createMockResponse();
+    service.addClient('c1', res, [], '127.0.0.1', 'GUSER1');
+
+    service.revokeSessionConnections('session-x');
+    (service as any)._revalidateConnections();
+
+    expect(service.getClientCount()).toBe(1);
+  });
+
   it('does not evict connections that are still within the max age', () => {
     process.env.SSE_MAX_CONN_AGE_MS = '3600000';
     service = new SSEService();

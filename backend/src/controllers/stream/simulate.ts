@@ -4,6 +4,10 @@ import { ApiError } from '../../lib/api-error.js';
 import logger from '../../logger.js';
 import { simulateStreamAction, type StreamAction } from '../../services/sorobanService.js';
 import {
+  evaluateStreamActionReadiness,
+  type ReadinessReport,
+} from '../../services/streamReadinessService.js';
+import {
   getIdempotencyKey,
   runIdempotent,
   type IdempotencyScope,
@@ -31,6 +35,13 @@ const simulateBodySchema = z.object({
       tokenAddress: z.string().optional(),
     })
     .default({}),
+  /**
+   * Opt-in: when true, the response also carries a `readiness` report using
+   * the same stable codes and warning/blocker separation as
+   * GET /api/v1/streams/readiness. Defaults to false so the existing
+   * simulation response shape stays backwards compatible.
+   */
+  includeReadiness: z.boolean().optional().default(false),
 });
 
 /**
@@ -59,6 +70,15 @@ const simulateBodySchema = z.object({
  *                 type: string
  *               params:
  *                 type: object
+ *               includeReadiness:
+ *                 type: boolean
+ *                 default: false
+ *                 description: |
+ *                   When true, the response also includes a `readiness` report
+ *                   (stable codes, warnings vs blockers) so clients can
+ *                   preflight the action. Readiness is advisory only: it does
+ *                   not guarantee the simulated transaction will succeed, and
+ *                   state may change between the check and submission.
  *     responses:
  *       200:
  *         description: Simulation succeeded
@@ -90,11 +110,29 @@ export const simulateStreamHandler = async (req: Request, res: Response) => {
     });
   }
 
-  const { action, senderPublicKey, params } = parsed.data;
+  const { action, senderPublicKey, params, includeReadiness } = parsed.data;
 
   const execute = async () => {
     const data = await simulateStreamAction(action as StreamAction, senderPublicKey, params);
-    return { status: 200, body: { success: true, data } };
+    if (!includeReadiness) {
+      return { status: 200, body: { success: true, data } };
+    }
+
+    // Readiness is advisory: a failure to evaluate it must never fail the
+    // simulation itself, so we degrade to `null` and let the client retry via
+    // the dedicated readiness endpoint.
+    let readiness: ReadinessReport | null = null;
+    try {
+      readiness = await evaluateStreamActionReadiness(
+        action as StreamAction,
+        senderPublicKey,
+        params,
+      );
+    } catch (err) {
+      logger.warn(`[simulate] Readiness evaluation failed for action ${action}:`, err);
+    }
+
+    return { status: 200, body: { success: true, data, readiness } };
   };
 
   const idempotencyKey = getIdempotencyKey(req);

@@ -151,6 +151,25 @@ export const subscribe = async (req: Request, res: Response) => {
     // Issue 1: read Last-Event-ID from the HTTP header.
     const lastEventId = parseLastEventId(req);
 
+    // Issue #249: reject connections whose wallet session was revoked or has
+    // expired. The ticket carries the session id (never the signing secret),
+    // so revocation takes effect immediately for new SSE connections.
+    const sessionId = ticket.sessionId;
+    if (sessionId) {
+      const session = await prisma.walletSession.findUnique({
+        where: { id: sessionId },
+        select: { publicKey: true, revokedAt: true, expiresAt: true },
+      });
+      if (
+        !session ||
+        session.publicKey !== publicKey ||
+        session.revokedAt !== null ||
+        session.expiresAt.getTime() <= Date.now()
+      ) {
+        return res.status(401).json({ message: 'Session revoked or expired' });
+      }
+    }
+
     const clientId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
     res.writeHead(200, {
@@ -162,7 +181,7 @@ export const subscribe = async (req: Request, res: Response) => {
 
     res.write(`data: ${JSON.stringify({ type: 'connected', clientId })}\n\n`);
 
-    sseService.addClient(clientId, res, subscriptions, sourceIp, publicKey, lastEventId);
+    sseService.addClient(clientId, res, subscriptions, sourceIp, publicKey, lastEventId, sessionId);
     return;
   } catch (error: unknown) {
     if (error instanceof z.ZodError) {

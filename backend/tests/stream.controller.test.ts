@@ -489,4 +489,163 @@ describe("Stream Controller", () => {
       expect(res.status).toHaveBeenCalledWith(200);
     });
   });
+
+  // Issue #237: optimistic concurrency for stale stream mutations.
+  describe("stale mutation conflict contract (Issue #237)", () => {
+    const CURRENT_VERSION = 7;
+
+    type MutationCase = {
+      name: string;
+      handler: (req: Request, res: Response) => Promise<unknown>;
+      body: Record<string, unknown>;
+      stream: Record<string, unknown>;
+      mockSuccess: () => void;
+    };
+
+    const mutationCases: MutationCase[] = [
+      {
+        name: "cancel",
+        handler: cancelStream,
+        body: { secret: "S123" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.cancelStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "withdraw",
+        handler: withdrawStream,
+        body: { secret: "S123", amount: "100" },
+        stream: { streamId: 123, sender: "GUSER1", recipient: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.withdrawStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "top-up",
+        handler: topUpStream,
+        body: { secret: "S123", amount: "100" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.topUpStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "pause",
+        handler: pauseStream,
+        body: { secret: "S123" },
+        stream: { streamId: 123, sender: "GUSER1", isActive: true, isPaused: false },
+        mockSuccess: () => {
+          (sorobanService.pauseStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+      {
+        name: "resume",
+        handler: resumeStream,
+        body: { secret: "S123" },
+        stream: {
+          streamId: 123,
+          sender: "GUSER1",
+          isActive: true,
+          isPaused: true,
+          pausedAt: Math.floor(Date.now() / 1000),
+        },
+        mockSuccess: () => {
+          (sorobanService.resumeStream as any).mockResolvedValue({ txHash: "tx123" });
+        },
+      },
+    ];
+
+    const expectedConflictPayload = (currentVersion: number) =>
+      expect.objectContaining({
+        error: expect.objectContaining({
+          code: "STREAM_VERSION_CONFLICT",
+          currentVersion,
+        }),
+      });
+
+    beforeEach(() => {
+      (req as any).user = { publicKey: "GUSER1" };
+    });
+
+    for (const mutation of mutationCases) {
+      describe(mutation.name, () => {
+        it("succeeds when the submitted version matches the current version", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          (prisma.stream.update as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION + 1,
+          });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(200);
+          expect(res.status).not.toHaveBeenCalledWith(409);
+        });
+
+        it("preserves legacy behavior when no version is submitted", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          (prisma.stream.update as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION + 1,
+          });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(200);
+          expect(res.status).not.toHaveBeenCalledWith(409);
+        });
+
+        it("returns 409 with current version metadata when the submitted version is stale", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION - 1 };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(409);
+          expect(res.json).toHaveBeenCalledWith(expectedConflictPayload(CURRENT_VERSION));
+          expect(prisma.stream.update).not.toHaveBeenCalled();
+        });
+
+        it("returns the same 409 payload when the compare-and-set loses a concurrent update", async () => {
+          req.params = { streamId: "123" };
+          req.body = { ...mutation.body, version: CURRENT_VERSION };
+          (prisma.stream.findUnique as any).mockResolvedValue({
+            ...mutation.stream,
+            version: CURRENT_VERSION,
+          });
+          mutation.mockSuccess();
+          // Another request bumped the version between read and write.
+          (prisma.stream.update as any).mockRejectedValue(
+            Object.assign(new Error("Record to update not found."), { code: "P2025" }),
+          );
+          (prisma.stream.findUnique as any)
+            .mockResolvedValueOnce({ ...mutation.stream, version: CURRENT_VERSION })
+            .mockResolvedValueOnce({ ...mutation.stream, version: CURRENT_VERSION + 1 });
+
+          await mutation.handler(req as Request, res as Response);
+
+          expect(res.status).toHaveBeenCalledWith(409);
+          expect(res.json).toHaveBeenCalledWith(expectedConflictPayload(CURRENT_VERSION + 1));
+        });
+      });
+    }
+  });
 });

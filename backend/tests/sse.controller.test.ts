@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { subscribe } from '../src/controllers/sse.controller.js';
 import { sseService } from '../src/services/sse.service.js';
 import { prisma } from '../src/lib/prisma.js';
+import { sessionService } from '../src/services/session.service.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/services/sse.service.js', () => ({
@@ -20,6 +21,12 @@ vi.mock('../src/lib/prisma.js', () => ({
   },
 }));
 
+vi.mock('../src/services/session.service.js', () => ({
+  sessionService: {
+    isSessionActive: vi.fn(),
+  },
+}));
+
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 /**
@@ -29,8 +36,13 @@ vi.mock('../src/lib/prisma.js', () => ({
  */
 import { signSseTicket } from '../src/middleware/auth.js';
 
-function makeTicket(publicKey: string, streams: string[] = [], users: string[] = []): string {
-  return signSseTicket({ publicKey, streams, users });
+function makeTicket(
+  publicKey: string,
+  streams: string[] = [],
+  users: string[] = [],
+  sessionId?: string,
+): string {
+  return signSseTicket({ publicKey, streams, users, ...(sessionId ? { sessionId } : {}) });
 }
 
 const GUSER1 = 'GUSER1';
@@ -45,6 +57,8 @@ describe('SSE Controller', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // By default every session referenced by a ticket is considered active.
+    (sessionService.isSessionActive as any).mockResolvedValue(true);
     req = {
       headers: {},
       query: {},
@@ -228,5 +242,72 @@ describe('SSE Controller', () => {
     expect(subscriptions).toContain('1');
     // Stream 999 must be filtered out at connect time
     expect(subscriptions).not.toContain('999');
+  });
+
+  it('should reject a ticket whose session has been revoked before addClient', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (prisma.stream.findMany as any).mockResolvedValue([
+      { streamId: BigInt(1), sender: GUSER1, recipient: GOTHER },
+    ]);
+    (sessionService.isSessionActive as any).mockResolvedValue(false);
+
+    req.query = { ticket: makeTicket(GUSER1, ['1'], [], 'session-revoked') };
+
+    await subscribe(req as Request, res as Response);
+
+    expect(sessionService.isSessionActive).toHaveBeenCalledWith('session-revoked');
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'SESSION_REVOKED' }));
+    expect(sseService.addClient).not.toHaveBeenCalled();
+  });
+
+  it('should reject a ticket whose session has expired before addClient', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (prisma.stream.findMany as any).mockResolvedValue([
+      { streamId: BigInt(1), sender: GUSER1, recipient: GOTHER },
+    ]);
+    (sessionService.isSessionActive as any).mockResolvedValue(false);
+
+    req.query = { ticket: makeTicket(GUSER1, ['1'], [], 'session-expired') };
+
+    await subscribe(req as Request, res as Response);
+
+    expect(res.status).toHaveBeenCalledWith(401);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ code: 'SESSION_REVOKED' }));
+    expect(sseService.addClient).not.toHaveBeenCalled();
+  });
+
+  it('should allow a ticket whose session is still active', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (prisma.stream.findMany as any).mockResolvedValue([
+      { streamId: BigInt(1), sender: GUSER1, recipient: GOTHER },
+    ]);
+    (sessionService.isSessionActive as any).mockResolvedValue(true);
+
+    req.query = { ticket: makeTicket(GUSER1, ['1'], [], 'session-active') };
+
+    await subscribe(req as Request, res as Response);
+
+    expect(sessionService.isSessionActive).toHaveBeenCalledWith('session-active');
+    expect(res.writeHead).toHaveBeenCalledWith(200, expect.any(Object));
+    expect(sseService.addClient).toHaveBeenCalled();
+  });
+
+  it('should not consult the session store for legacy tickets without a sessionId', async () => {
+    (sseService.isShuttingDown as any).mockReturnValue(false);
+    (sseService.checkCapacity as any).mockReturnValue({ allowed: true });
+    (prisma.stream.findMany as any).mockResolvedValue([
+      { streamId: BigInt(1), sender: GUSER1, recipient: GOTHER },
+    ]);
+
+    req.query = { ticket: makeTicket(GUSER1, ['1']) };
+
+    await subscribe(req as Request, res as Response);
+
+    expect(sessionService.isSessionActive).not.toHaveBeenCalled();
+    expect(sseService.addClient).toHaveBeenCalled();
   });
 });

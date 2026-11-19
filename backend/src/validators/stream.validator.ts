@@ -62,6 +62,73 @@ export const streamIdParamSchema = z.object({
 
 export type StreamIdParamInput = z.infer<typeof streamIdParamSchema>;
 
+/**
+ * Shared schema for the optimistic-concurrency `expectedVersion` field.
+ *
+ * Clients may submit the stream state version they reviewed when preparing a
+ * mutation. The value is optional for backwards compatibility: when omitted,
+ * the mutation proceeds without a version check. When provided, it must be a
+ * non-negative integer (as a number or numeric string) and is normalized to a
+ * `number`.
+ */
+export const expectedVersionSchema = z
+  .union([z.number(), z.string()])
+  .optional()
+  .transform((v, ctx) => {
+    if (v === undefined || v === '') return undefined;
+    const n = typeof v === 'number' ? v : Number(v);
+    if (!Number.isInteger(n) || n < 0) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'expectedVersion must be a non-negative integer',
+      });
+      return z.NEVER;
+    }
+    return n;
+  });
+
+export type ExpectedVersionInput = z.infer<typeof expectedVersionSchema>;
+
+/**
+ * Schema for stream mutation requests (cancel, withdraw, top-up, pause, resume).
+ * All mutations accept an optional `expectedVersion` for optimistic concurrency.
+ */
+export const streamMutationSchema = z.object({
+  expectedVersion: expectedVersionSchema,
+});
+
+export type StreamMutationInput = z.infer<typeof streamMutationSchema>;
+
+/**
+ * Schema for cancel-stream requests.
+ */
+export const cancelStreamSchema = streamMutationSchema;
+export type CancelStreamInput = z.infer<typeof cancelStreamSchema>;
+
+/**
+ * Schema for withdraw requests.
+ */
+export const withdrawStreamSchema = streamMutationSchema;
+export type WithdrawStreamInput = z.infer<typeof withdrawStreamSchema>;
+
+/**
+ * Schema for top-up requests.
+ */
+export const topUpStreamSchema = streamMutationSchema;
+export type TopUpStreamInput = z.infer<typeof topUpStreamSchema>;
+
+/**
+ * Schema for pause requests.
+ */
+export const pauseStreamSchema = streamMutationSchema;
+export type PauseStreamInput = z.infer<typeof pauseStreamSchema>;
+
+/**
+ * Schema for resume requests.
+ */
+export const resumeStreamSchema = streamMutationSchema;
+export type ResumeStreamInput = z.infer<typeof resumeStreamSchema>;
+
 const DEFAULT_PAGE = 1;
 const DEFAULT_PAGE_SIZE = 20;
 const MAX_PAGE_SIZE = 100;

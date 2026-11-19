@@ -42,6 +42,7 @@ model Stream {
   isPaused          Boolean   @default(false)
   pausedAt          BigInt?   // Unix timestamp when paused
   totalPausedDuration Int     @default(0) // Accumulated paused duration in seconds
+  version           Int       @default(0) // Optimistic-concurrency guard for stale stream mutations
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
@@ -220,4 +221,21 @@ enum BackfillStatus {
   COMPLETED
   FAILED
   CANCELLED
+}
+
+// WalletSession model - inventory of active wallet-authenticated sessions.
+// Stores only an opaque session identifier and non-secret metadata so users can
+// inspect and revoke sessions after a device/browser is no longer trusted.
+// Signing secrets and wallet private keys are NEVER persisted here.
+model WalletSession {
+  id            String    @id @default(uuid()) // Opaque session identifier (never a signing secret)
+  walletAddress String    // Stellar public key the session is bound to
+  metadata      String?   // JSON string: user agent, IP, device label, etc.
+  createdAt     DateTime  @default(now())
+  lastSeenAt    DateTime  @default(now())
+  expiresAt     DateTime  // Absolute session expiry
+  revokedAt     DateTime? // Set when the session is explicitly revoked
+
+  @@index([walletAddress])
+  @@index([expiresAt])
 }

@@ -46,6 +46,42 @@ const errorResponses = {
     description: 'Request conflicts with the current state of the resource',
     content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
   },
+  StreamVersionConflict: {
+    description: `The mutation was rejected because the stream changed after the client reviewed it.
+
+Clients must submit the \`stateVersion\` they reviewed (via the \`If-Match\` header or the
+\`stateVersion\` request body field). When the current version differs, the request is rejected
+with HTTP 409 and \`error.code = "STREAM_VERSION_CONFLICT"\`. The response includes the current
+version metadata so the client can re-read the stream and retry.
+
+**Wallet-signed semantics:** This check is a preflight guard only. It never replaces the
+wallet signature or on-chain authorization — the signed transaction must still be authorized
+by the wallet and validated by the contract.`,
+    content: {
+      'application/json': {
+        schema: {
+          allOf: [
+            { $ref: '#/components/schemas/ErrorEnvelope' },
+            {
+              type: 'object',
+              properties: {
+                error: {
+                  type: 'object',
+                  properties: {
+                    code: { type: 'string', enum: ['STREAM_VERSION_CONFLICT'], example: 'STREAM_VERSION_CONFLICT' },
+                    details: {
+                      type: 'array',
+                      items: { $ref: '#/components/schemas/StreamVersionConflictDetail' },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      },
+    },
+  },
   TooManyRequests: {
     description: 'Rate limit exceeded',
     content: { 'application/json': { schema: { $ref: '#/components/schemas/Error' } } },
@@ -107,7 +143,33 @@ All REST endpoints return a stable, versioned error envelope on failure:
 - \`details\` is present for validation failures.
 
 **Migration:** This is an additive, backward-compatible change. Existing \`error.code\`/\`error.message\`
-consumers are unaffected. Unknown codes should be treated as generic failures.`,
+consumers are unaffected. Unknown codes should be treated as generic failures.
+
+## Optimistic Concurrency (Stream Mutations)
+
+Stream mutations accept the state version the client reviewed, via the \`If-Match\` header
+(\`If-Match: "<stateVersion>"\`) or a \`stateVersion\` body field. If the stream changed in the
+meantime the API returns HTTP 409 with \`error.code = "STREAM_VERSION_CONFLICT"\` and the current
+version metadata in \`error.details\`. This is a preflight guard only — wallet signatures and
+on-chain authorization remain authoritative.
+
+## Token Metadata Provenance
+
+Token metadata objects carry \`trustLevel\` (\`verified\` | \`curated\` | \`hint\` | \`unknown\`),
+\`source\`, \`stale\` and \`fetchedAt\` so clients can distinguish verified data from hints. Raw
+on-chain amounts are always base-unit integer strings and are never rescaled by metadata.
+
+## Action Readiness
+
+\`GET /v1/streams/{id}/readiness?action=...\` returns stable check codes with \`blocker\` vs
+\`warning\` severity. Readiness is advisory: it never promises transaction success, and state may
+change between the check and submission.
+
+## Wallet Sessions
+
+\`GET /v1/auth/sessions\` lists active wallet sessions (ids only, never signing secrets) and
+\`DELETE /v1/auth/sessions/{id}\` revokes one immediately across REST and SSE. Sessions expire at
+\`expiresAt\` and are not extended by activity.`,
       contact: {
         name: 'FlowFi Team',
         url: 'https://github.com/LabsCrypt/flowfi',
@@ -151,6 +213,14 @@ consumers are unaffected. Unknown codes should be treated as generic failures.`,
       {
         name: 'Observability',
         description: 'Prometheus metrics scrape endpoint',
+      },
+      {
+        name: 'Sessions',
+        description: 'Wallet-authenticated session inventory and revocation',
+      },
+      {
+        name: 'Readiness',
+        description: 'Preflight action readiness checks (advisory, not a transaction guarantee)',
       },
     ],
     components: {
@@ -439,6 +509,260 @@ consumers are unaffected. Unknown codes should be treated as generic failures.`,
             calculatedAt: { type: 'integer', description: 'Unix timestamp of the calculation' },
             cached: { type: 'boolean', description: 'Whether the value came from cache or a fresh computation' },
             source: { type: 'string', enum: ['db', 'chain'], description: 'Where the value was computed from' },
+          },
+        },
+        StreamVersionConflictDetail: {
+          type: 'object',
+          required: ['field', 'message', 'expectedVersion', 'currentVersion'],
+          properties: {
+            field: { type: 'string', example: 'stateVersion' },
+            message: { type: 'string', example: 'Stream state changed since the reviewed version' },
+            code: { type: 'string', enum: ['STREAM_VERSION_CONFLICT'], example: 'STREAM_VERSION_CONFLICT' },
+            expectedVersion: {
+              type: 'integer',
+              description: 'The state version the client submitted (what it reviewed)',
+              example: 3,
+            },
+            currentVersion: {
+              type: 'integer',
+              description: 'The current state version of the stream; re-read and retry with this value',
+              example: 4,
+            },
+            currentUpdatedAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'Timestamp of the most recent state change, when known',
+            },
+            streamId: { type: 'integer', description: 'On-chain stream ID', example: 1 },
+          },
+        },
+        TokenMetadata: {
+          type: 'object',
+          description: `Display metadata for a token, annotated with provenance and freshness so clients can
+distinguish verified data from hints.
+
+**Trust levels (\`trustLevel\`):**
+- \`verified\` — metadata was read from the token contract itself (on-chain \`name\`/\`decimals\`).
+- \`curated\` — metadata came from the operator-maintained allowlist.
+- \`hint\` — metadata came from an unverified third-party source; display only, never use for accounting.
+- \`unknown\` — no metadata source was available; \`name\`/\`symbol\` are null and \`decimals\` is null.
+
+**Fallback behavior:** sources are tried in order verified → curated → hint. If all fail, the
+object is returned with \`trustLevel: "unknown"\` and \`stale: true\`. Raw on-chain amounts are
+never altered by metadata: \`amount\` fields remain base-unit integer strings regardless of
+\`decimals\` or trust level.`,
+          required: ['tokenAddress', 'trustLevel', 'stale'],
+          properties: {
+            tokenAddress: {
+              type: 'string',
+              description: 'Token contract address',
+              example: 'CBCD789EFG012HIJ345KLM678NOP901QRS234TUV567WXY890ZAB123CDE',
+            },
+            name: { type: 'string', nullable: true, description: 'Human-readable token name, null when unavailable', example: 'USD Coin' },
+            symbol: { type: 'string', nullable: true, description: 'Token symbol, null when unavailable', example: 'USDC' },
+            decimals: {
+              type: 'integer',
+              nullable: true,
+              description: 'Display decimals hint; never applied to raw on-chain amounts by the API',
+              example: 7,
+            },
+            trustLevel: {
+              type: 'string',
+              enum: ['verified', 'curated', 'hint', 'unknown'],
+              description: 'Provenance of the metadata; see schema description for semantics',
+              example: 'verified',
+            },
+            source: {
+              type: 'string',
+              enum: ['contract', 'allowlist', 'third_party', 'none'],
+              description: 'Concrete source that produced this metadata',
+              example: 'contract',
+            },
+            stale: {
+              type: 'boolean',
+              description: 'True when the metadata is older than the freshness window or could not be refreshed',
+              example: false,
+            },
+            fetchedAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'When the metadata was last successfully fetched, null when never fetched',
+            },
+            staleAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'When the metadata becomes (or became) stale, null when it does not expire',
+            },
+            error: {
+              type: 'string',
+              nullable: true,
+              description: 'Safe reason metadata could not be refreshed (e.g. malformed or unavailable source)',
+            },
+          },
+        },
+        ReadinessCheck: {
+          type: 'object',
+          required: ['code', 'severity', 'passed', 'message'],
+          properties: {
+            code: {
+              type: 'string',
+              description: `Stable machine-readable check code. Switch on this, not on \`message\`.
+Codes are grouped by category:
+- Authorization: \`WALLET_NOT_AUTHENTICATED\`, \`WALLET_NOT_AUTHORIZED\`, \`SESSION_REVOKED\`
+- Network: \`NETWORK_MISMATCH\`, \`SOROBAN_RPC_UNAVAILABLE\`
+- Asset: \`TOKEN_METADATA_UNKNOWN\`, \`INSUFFICIENT_BALANCE\`, \`INSUFFICIENT_ALLOWANCE\`
+- Freshness: \`STREAM_STATE_STALE\`, \`STREAM_VERSION_MISMATCH\`, \`STREAM_INACTIVE\`
+- Input: \`INVALID_AMOUNT\`, \`AMOUNT_EXCEEDS_CLAIMABLE\``,
+              enum: [
+                'WALLET_NOT_AUTHENTICATED',
+                'WALLET_NOT_AUTHORIZED',
+                'SESSION_REVOKED',
+                'NETWORK_MISMATCH',
+                'SOROBAN_RPC_UNAVAILABLE',
+                'TOKEN_METADATA_UNKNOWN',
+                'INSUFFICIENT_BALANCE',
+                'INSUFFICIENT_ALLOWANCE',
+                'STREAM_STATE_STALE',
+                'STREAM_VERSION_MISMATCH',
+                'STREAM_INACTIVE',
+                'INVALID_AMOUNT',
+                'AMOUNT_EXCEEDS_CLAIMABLE',
+              ],
+              example: 'STREAM_VERSION_MISMATCH',
+            },
+            severity: {
+              type: 'string',
+              enum: ['blocker', 'warning'],
+              description: '`blocker` means the action is expected to fail; `warning` means it may still succeed',
+              example: 'blocker',
+            },
+            passed: {
+              type: 'boolean',
+              description: 'True when the check passed; false for both blockers and warnings that did not pass',
+              example: false,
+            },
+            message: { type: 'string', description: 'Safe human-readable explanation', example: 'Stream state changed since the reviewed version' },
+            category: {
+              type: 'string',
+              enum: ['authorization', 'network', 'asset', 'freshness', 'input'],
+              description: 'Category the check belongs to',
+              example: 'freshness',
+            },
+          },
+        },
+        ActionReadinessResponse: {
+          type: 'object',
+          description: `Preflight readiness for a stream action. This is advisory only and never promises
+transaction success: the wallet signature, contract constraints and on-chain state at execution
+time remain authoritative.
+
+**Race conditions:** checks are evaluated against a snapshot at \`evaluatedAt\`. State can change
+between this response and transaction submission (another client may mutate the stream, the
+network may change, balances may move). Clients should submit the reviewed \`stateVersion\` with
+the mutation and handle \`STREAM_VERSION_CONFLICT\` (HTTP 409) by re-running readiness.`,
+          required: ['action', 'streamId', 'ready', 'blockers', 'warnings', 'checks', 'evaluatedAt'],
+          properties: {
+            action: {
+              type: 'string',
+              enum: ['withdraw', 'top_up', 'pause', 'resume', 'cancel'],
+              description: 'Action the readiness was evaluated for',
+              example: 'withdraw',
+            },
+            streamId: { type: 'integer', description: 'On-chain stream ID', example: 1 },
+            ready: {
+              type: 'boolean',
+              description: 'True when no blocker failed; warnings do not affect this value',
+              example: false,
+            },
+            stateVersion: {
+              type: 'integer',
+              description: 'Stream state version the checks were evaluated against; submit this with the mutation',
+              example: 4,
+            },
+            blockers: {
+              type: 'array',
+              description: 'Failed checks with severity `blocker`',
+              items: { $ref: '#/components/schemas/ReadinessCheck' },
+            },
+            warnings: {
+              type: 'array',
+              description: 'Failed checks with severity `warning`',
+              items: { $ref: '#/components/schemas/ReadinessCheck' },
+            },
+            checks: {
+              type: 'array',
+              description: 'All evaluated checks, passed or not',
+              items: { $ref: '#/components/schemas/ReadinessCheck' },
+            },
+            evaluatedAt: { type: 'string', format: 'date-time', description: 'When the snapshot was evaluated' },
+          },
+        },
+        WalletSession: {
+          type: 'object',
+          description: `A wallet-authenticated session. Only non-secret identifiers are exposed: the
+session id, the wallet public key, and coarse client metadata. Signing secrets, JWTs and
+challenge nonces are never returned.`,
+          required: ['id', 'publicKey', 'createdAt', 'lastSeenAt', 'expiresAt', 'current'],
+          properties: {
+            id: {
+              type: 'string',
+              format: 'uuid',
+              description: 'Opaque session identifier (safe to display and to revoke)',
+              example: '550e8400-e29b-41d4-a716-446655440000',
+            },
+            publicKey: {
+              type: 'string',
+              description: 'Stellar public key the session was authenticated for',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            createdAt: { type: 'string', format: 'date-time', description: 'When the session was created' },
+            lastSeenAt: { type: 'string', format: 'date-time', description: 'Last request made with this session' },
+            expiresAt: {
+              type: 'string',
+              format: 'date-time',
+              description: 'Absolute expiry. Sessions are not extended by activity; re-authenticate after expiry.',
+            },
+            revokedAt: {
+              type: 'string',
+              format: 'date-time',
+              nullable: true,
+              description: 'When the session was revoked, null while active',
+            },
+            current: {
+              type: 'boolean',
+              description: 'True for the session making the request',
+              example: false,
+            },
+            userAgent: { type: 'string', nullable: true, description: 'Coarse client hint captured at creation' },
+            ipHint: { type: 'string', nullable: true, description: 'Truncated client IP hint captured at creation' },
+          },
+        },
+        WalletSessionListResponse: {
+          type: 'object',
+          required: ['data', 'total'],
+          properties: {
+            data: {
+              type: 'array',
+              description: 'Active (non-revoked, non-expired) sessions for the authenticated wallet, newest first',
+              items: { $ref: '#/components/schemas/WalletSession' },
+            },
+            total: { type: 'integer', description: 'Number of active sessions' },
+          },
+        },
+        RevokeSessionResponse: {
+          type: 'object',
+          required: ['id', 'revokedAt'],
+          properties: {
+            id: { type: 'string', format: 'uuid', description: 'Revoked session id' },
+            revokedAt: { type: 'string', format: 'date-time', description: 'When revocation took effect' },
+            alreadyRevoked: {
+              type: 'boolean',
+              description: 'True when the session was already revoked (idempotent success)',
+              example: false,
+            },
           },
         },
         PauseResumeResponse: {

@@ -89,6 +89,8 @@ interface SSEClient {
   authPublicKey: string;
   /** Issue 2: whether the connection has been invalidated and is pending close. */
   authRevoked: boolean;
+  /** Wallet session id this connection was authenticated under (if any). */
+  sessionId?: string;
 }
 
 interface SSECapacityCheckResult {
@@ -386,6 +388,7 @@ export class SSEService {
     ip = 'unknown',
     userId?: string,
     lastEventId: number | null = null,
+    sessionId?: string,
   ): void {
     const nextIpCount = (this.ipConnectionCounts.get(ip) ?? 0) + 1;
     this.ipConnectionCounts.set(ip, nextIpCount);
@@ -411,13 +414,14 @@ export class SSEService {
       authPublicKey: userId ?? '',
       authRevoked: false,
       ...(userId !== undefined && { userId }),
+      ...(sessionId !== undefined && { sessionId }),
     };
 
     this.clients.set(clientId, client);
     sseConnectionsTotal.inc();
     this.publishConnectionMetrics();
     logger.info(
-      `[SSEService] Connection opened: ${clientId}, ip: ${ip}, userId: ${userId ?? 'n/a'}, subscriptions: ${subscriptions.join(', ')}, lastEventId: ${lastEventId ?? 'none'}`,
+      `[SSEService] Connection opened: ${clientId}, ip: ${ip}, userId: ${userId ?? 'n/a'}, sessionId: ${sessionId ?? 'n/a'}, subscriptions: ${subscriptions.join(', ')}, lastEventId: ${lastEventId ?? 'none'}`,
     );
 
     res.on('close', () => {
@@ -519,6 +523,40 @@ export class SSEService {
       // Evict on the next revalidation sweep (within AUTH_CHECK_INTERVAL_MS).
       logger.info(`[SSEService] Revoked ${count} connection(s) for user ${publicKey}.`);
     }
+  }
+
+  /**
+   * Forcibly revoke all connections authenticated under a given wallet session.
+   * Call this when a session is revoked (logout, device untrusted, compromise).
+   *
+   * Matching connections are marked `authRevoked` and closed on the next
+   * revalidation sweep, which also emits a `reconnect` event so the browser
+   * re-authenticates with a fresh ticket instead of silently stalling.
+   */
+  revokeSessionConnections(sessionId: string): number {
+    let count = 0;
+    for (const client of this.clients.values()) {
+      if (client.sessionId === sessionId) {
+        client.authRevoked = true;
+        count++;
+      }
+    }
+    if (count > 0) {
+      logger.info(`[SSEService] Revoked ${count} connection(s) for session ${sessionId}.`);
+    }
+    return count;
+  }
+
+  /**
+   * Number of live connections currently bound to the given wallet session.
+   * Used by the session inventory endpoint to report active SSE streams.
+   */
+  getSessionConnectionCount(sessionId: string): number {
+    let count = 0;
+    for (const client of this.clients.values()) {
+      if (client.sessionId === sessionId) count++;
+    }
+    return count;
   }
 
   // ─── Metrics helpers ────────────────────────────────────────────────────────

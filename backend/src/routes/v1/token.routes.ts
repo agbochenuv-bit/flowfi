@@ -28,6 +28,10 @@ function buildPayload(): TokenMetadataList {
  * Strong ETag derived from the serialized payload. Anything that changes the
  * metadata (or its version marker) changes the hash, so a client revalidating
  * with a stale ETag gets fresh content — i.e. updates invalidate the cache.
+ *
+ * The payload includes per-token provenance (`source`, `trustLevel`) and
+ * staleness (`stale`, `ageSeconds`) fields, so a change in where a token's
+ * metadata came from, or in its freshness, also changes the ETag.
  */
 export function computeTokensEtag(body: string): string {
   const hash = createHash('sha1').update(body).digest('base64url');
@@ -55,13 +59,37 @@ export function etagMatches(ifNoneMatch: string | undefined, etag: string): bool
  *     summary: List verified token metadata
  *     description: |
  *       Returns symbol, name, decimals, contract address and icon for every
- *       verified Stellar asset. The response carries an `ETag` and a
- *       `Cache-Control` header; clients should revalidate with
- *       `If-None-Match` and accept a `304 Not Modified` while the metadata is
- *       unchanged.
+ *       verified Stellar asset, together with provenance and staleness
+ *       information so clients can distinguish verified data from hints.
+ *
+ *       **Trust levels** (`trustLevel`):
+ *       - `verified` — metadata comes from the curated verified registry and
+ *         is safe to display as authoritative.
+ *       - `onchain` — metadata was read from the on-chain contract (e.g.
+ *         `decimals()` / `name()`); authoritative for on-chain values but not
+ *         curated for display.
+ *       - `hint` — metadata is a best-effort fallback (cached or inferred)
+ *         and MUST be treated as a display hint, not authoritative.
+ *       - `unknown` — no usable metadata source was available; clients should
+ *         fall back to the raw contract address and default decimals.
+ *
+ *       **Provenance** (`source`): identifies where the metadata came from,
+ *       e.g. `verified-registry`, `onchain`, `cache`, or `fallback`.
+ *
+ *       **Staleness** (`stale`, `ageSeconds`, `updatedAt`): `stale` is `true`
+ *       when the metadata is older than the freshness window; `ageSeconds` is
+ *       the age of the underlying source at response time. Stale or malformed
+ *       sources degrade the trust level but never alter raw on-chain amounts —
+ *       `decimals` is only used for display formatting and callers must keep
+ *       using the raw integer amounts returned by balance endpoints.
+ *
+ *       The response carries an `ETag` and a `Cache-Control` header; clients
+ *       should revalidate with `If-None-Match` and accept a
+ *       `304 Not Modified` while the metadata (including provenance and
+ *       staleness) is unchanged.
  *     responses:
  *       200:
- *         description: Verified token metadata
+ *         description: Verified token metadata with provenance and staleness
  *         headers:
  *           Cache-Control:
  *             schema:
@@ -79,6 +107,37 @@ export function etagMatches(ifNoneMatch: string | undefined, etag: string): bool
  *                   type: array
  *                   items:
  *                     type: object
+ *                     properties:
+ *                       symbol:
+ *                         type: string
+ *                       name:
+ *                         type: string
+ *                       decimals:
+ *                         type: integer
+ *                       address:
+ *                         type: string
+ *                       icon:
+ *                         type: string
+ *                         nullable: true
+ *                       source:
+ *                         type: string
+ *                         description: Where the metadata came from (e.g. verified-registry, onchain, cache, fallback).
+ *                       trustLevel:
+ *                         type: string
+ *                         enum: [verified, onchain, hint, unknown]
+ *                         description: How much the metadata can be trusted.
+ *                       stale:
+ *                         type: boolean
+ *                         description: True when the metadata is older than the freshness window.
+ *                       ageSeconds:
+ *                         type: integer
+ *                         nullable: true
+ *                         description: Age of the underlying metadata source in seconds, when known.
+ *                       updatedAt:
+ *                         type: string
+ *                         format: date-time
+ *                         nullable: true
+ *                         description: When the underlying metadata source was last refreshed.
  *                 updatedAt:
  *                   type: string
  *                   format: date-time

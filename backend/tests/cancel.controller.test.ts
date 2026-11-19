@@ -106,4 +106,98 @@ describe('Cancel Stream Controller', () => {
     expect(streamRepository.updateStatus).not.toHaveBeenCalled();
     expect(res.status).toHaveBeenCalledWith(500);
   });
+
+  describe('expectedVersion precondition', () => {
+    it('should return 409 with current version metadata when expectedVersion is stale', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        sender: 'GSENDER1',
+        isActive: true,
+        version: 5,
+      });
+      req.body = { senderSecret: 'SABC123', expectedVersion: 4 };
+
+      await cancelStreamHandler(req as AuthenticatedRequest, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith({
+        error: {
+          code: 'STREAM_VERSION_CONFLICT',
+          message: expect.any(String),
+          currentVersion: 5,
+          expectedVersion: 4,
+        },
+      });
+      expect(sorobanService.cancelStream).not.toHaveBeenCalled();
+      expect(streamRepository.updateStatus).not.toHaveBeenCalled();
+    });
+
+    it('should proceed when expectedVersion matches the current version', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        sender: 'GSENDER1',
+        isActive: true,
+        version: 5,
+      });
+      (sorobanService.cancelStream as any).mockResolvedValue('tx_hash_123');
+      req.body = { senderSecret: 'SABC123', expectedVersion: 5 };
+
+      await cancelStreamHandler(req as AuthenticatedRequest, res as Response);
+
+      expect(sorobanService.cancelStream).toHaveBeenCalledWith(123n, 'SABC123');
+      expect(streamRepository.updateStatus).toHaveBeenCalledWith(123n, 'CANCELLED');
+      expect(res.status).toHaveBeenCalledWith(200);
+    });
+
+    it('should return 409 when the stream changes between read and write', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        sender: 'GSENDER1',
+        isActive: true,
+        version: 5,
+      });
+      (sorobanService.cancelStream as any).mockResolvedValue('tx_hash_123');
+      // Simulate a concurrent update: the guarded write finds no matching version.
+      (streamRepository.updateStatus as any).mockResolvedValue({ count: 0 });
+      req.body = { senderSecret: 'SABC123', expectedVersion: 5 };
+
+      await cancelStreamHandler(req as AuthenticatedRequest, res as Response);
+
+      expect(streamRepository.updateStatus).toHaveBeenCalledWith(123n, 'CANCELLED', 5);
+      expect(res.status).toHaveBeenCalledWith(409);
+      expect(res.json).toHaveBeenCalledWith({
+        error: {
+          code: 'STREAM_VERSION_CONFLICT',
+          message: expect.any(String),
+          currentVersion: expect.anything(),
+          expectedVersion: 5,
+        },
+      });
+    });
+
+    it('should reject a non-integer expectedVersion with 400', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        sender: 'GSENDER1',
+        isActive: true,
+        version: 5,
+      });
+      req.body = { senderSecret: 'SABC123', expectedVersion: 'not-a-number' };
+
+      await cancelStreamHandler(req as AuthenticatedRequest, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(400);
+      expect(sorobanService.cancelStream).not.toHaveBeenCalled();
+    });
+
+    it('should keep wallet authorization ahead of the version check', async () => {
+      (prisma.stream.findUnique as any).mockResolvedValue({
+        sender: 'GOTHER',
+        isActive: true,
+        version: 5,
+      });
+      req.body = { senderSecret: 'SABC123', expectedVersion: 4 };
+
+      await cancelStreamHandler(req as AuthenticatedRequest, res as Response);
+
+      expect(res.status).toHaveBeenCalledWith(403);
+      expect(sorobanService.cancelStream).not.toHaveBeenCalled();
+    });
+  });
 });

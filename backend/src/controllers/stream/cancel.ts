@@ -6,6 +6,7 @@ import type { AuthenticatedRequest } from '../../types/auth.types.js';
 import * as streamRepository from '../../repositories/stream.repository.js';
 import { parseStreamId } from '../../lib/stream-id.js';
 import { sendApiError } from '../../types/api-error.js';
+import { sendStreamConflict } from '../../lib/stream-conflict.js';
 import {
   getIdempotencyContext,
   runIdempotentCommand,
@@ -50,7 +51,11 @@ import {
  *       404:
  *         description: Stream not found
  *       409:
- *         description: Stream already cancelled or completed
+ *         description: |
+ *           Stream already cancelled or completed, or the supplied `expectedVersion`
+ *           does not match the current stream version (stale mutation). The body
+ *           carries `code: STREAM_VERSION_CONFLICT` and the current `version`
+ *           metadata so clients can refresh and retry.
  */
 export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -65,6 +70,25 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
     const parsedStreamId = parseStreamId(streamId);
     if (parsedStreamId === null) {
       return sendApiError(res, 400, 'INVALID_STREAM_ID', 'Invalid streamId parameter');
+    }
+
+    // 0. Parse the optional optimistic-concurrency token supplied by the client.
+    const rawExpectedVersion = req.body?.expectedVersion;
+    let expectedVersion: number | undefined;
+    if (rawExpectedVersion !== undefined && rawExpectedVersion !== null) {
+      if (
+        typeof rawExpectedVersion !== 'number' ||
+        !Number.isInteger(rawExpectedVersion) ||
+        rawExpectedVersion < 0
+      ) {
+        return sendApiError(
+          res,
+          400,
+          'INVALID_EXPECTED_VERSION',
+          'expectedVersion must be a non-negative integer',
+        );
+      }
+      expectedVersion = rawExpectedVersion;
     }
 
     // 1. Fetch stream from DB
@@ -84,6 +108,15 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
     // 3. Check status
     if (!stream.isActive) {
       return sendApiError(res, 409, 'CONFLICT', 'Stream is already cancelled or completed');
+    }
+
+    // 3b. Reject stale mutations before any on-chain call is made.
+    if (expectedVersion !== undefined && expectedVersion !== stream.version) {
+      return sendStreamConflict(res, {
+        streamId: parsedStreamId,
+        currentVersion: stream.version,
+        expectedVersion,
+      });
     }
 
     // 4. Validate request payload before touching the idempotency store
@@ -120,8 +153,28 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
       async () => {
         const txHash = await sorobanService.cancelStream(parsedStreamId, senderSecret);
 
-        // Update DB record status using repository helper
-        await streamRepository.updateStatus(parsedStreamId, 'CANCELLED');
+        // Update DB record status using the repository compare-and-set helper so
+        // concurrent mutations cannot silently overwrite each other. The CAS
+        // bumps the version atomically and fails if the row changed underneath us.
+        const updated = await streamRepository.updateStatusWithVersion(
+          parsedStreamId,
+          'CANCELLED',
+          stream.version,
+        );
+
+        if (!updated) {
+          // A concurrent mutation won the race after the on-chain transaction
+          // was submitted. Surface the same stable conflict payload so the
+          // client can refresh and reconcile.
+          const latest = await prisma.stream.findUnique({
+            where: { streamId: parsedStreamId },
+          });
+          throw new StreamVersionConflictError(
+            parsedStreamId,
+            latest?.version ?? stream.version,
+            stream.version,
+          );
+        }
 
         logger.info(
           `[CancelStream] Stream ${parsedStreamId} cancelled by ${callerAddress}. Tx: ${txHash}`,
@@ -133,6 +186,13 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
 
     return res.status(200).json(result);
   } catch (error) {
+    if (error instanceof StreamVersionConflictError) {
+      return sendStreamConflict(res, {
+        streamId: error.streamId,
+        currentVersion: error.currentVersion,
+        expectedVersion: error.expectedVersion,
+      });
+    }
     logger.error('Error cancelling stream:', error);
     if (error instanceof Error && error.message.includes('Simulation failed')) {
         return sendApiError(res, 400, 'TRANSACTION_SIMULATION_FAILED', error.message);
@@ -140,3 +200,18 @@ export const cancelStreamHandler = async (req: AuthenticatedRequest, res: Respon
     return sendApiError(res, 500, 'INTERNAL_SERVER_ERROR', 'A technical error occurred. Please try again later.');
   }
 };
+
+/**
+ * Raised when the optimistic-concurrency compare-and-set fails because the
+ * stream row was mutated by another request between read and write.
+ */
+class StreamVersionConflictError extends Error {
+  constructor(
+    readonly streamId: number,
+    readonly currentVersion: number,
+    readonly expectedVersion: number,
+  ) {
+    super('Stream version conflict');
+    this.name = 'StreamVersionConflictError';
+  }
+}

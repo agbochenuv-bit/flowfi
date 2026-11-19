@@ -12,6 +12,13 @@ const mocks = vi.hoisted(() => ({
     stream: {
       findMany: vi.fn(),
     },
+    walletSession: {
+      create: vi.fn(),
+      findUnique: vi.fn(),
+      findMany: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+    },
   },
   sseService: {
     broadcastToStream: vi.fn(),
@@ -56,6 +63,8 @@ vi.mock('../../src/lib/redis.js', () => ({
 
 import app from '../../src/app.js';
 import { signJwt } from '../../src/middleware/auth.js';
+import { sseService } from '../../src/services/sse.service.js';
+import { walletSessionService } from '../../src/services/wallet-session.service.js';
 
 const ADDR = 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA';
 const now = Math.floor(Date.now() / 1000);
@@ -80,6 +89,42 @@ describe('GET /v1/events/subscribe', () => {
 
   it('rejects requests missing authentication', async () => {
     const res = await request(app).get('/v1/events/subscribe?ticket=not-a-ticket');
+    expect(res.status).toBe(401);
+  });
+});
+
+describe('session revocation', () => {
+  const sessionId = '11111111-2222-3333-4444-555555555555';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mocks.prisma.stream.findMany.mockResolvedValue([]);
+    mocks.sseService.getClientCount.mockReturnValue(0);
+    mocks.sseService.getActiveIpCount.mockReturnValue(0);
+    mocks.sseService.getPerIpPeakConnections.mockReturnValue(0);
+    mocks.sseService.getMaxConnections.mockReturnValue(10000);
+    mocks.sseService.checkCapacity.mockReturnValue({ allowed: true });
+    mocks.sseService.isShuttingDown.mockReturnValue(false);
+  });
+
+  it('closes the SSE connection for the revoked session immediately', async () => {
+    const closeSpy = vi.spyOn(sseService, 'closeSessionConnections');
+
+    const res = await request(app)
+      .delete(`/v1/auth/sessions/${sessionId}`)
+      .set('Authorization', `Bearer ${token}`);
+
+    expect(res.status).toBe(200);
+    expect(closeSpy).toHaveBeenCalledWith(sessionId);
+  });
+
+  it('returns 401 for API calls made with a revoked session token', async () => {
+    vi.spyOn(walletSessionService, 'isSessionActive').mockResolvedValue(false);
+
+    const res = await request(app)
+      .get('/v1/events/subscribe?ticket=not-a-ticket')
+      .set('Authorization', `Bearer ${token}`);
+
     expect(res.status).toBe(401);
   });
 });

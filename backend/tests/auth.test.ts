@@ -659,6 +659,201 @@ describe('Authentication & Middleware Tests', () => {
     });
   });
 
+  describe('Wallet session inventory & revocation', () => {
+    async function getValidJwt(keypair: StellarSdk.Keypair): Promise<string> {
+      const challengeRes = await request(app)
+        .post('/v1/auth/challenge')
+        .send({ publicKey: keypair.publicKey() });
+      const { nonce } = challengeRes.body as { nonce: string };
+      const signedTransaction = buildSignedTransaction(keypair, nonce);
+
+      vi.spyOn(StellarSdk.Keypair.prototype, 'verify').mockReturnValue(true);
+
+      const verifyRes = await request(app)
+        .post('/v1/auth/verify')
+        .send({ publicKey: keypair.publicKey(), signedTransaction });
+      expect(verifyRes.status).toBe(200);
+      return (verifyRes.body as { token: string }).token;
+    }
+
+    function decodeJwtPayload(token: string): Record<string, any> {
+      return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8'));
+    }
+
+    it('test_verify_issues_session_identifier_without_signing_secret', async () => {
+      const keypair = makeKeypair();
+      const token = await getValidJwt(keypair);
+      const payload = decodeJwtPayload(token);
+
+      expect(typeof payload.sid).toBe('string');
+      expect(payload.sid.length).toBeGreaterThan(0);
+      // The session id must not leak the nonce or any signing material.
+      expect(payload).not.toHaveProperty('nonce');
+      expect(payload).not.toHaveProperty('signedTransaction');
+      expect(payload).not.toHaveProperty('secret');
+    });
+
+    it('test_list_sessions_returns_only_callers_sessions', async () => {
+      const owner = makeKeypair();
+      const other = makeKeypair();
+
+      const ownerToken = await getValidJwt(owner);
+      await getValidJwt(other);
+
+      const res = await request(app)
+        .get('/v1/auth/sessions')
+        .set('Authorization', `Bearer ${ownerToken}`);
+
+      expect(res.status).toBe(200);
+      expect(Array.isArray(res.body.sessions)).toBe(true);
+      for (const session of res.body.sessions) {
+        expect(session.publicKey ?? owner.publicKey()).toBe(owner.publicKey());
+        expect(session).not.toHaveProperty('secret');
+        expect(session).not.toHaveProperty('nonce');
+      }
+      const current = res.body.sessions.find(
+        (s: any) => s.id === decodeJwtPayload(ownerToken).sid,
+      );
+      expect(current).toBeDefined();
+      expect(current.current).toBe(true);
+    });
+
+    it('test_list_sessions_requires_authentication', async () => {
+      const res = await request(app).get('/v1/auth/sessions');
+      expect(res.status).toBe(401);
+    });
+
+    it('test_revoke_own_session_returns_success', async () => {
+      const keypair = makeKeypair();
+      const token = await getValidJwt(keypair);
+      const sid = decodeJwtPayload(token).sid;
+
+      const res = await request(app)
+        .delete(`/v1/auth/sessions/${sid}`)
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ revoked: true });
+    });
+
+    it('test_revoke_other_wallets_session_is_rejected', async () => {
+      const victim = makeKeypair();
+      const attacker = makeKeypair();
+
+      const victimToken = await getValidJwt(victim);
+      const attackerToken = await getValidJwt(attacker);
+      const victimSid = decodeJwtPayload(victimToken).sid;
+
+      const res = await request(app)
+        .delete(`/v1/auth/sessions/${victimSid}`)
+        .set('Authorization', `Bearer ${attackerToken}`);
+
+      expect([403, 404]).toContain(res.status);
+
+      // The victim's session must still be usable.
+      const victimCheck = await request(app)
+        .get('/v1/events')
+        .query({ address: victim.publicKey() })
+        .set('Authorization', `Bearer ${victimToken}`);
+      expect(victimCheck.status).toBe(200);
+    });
+
+    it('test_revoked_session_immediately_rejected_on_api', async () => {
+      const keypair = makeKeypair();
+      const token = await getValidJwt(keypair);
+      const sid = decodeJwtPayload(token).sid;
+
+      const before = await request(app)
+        .get('/v1/events')
+        .query({ address: keypair.publicKey() })
+        .set('Authorization', `Bearer ${token}`);
+      expect(before.status).toBe(200);
+
+      const revoke = await request(app)
+        .delete(`/v1/auth/sessions/${sid}`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(revoke.status).toBe(200);
+
+      const after = await request(app)
+        .get('/v1/events')
+        .query({ address: keypair.publicKey() })
+        .set('Authorization', `Bearer ${token}`);
+      expect(after.status).toBe(401);
+    });
+
+    it('test_revoked_session_immediately_rejected_on_sse', async () => {
+      const keypair = makeKeypair();
+      const token = await getValidJwt(keypair);
+      const sid = decodeJwtPayload(token).sid;
+
+      const revoke = await request(app)
+        .delete(`/v1/auth/sessions/${sid}`)
+        .set('Authorization', `Bearer ${token}`);
+      expect(revoke.status).toBe(200);
+
+      const res = await request(app)
+        .get('/v1/events/subscribe')
+        .set('Accept', 'text/event-stream')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(401);
+    });
+
+    it('test_revoke_unknown_session_returns_404', async () => {
+      const keypair = makeKeypair();
+      const token = await getValidJwt(keypair);
+
+      const res = await request(app)
+        .delete('/v1/auth/sessions/does-not-exist')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(res.status).toBe(404);
+    });
+
+    it('test_expired_session_is_rejected_and_not_listed', async () => {
+      const keypair = makeKeypair();
+      const now = Math.floor(Date.now() / 1000);
+      const expiredToken = signJwt({
+        sub: keypair.publicKey(),
+        sid: crypto.randomUUID(),
+        iat: now - 7200,
+        exp: now - 1,
+        iss: 'flowfi-api',
+        aud: 'flowfi-api',
+      });
+
+      const res = await request(app)
+        .get('/v1/events')
+        .query({ address: keypair.publicKey() })
+        .set('Authorization', `Bearer ${expiredToken}`);
+      expect(res.status).toBe(401);
+
+      const list = await request(app)
+        .get('/v1/auth/sessions')
+        .set('Authorization', `Bearer ${expiredToken}`);
+      expect(list.status).toBe(401);
+    });
+
+    it('test_session_at_exact_expiry_boundary_is_rejected', async () => {
+      const keypair = makeKeypair();
+      const now = Math.floor(Date.now() / 1000);
+      const boundaryToken = signJwt({
+        sub: keypair.publicKey(),
+        sid: crypto.randomUUID(),
+        iat: now - 3600,
+        exp: now,
+        iss: 'flowfi-api',
+        aud: 'flowfi-api',
+      });
+
+      const res = await request(app)
+        .get('/v1/events')
+        .query({ address: keypair.publicKey() })
+        .set('Authorization', `Bearer ${boundaryToken}`);
+      expect(res.status).toBe(401);
+    });
+  });
+
   describe('GET /v1/events (authenticated & scoped)', () => {
     it('test_events_endpoint_rejects_unauthenticated', async () => {
       const res = await request(app)

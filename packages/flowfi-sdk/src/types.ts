@@ -177,3 +177,189 @@ export interface WithdrawResult {
 export interface SubmitResult {
   transactionHash: string;
 }
+
+// ─── Optimistic concurrency (stale mutation conflicts) ────────────────────────
+
+/**
+ * Stable machine-readable code returned when a mutation is rejected because
+ * the stream changed after the client reviewed it.
+ */
+export const STREAM_VERSION_CONFLICT_CODE = 'STREAM_VERSION_CONFLICT' as const;
+
+/**
+ * Version metadata describing the stream state a client reviewed.
+ *
+ * `version` is an opaque, monotonically increasing token (the contract's
+ * `last_update_time` ledger timestamp). Clients must echo the value they
+ * reviewed back on mutations; the API rejects the mutation with
+ * {@link StreamVersionConflict} when the stream has advanced since.
+ */
+export interface StreamVersion {
+  streamId: bigint;
+  /** Opaque version token the client reviewed. */
+  version: bigint;
+  /** Ledger timestamp of the last mutation, when known. */
+  lastUpdateTime?: bigint | null;
+}
+
+/**
+ * Conflict response body returned with HTTP 409 when a mutation is stale.
+ *
+ * Wallet-signed transaction semantics are unchanged: the client must rebuild
+ * and re-sign the transaction against the current version. The API never
+ * signs on the client's behalf.
+ */
+export interface StreamVersionConflict {
+  code: typeof STREAM_VERSION_CONFLICT_CODE;
+  message: string;
+  /** Version the client submitted (may be absent if omitted). */
+  expectedVersion?: bigint | null;
+  /** Current version metadata the client should re-review. */
+  current: StreamVersion;
+}
+
+// ─── Token metadata provenance ────────────────────────────────────────────────
+
+/**
+ * Trust level of token display metadata.
+ *
+ * - `verified` — sourced from the token contract itself (name/symbol/decimals
+ *   read on-chain) and cross-checked against the configured allowlist.
+ * - `on_chain` — read from the token contract but not cross-checked.
+ * - `hint` — supplied by an untrusted source (client, indexer cache, config).
+ * - `unavailable` — no metadata could be resolved; clients must fall back.
+ */
+export type TokenMetadataTrustLevel = 'verified' | 'on_chain' | 'hint' | 'unavailable';
+
+/**
+ * Freshness of token metadata relative to the time it was resolved.
+ */
+export type TokenMetadataFreshness = 'fresh' | 'stale' | 'unknown';
+
+/**
+ * Token display metadata with provenance.
+ *
+ * Raw on-chain amounts are never altered by this metadata: `decimals` is a
+ * display hint only and must not be used to rescale stored stroop amounts
+ * without an explicit conversion step.
+ */
+export interface TokenMetadata {
+  tokenAddress: string;
+  /** Token name, when resolved. */
+  name?: string | null;
+  /** Token symbol, when resolved. */
+  symbol?: string | null;
+  /** Display decimals hint; never changes raw on-chain amounts. */
+  decimals?: number | null;
+  trustLevel: TokenMetadataTrustLevel;
+  freshness: TokenMetadataFreshness;
+  /** Source identifier, e.g. `token_contract`, `indexer_cache`, `client_hint`. */
+  source?: string | null;
+  /** Unix epoch seconds when the metadata was resolved. */
+  resolvedAt?: number | null;
+  /** Unix epoch seconds after which the metadata should be considered stale. */
+  staleAfter?: number | null;
+  /** Human-readable reason when `trustLevel` is `unavailable` or `freshness` is `stale`. */
+  reason?: string | null;
+}
+
+// ─── Action readiness (preflight) ─────────────────────────────────────────────
+
+/**
+ * Stable result codes for preflight readiness checks.
+ *
+ * These describe preflight observations only; they never promise that a
+ * transaction will succeed on-chain.
+ */
+export type ReadinessCode =
+  | 'OK'
+  | 'WALLET_NOT_CONNECTED'
+  | 'WALLET_NOT_AUTHORIZED'
+  | 'NETWORK_MISMATCH'
+  | 'CONTRACT_NOT_FOUND'
+  | 'STREAM_NOT_FOUND'
+  | 'STREAM_NOT_ACTIVE'
+  | 'STREAM_PAUSED'
+  | 'STREAM_COMPLETED'
+  | 'STREAM_CANCELLED'
+  | 'INSUFFICIENT_BALANCE'
+  | 'INSUFFICIENT_ALLOWANCE'
+  | 'TOKEN_METADATA_UNAVAILABLE'
+  | 'STALE_STREAM_VERSION'
+  | 'NOTHING_TO_WITHDRAW'
+  | 'UNKNOWN';
+
+/**
+ * Severity of a readiness check result.
+ *
+ * - `blocker` — the action is expected to fail; clients should disable it.
+ * - `warning` — the action may still succeed; clients should surface it.
+ * - `info` — informational only.
+ */
+export type ReadinessSeverity = 'blocker' | 'warning' | 'info';
+
+/**
+ * A single preflight readiness check result.
+ */
+export interface ReadinessCheck {
+  code: ReadinessCode;
+  severity: ReadinessSeverity;
+  message: string;
+  /** Optional structured details, e.g. expected vs. actual network. */
+  details?: Record<string, unknown>;
+}
+
+/**
+ * Preflight readiness for a stream action.
+ *
+ * `ready` is `true` only when no check has `severity: 'blocker'`. It is a
+ * preflight signal, not a guarantee of transaction success: state can change
+ * between preflight and submission (see `checkedAt`).
+ */
+export interface ActionReadiness {
+  action: 'create' | 'withdraw' | 'cancel' | 'pause' | 'resume';
+  streamId?: bigint | null;
+  ready: boolean;
+  checks: ReadinessCheck[];
+  /** Version metadata observed during preflight, when applicable. */
+  version?: StreamVersion | null;
+  /** Unix epoch seconds when the preflight was evaluated. */
+  checkedAt: number;
+}
+
+// ─── Wallet sessions ──────────────────────────────────────────────────────────
+
+/**
+ * A wallet-authenticated session, as listed in the session inventory.
+ *
+ * Session records never contain signing secrets; only an opaque identifier and
+ * descriptive metadata are exposed.
+ */
+export interface WalletSession {
+  /** Opaque session identifier used for revocation. */
+  sessionId: string;
+  /** Stellar account (G... address) the session is authenticated for. */
+  walletAddress: string;
+  /** Unix epoch seconds when the session was created. */
+  createdAt: number;
+  /** Unix epoch seconds when the session was last used. */
+  lastUsedAt?: number | null;
+  /** Unix epoch seconds when the session expires. */
+  expiresAt: number;
+  /** Best-effort client description, e.g. user agent or device label. */
+  deviceLabel?: string | null;
+  /** Whether this session is the one making the current request. */
+  current?: boolean;
+}
+
+export interface WalletSessionListResponse {
+  sessions: WalletSession[];
+}
+
+export interface RevokeWalletSessionResponse {
+  sessionId: string;
+  /** `true` when the session was active and has now been revoked. */
+  revoked: boolean;
+  /** Unix epoch seconds when the revocation took effect. */
+  revokedAt: number;
+}

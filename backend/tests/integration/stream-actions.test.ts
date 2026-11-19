@@ -369,6 +369,154 @@ describe('stream action routes', () => {
     );
   });
 
+  describe('action readiness', () => {
+    function mockReadyStream(sender: StellarSdk.Keypair, overrides: Record<string, unknown> = {}) {
+      mockPrisma.stream.findUnique.mockResolvedValue({
+        streamId: 21,
+        sender: sender.publicKey(),
+        recipient: makeKeypair().publicKey(),
+        assetCode: 'USDC',
+        assetIssuer: 'GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5',
+        network: 'testnet',
+        isActive: true,
+        isPaused: false,
+        pausedAt: null,
+        totalPausedDuration: 0,
+        depositedAmount: '1000',
+        withdrawnAmount: '100',
+        updatedAt: new Date(),
+        ...overrides,
+      });
+    }
+
+    it('returns no blockers for a sender-owned, active stream on the expected network', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockReadyStream(sender);
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({
+        streamId: 21,
+        action: 'pause',
+        ready: true,
+        blockers: [],
+      });
+      expect(Array.isArray(response.body.warnings)).toBe(true);
+      expect(response.body.checkedAt).toBeDefined();
+    });
+
+    it('reports an AUTHORIZATION blocker when the wallet does not own the stream', async () => {
+      const sender = makeKeypair();
+      const attacker = makeKeypair();
+      const token = await getValidJwt(attacker);
+      mockReadyStream(sender);
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.ready).toBe(false);
+      expect(response.body.blockers).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'AUTHORIZATION' })]),
+      );
+      expect(response.body.warnings.map((w: { code: string }) => w.code)).not.toContain(
+        'AUTHORIZATION',
+      );
+      expect(mockPauseStream).not.toHaveBeenCalled();
+    });
+
+    it('reports a NETWORK_MISMATCH blocker when the stream network differs from the request', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockReadyStream(sender, { network: 'mainnet' });
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .query({ network: 'testnet' })
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.ready).toBe(false);
+      expect(response.body.blockers).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'NETWORK_MISMATCH' })]),
+      );
+      expect(response.body.warnings.map((w: { code: string }) => w.code)).not.toContain(
+        'NETWORK_MISMATCH',
+      );
+    });
+
+    it('reports an INVALID_ASSET blocker when the stream asset is not supported', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockReadyStream(sender, { assetCode: 'NOTREAL', assetIssuer: null });
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.ready).toBe(false);
+      expect(response.body.blockers).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'INVALID_ASSET' })]),
+      );
+    });
+
+    it('reports a STALE_METADATA warning without blocking the action', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockReadyStream(sender, {
+        updatedAt: new Date(Date.now() - 60 * 60 * 1000),
+      });
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.ready).toBe(true);
+      expect(response.body.blockers).toEqual([]);
+      expect(response.body.warnings).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'STALE_METADATA' })]),
+      );
+    });
+
+    it('mirrors contract constraints for pause on an already paused stream', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockReadyStream(sender, {
+        isPaused: true,
+        pausedAt: Math.floor(Date.now() / 1000) - 30,
+      });
+
+      const response = await request(app)
+        .get('/v1/streams/21/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(200);
+      expect(response.body.ready).toBe(false);
+      expect(response.body.blockers).toEqual(
+        expect.arrayContaining([expect.objectContaining({ code: 'INVALID_STATE' })]),
+      );
+    });
+
+    it('returns 404 for an unknown stream', async () => {
+      const sender = makeKeypair();
+      const token = await getValidJwt(sender);
+      mockPrisma.stream.findUnique.mockResolvedValue(null);
+
+      const response = await request(app)
+        .get('/v1/streams/999/actions/pause/readiness')
+        .set('Authorization', `Bearer ${token}`);
+
+      expect(response.status).toBe(404);
+    });
+  });
+
   describe('idempotency', () => {
     const IDEMPOTENCY_KEY = 'retry-key-0001';
 
