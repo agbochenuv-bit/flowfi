@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  connectWallet,
   toWalletErrorMessage,
   shortenPublicKey,
   formatNetwork,
@@ -27,6 +28,10 @@ describe("STELLAR_NETWORK", () => {
 describe("SUPPORTED_WALLETS", () => {
   it("contains freighter", () => {
     expect(SUPPORTED_WALLETS.find((w) => w.id === "freighter")).toBeDefined();
+  });
+
+  it.each(["", "other-wallet", "Freighter"])("rejects unsupported wallet ID %j", async (walletId) => {
+    await expect(connectWallet(walletId)).rejects.toThrow(`Unsupported wallet: ${walletId}`);
   });
 
   it("each entry has required fields", () => {

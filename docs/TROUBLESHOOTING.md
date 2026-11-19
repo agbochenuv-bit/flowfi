@@ -214,3 +214,5 @@ new FlowFiClient({
    - your network,
    - the steps to reproduce,
    - relevant logs (redact any secret keys!).
+
+See the [compatibility matrix](COMPATIBILITY.md) for browser, wallet, and network coverage.
