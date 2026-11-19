@@ -79,6 +79,8 @@ Our backend API implements several security measures:
 - **Environment Variables**: Sensitive configuration is stored securely
 - **JWT Signing-Key Rotation**: Tokens are signed with a key identified by a `kid` header and verified against a set of keys, so keys can be rotated without logging users out (see below)
 
+See the [wallet and operator key lifecycle matrix](docs/security/KEY_LIFECYCLE.md) for custody, signer responsibilities, revocation, and incident response.
+
 ### JWT Signing-Key Rotation
 
 FlowFi supports rotating JWT signing keys without invalidating existing sessions. Each issued token carries a `kid` (key identifier) header, and the verifier accepts any key in the current verification set. Rotation is performed by overlapping keys: a new key is added and made active for signing, while the previous key remains in the verification set until every token it signed has expired.
