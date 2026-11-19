@@ -201,3 +201,5 @@ addresses) are used.
 | `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
 | `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
 | `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+
+Use the [incident review template](../../docs/operations/INCIDENT_REVIEW_TEMPLATE.md) to record indexer impact, recovery evidence, and follow-ups.

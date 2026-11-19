@@ -70,3 +70,5 @@ Smart contracts deployed to the Stellar network are permanent and immutable.
 3. **Contract Upgrades:**
    - Execute upgrades via the contract's governance upgrade mechanism.
    - Point the backend `CONTRACT_ADDRESS` to the new contract address only after full indexing replay verification.
+
+Record deployment incidents and follow-up verification in the [incident review template](../operations/INCIDENT_REVIEW_TEMPLATE.md).
