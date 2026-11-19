@@ -106,6 +106,71 @@ export interface BackendStream
 }
 
 // ---------------------------------------------------------------------------
+// Token metadata
+// ---------------------------------------------------------------------------
+
+/**
+ * Verification status of a token asset.
+ *
+ * - `verified`   — asset is configured and its metadata has been verified.
+ * - `unverified` — asset is configured but not yet verified.
+ * - `deprecated` — asset is configured but deprecated; avoid new streams.
+ * - `blocked`    — asset is not allowed; do not create or fund streams.
+ * - `unknown`    — asset is not configured / metadata could not be resolved.
+ */
+export type TokenVerificationStatus =
+  | "verified"
+  | "unverified"
+  | "deprecated"
+  | "blocked"
+  | "unknown";
+
+/**
+ * Provenance information describing where a token's metadata came from.
+ * All fields are optional so older backends that do not report provenance
+ * remain compatible.
+ */
+export interface TokenProvenance {
+  /** Human-readable source of the metadata (e.g. "registry", "on-chain", "user"). */
+  source?: string;
+  /** Optional reference (URL or identifier) for the metadata source. */
+  reference?: string;
+  /** ISO-8601 timestamp of when the metadata was last verified/updated. */
+  updatedAt?: string;
+}
+
+/**
+ * A network-specific token address entry.
+ * `network` is the chain/network identifier (e.g. "stellar:testnet").
+ */
+export interface TokenNetworkAddress {
+  network: string;
+  address: string;
+}
+
+/**
+ * Token metadata as returned by the backend API.
+ *
+ * The fields below are additive and optional so existing consumers that only
+ * rely on the original metadata fields continue to work unchanged.
+ */
+export interface TokenMetadata {
+  /** Raw token identifier (contract address / asset id). Always preserved. */
+  address?: string;
+  symbol?: string;
+  name?: string;
+  decimals?: number;
+  /** Verification status; absent on older backends. */
+  verificationStatus?: TokenVerificationStatus;
+  /** Provenance of the metadata; absent on older backends. */
+  provenance?: TokenProvenance;
+  /** Network-specific addresses for this asset. */
+  addresses?: TokenNetworkAddress[];
+  /** Allow additional backend fields without breaking existing call sites. */
+  [key: string]: unknown;
+}
+
+// ---------------------------------------------------------------------------
 // Operation-specific response types (derived from `paths`)
 // ---------------------------------------------------------------------------
 

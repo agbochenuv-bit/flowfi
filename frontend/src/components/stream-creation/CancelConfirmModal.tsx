@@ -8,11 +8,29 @@
  * already-withdrawn funds) before the user commits.
  */
 
-import React, { useState } from "react";
+import React, { useMemo, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
+
+/**
+ * Authoritative snapshot of the stream as read from chain at the time the
+ * modal was opened. The preview is derived exclusively from these values so
+ * that what the user sees matches what the contract will do.
+ */
+export interface CancelStreamSnapshot {
+  /** Total amount deposited into the stream (token base units, as number). */
+  deposited: number;
+  /** Amount already withdrawn by the recipient. */
+  withdrawn: number;
+  /** Unix timestamp (seconds) at which the stream would have ended. */
+  endTime: number;
+  /** Recipient address the stream pays out to. */
+  recipient: string;
+  /** Ledger timestamp (seconds) the snapshot was captured at. */
+  capturedAt: number;
+}
 
 interface CancelConfirmModalProps {
   streamId: string;
@@ -21,9 +39,17 @@ interface CancelConfirmModalProps {
   token: string;
   deposited: number;
   withdrawn: number;
+  /** Optional authoritative snapshot; falls back to props when omitted. */
+  snapshot?: CancelStreamSnapshot;
+  /** Optional current ledger time (seconds) used to detect stale snapshots. */
+  nowSeconds?: number;
+  /** Max age (seconds) of a snapshot before it is considered stale. */
+  staleAfterSeconds?: number;
   onConfirm: (streamId: string) => Promise<void>;
   onClose: () => void;
 }
+
+const DEFAULT_STALE_AFTER_SECONDS = 60;
 
 export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
   streamId,
@@ -32,6 +58,9 @@ export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
   token,
   deposited,
   withdrawn,
+  snapshot,
+  nowSeconds,
+  staleAfterSeconds = DEFAULT_STALE_AFTER_SECONDS,
   onConfirm,
   onClose,
 }) => {
@@ -39,9 +68,40 @@ export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
 
   const dialogRef = useModalDialog({ onClose, isCloseDisabled: isSubmitting });
 
-  const remaining = deposited - withdrawn;
+  const preview = useMemo(() => {
+    const source: CancelStreamSnapshot =
+      snapshot ?? {
+        deposited,
+        withdrawn,
+        endTime: 0,
+        recipient,
+        capturedAt: 0,
+      };
+
+    // Clamp to avoid negative remaining amounts from rounding drift.
+    const remaining = Math.max(0, source.deposited - source.withdrawn);
+    const now = nowSeconds ?? Math.floor(Date.now() / 1000);
+    const ageSeconds = source.capturedAt > 0 ? Math.max(0, now - source.capturedAt) : 0;
+    const isStale = source.capturedAt > 0 && ageSeconds > staleAfterSeconds;
+
+    return {
+      remaining,
+      endTime: source.endTime,
+      recipient: source.recipient,
+      ageSeconds,
+      isStale,
+      hasSnapshot: Boolean(snapshot),
+    };
+  }, [snapshot, deposited, withdrawn, recipient, nowSeconds, staleAfterSeconds]);
+
+  const remaining = preview.remaining;
+  const isStale = preview.isStale;
 
   const handleConfirm = async () => {
+    if (isStale) {
+      toast.error("Stream state is stale. Refresh the stream before cancelling.");
+      return;
+    }
     setIsSubmitting(true);
     try {
       await onConfirm(streamId);
@@ -122,6 +182,59 @@ export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
           </div>
         </div>
 
+        {/* Cancellation preview: resulting stream state */}
+        <div className="mb-6 rounded-lg bg-white/5 border border-glass-border text-sm">
+          <div className="px-4 py-3 border-b border-glass-border">
+            <h3 className="font-semibold text-foreground">After cancellation</h3>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Preview computed from the on-chain snapshot at the time this dialog opened.
+            </p>
+          </div>
+          <div className="divide-y divide-glass-border">
+            <div className="flex justify-between px-4 py-3">
+              <span className="text-slate-400">Stream status</span>
+              <span className="font-semibold text-red-400">Cancelled</span>
+            </div>
+            <div className="flex justify-between px-4 py-3">
+              <span className="text-slate-400">Beneficiary</span>
+              <code className="font-mono text-xs text-foreground">{preview.recipient}</code>
+            </div>
+            <div className="flex justify-between px-4 py-3">
+              <span className="text-slate-400">End time</span>
+              <span className="font-semibold text-foreground">
+                {preview.endTime > 0
+                  ? new Date(preview.endTime * 1000).toLocaleString()
+                  : "Immediate (now)"}
+              </span>
+            </div>
+            <div className="flex justify-between px-4 py-3">
+              <span className="text-slate-400">Remaining forfeited</span>
+              <span className="font-semibold text-accent">{remaining} {token}</span>
+            </div>
+            <div className="flex justify-between px-4 py-3">
+              <span className="text-slate-400">Already withdrawn (kept)</span>
+              <span className="font-semibold text-foreground">{withdrawn} {token}</span>
+            </div>
+          </div>
+          <div className="px-4 py-2 border-t border-glass-border text-xs text-slate-500">
+            Assumptions: amounts are read from the latest confirmed snapshot; no further
+            accrual is assumed after cancellation. Remaining funds stay locked in the
+            contract until the recipient withdraws or the admin resolves them.
+          </div>
+        </div>
+
+        {/* Stale-state guard */}
+        {isStale && (
+          <div
+            role="alert"
+            className="mb-6 p-3 rounded-lg bg-amber-500/10 border border-amber-500/30 text-sm text-amber-300"
+          >
+            <strong className="text-amber-400">Stream state is stale.</strong>{" "}
+            This preview is {preview.ageSeconds}s old. Refresh the stream before
+            cancelling so the preview matches the contract.
+          </div>
+        )}
+
         {/* Consequence note */}
         <div className="mb-6 p-3 rounded-lg bg-red-500/10 border border-red-500/20 text-sm text-red-300">
           <strong className="text-red-400">What happens:</strong> The stream stops immediately.
@@ -138,7 +251,8 @@ export const CancelConfirmModal: React.FC<CancelConfirmModalProps> = ({
           <button
             type="button"
             onClick={() => void handleConfirm()}
-            disabled={isSubmitting}
+            disabled={isSubmitting || isStale}
+            title={isStale ? "Refresh the stream before cancelling" : undefined}
             className="inline-flex items-center justify-center rounded-full px-6 py-2.5 text-sm font-semibold bg-red-600 hover:bg-red-500 text-white transition-all active:scale-95 disabled:opacity-50 disabled:pointer-events-none"
           >
             {isSubmitting ? (

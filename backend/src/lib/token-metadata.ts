@@ -12,6 +12,33 @@
  * invalidated) cleanly.
  */
 
+/**
+ * Verification lifecycle for an asset.
+ *
+ * - `verified`    — curated by FlowFi and confirmed on-chain.
+ * - `configured`  — operator-configured (env/seed) but not independently confirmed.
+ * - `deprecated`  — still resolvable, but new streams should avoid it.
+ * - `unverified`  — discovered from user input; metadata is not trusted.
+ * - `blocked`     — explicitly disallowed; must not be used to create/fund streams.
+ */
+export type TokenVerificationStatus =
+  | 'verified'
+  | 'configured'
+  | 'deprecated'
+  | 'unverified'
+  | 'blocked';
+
+/** Where a token's metadata came from. */
+export type TokenProvenance = 'flowfi-curated' | 'operator-config' | 'user-supplied' | 'unknown';
+
+/** Network-scoped contract address. */
+export interface TokenNetworkAddress {
+  /** Stellar network identifier, e.g. `mainnet` or `testnet`. */
+  network: string;
+  /** `native` for XLM, otherwise the Soroban contract address (C…). */
+  contractAddress: string;
+}
+
 export interface TokenMetadata {
   /** Ticker used across the API and UI, e.g. `USDC`. */
   symbol: string;
@@ -27,8 +54,27 @@ export interface TokenMetadata {
   icon?: string;
   /** Short description shown in token pickers. */
   description?: string;
-  /** True for assets curated by FlowFi. */
+  /** True for assets curated by FlowFi. Retained for backwards compatibility. */
   verified: boolean;
+  /** Verification lifecycle state. Defaults to `verified` when `verified` is true. */
+  verificationStatus?: TokenVerificationStatus;
+  /** Where the metadata came from. */
+  provenance?: TokenProvenance;
+  /** Network-scoped addresses. `contractAddress` mirrors the default network entry. */
+  addresses?: TokenNetworkAddress[];
+  /** Optional human-readable reason for the current status (e.g. why blocked). */
+  statusReason?: string;
+}
+
+/** Resolve the effective verification status, honouring the legacy `verified` flag. */
+export function resolveVerificationStatus(token: TokenMetadata): TokenVerificationStatus {
+  if (token.verificationStatus) return token.verificationStatus;
+  return token.verified ? 'verified' : 'unverified';
+}
+
+/** True when the asset must not be used to create or fund streams. */
+export function isTokenBlocked(token: TokenMetadata): boolean {
+  return resolveVerificationStatus(token) === 'blocked';
 }
 
 export interface TokenMetadataList {
@@ -51,6 +97,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/xlm.svg',
       description: 'Native Stellar token',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.XLM_TOKEN_ADDRESS ??
+            'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCN',
+        },
+      ],
     },
     {
       symbol: 'USDC',
@@ -63,6 +119,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/usdc.svg',
       description: 'USD Coin',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.USDC_TOKEN_ADDRESS ??
+            'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA',
+        },
+      ],
     },
     {
       symbol: 'EURC',
@@ -75,6 +141,16 @@ function defaultTokens(): TokenMetadata[] {
       icon: 'https://assets.flowfi.xyz/tokens/eurc.svg',
       description: 'Euro Coin',
       verified: true,
+      verificationStatus: 'verified',
+      provenance: 'flowfi-curated',
+      addresses: [
+        {
+          network: process.env.STELLAR_NETWORK ?? 'mainnet',
+          contractAddress:
+            process.env.EURC_TOKEN_ADDRESS ??
+            'CCWAMYJME4YOIUNAKVYEBYOG5I65QMKEX2NMN4OJAPXRPIF24ONPSHY',
+        },
+      ],
     },
   ];
 }
@@ -114,10 +190,31 @@ export function getTokenMetadata(symbol: string): TokenMetadata | undefined {
  * clients holding a cached copy revalidate on their next request.
  */
 export function upsertTokenMetadata(token: TokenMetadata): TokenMetadata {
-  const entry: TokenMetadata = { ...token, symbol: token.symbol.toUpperCase() };
+  const entry: TokenMetadata = {
+    ...token,
+    symbol: token.symbol.toUpperCase(),
+    verificationStatus: resolveVerificationStatus(token),
+    provenance: token.provenance ?? 'operator-config',
+  };
   verifiedTokens.set(entry.symbol, entry);
   touch();
   return entry;
+}
+
+/**
+ * Look up a token by symbol and network. Returns `undefined` when the symbol is
+ * unknown, and the token (with its raw identifiers intact) when it is known but
+ * blocked — callers decide how to surface the block.
+ */
+export function getTokenMetadataForNetwork(
+  symbol: string,
+  network: string,
+): TokenMetadata | undefined {
+  const token = getTokenMetadata(symbol);
+  if (!token) return undefined;
+  const scoped = token.addresses?.find((a) => a.network === network);
+  if (!scoped) return token;
+  return { ...token, contractAddress: scoped.contractAddress };
 }
 
 /** Remove a token. Also bumps the version so caches are invalidated. */

@@ -8,22 +8,75 @@ import { formatAmount } from "@/utils/amount";
 import { downloadCSV } from "@/utils/csvExport";
 import TransactionTracker from "@/components/TransactionTracker";
 import { eventTypeToAction } from "@/utils/eventTypeToAction";
-import { Download, ExternalLink, Clock } from "lucide-react";
+import { Download, ExternalLink, Clock, Pencil, Trash2, StickyNote } from "lucide-react";
 import { Button } from "../ui/Button";
+import { useAnnotations } from "@/hooks/useAnnotations";
 
 const VIRTUALIZATION_THRESHOLD = 50;
 
 interface ActivityHistoryProps {
   events: BackendStreamEvent[];
   isLoading?: boolean;
+  /**
+   * Connected wallet address. Annotations are stored locally and scoped to
+   * this address; they are never published on-chain. When absent, annotation
+   * controls are hidden and no annotations are read or written.
+   */
+  walletAddress?: string | null;
 }
 
 export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
   events,
   isLoading,
+  walletAddress,
 }) => {
   const parentRef = useRef<HTMLDivElement>(null);
   const shouldVirtualize = events.length > VIRTUALIZATION_THRESHOLD;
+
+  const {
+    annotations,
+    setAnnotation,
+    deleteAnnotation,
+  } = useAnnotations(walletAddress);
+
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [draftNote, setDraftNote] = useState("");
+
+  const startEditing = useCallback(
+    (eventId: string) => {
+      setEditingEventId(eventId);
+      setDraftNote(annotations[eventId] ?? "");
+    },
+    [annotations],
+  );
+
+  const cancelEditing = useCallback(() => {
+    setEditingEventId(null);
+    setDraftNote("");
+  }, []);
+
+  const saveEditing = useCallback(() => {
+    if (!editingEventId) return;
+    const trimmed = draftNote.trim();
+    if (trimmed.length === 0) {
+      deleteAnnotation(editingEventId);
+    } else {
+      setAnnotation(editingEventId, trimmed);
+    }
+    setEditingEventId(null);
+    setDraftNote("");
+  }, [editingEventId, draftNote, setAnnotation, deleteAnnotation]);
+
+  const removeAnnotation = useCallback(
+    (eventId: string) => {
+      deleteAnnotation(eventId);
+      if (editingEventId === eventId) {
+        setEditingEventId(null);
+        setDraftNote("");
+      }
+    },
+    [deleteAnnotation, editingEventId],
+  );
 
   const virtualizer = useVirtualizer({
     count: events.length,
@@ -44,13 +97,16 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
       "Amount": event.amount ? formatAmount(BigInt(event.amount), 7) : "0",
       "Timestamp": new Date(event.timestamp * 1000).toISOString(),
       "Tx Hash": event.transactionHash || "",
+      // Annotations are local-only; they are included in the user-initiated
+      // export but never sent to the backend or published on-chain.
+      "Note": annotations[event.id] ?? "",
     }));
 
     downloadCSV(rows, `flowfi_activity_${new Date().getTime()}.csv`);
     setExportStatus("complete");
     // Reset after screen readers have had time to announce
     setTimeout(() => setExportStatus("idle"), 3000);
-  }, [events]);
+  }, [events, annotations]);
 
   const renderEventMessage = (event: BackendStreamEvent): React.ReactNode => {
     const amount = event.amount ? formatAmount(BigInt(event.amount), 7) : "0";
@@ -111,6 +167,101 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
       default:
         return <>Event on Stream {link}</>;
     }
+  };
+
+  const renderAnnotation = (event: BackendStreamEvent): React.ReactNode => {
+    // Annotations are only available for a connected wallet; without one we
+    // neither read nor write local notes.
+    if (!walletAddress) return null;
+
+    const isEditing = editingEventId === event.id;
+    const note = annotations[event.id];
+
+    if (isEditing) {
+      return (
+        <div className="mt-3 pt-3 border-t border-white/5">
+          <label
+            htmlFor={`annotation-input-${event.id}`}
+            className="sr-only"
+          >
+            Private note for event {event.id}
+          </label>
+          <textarea
+            id={`annotation-input-${event.id}`}
+            value={draftNote}
+            onChange={(e) => setDraftNote(e.target.value)}
+            rows={2}
+            maxLength={500}
+            placeholder="Add a private note (stored locally, never on-chain)"
+            className="w-full rounded-lg bg-black/30 border border-glass-border text-sm text-white p-2 focus:outline-none focus:ring-1 focus:ring-accent"
+          />
+          <div className="flex justify-end gap-2 mt-2">
+            <Button
+              onClick={cancelEditing}
+              variant="ghost"
+              size="sm"
+              type="button"
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={saveEditing}
+              variant="outline"
+              size="sm"
+              type="button"
+            >
+              Save note
+            </Button>
+          </div>
+        </div>
+      );
+    }
+
+    if (!note) {
+      return (
+        <div className="mt-3 pt-3 border-t border-white/5">
+          <button
+            type="button"
+            onClick={() => startEditing(event.id)}
+            className="flex items-center gap-1 text-xs text-slate-400 hover:text-white transition-colors"
+            aria-label={`Add private note to event ${event.id}`}
+          >
+            <StickyNote className="h-3.5 w-3.5" /> Add note
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="mt-3 pt-3 border-t border-white/5">
+        <div className="flex items-start justify-between gap-2">
+          <p className="text-xs text-slate-300 whitespace-pre-wrap break-words flex-1">
+            <span className="sr-only">Private note: </span>
+            {note}
+          </p>
+          <div className="flex items-center gap-1 shrink-0">
+            <button
+              type="button"
+              onClick={() => startEditing(event.id)}
+              className="text-slate-500 hover:text-white transition-colors"
+              title="Edit note"
+              aria-label={`Edit private note for event ${event.id}`}
+            >
+              <Pencil className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              onClick={() => removeAnnotation(event.id)}
+              className="text-slate-500 hover:text-red-400 transition-colors"
+              title="Delete note"
+              aria-label={`Delete private note for event ${event.id}`}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      </div>
+    );
   };
 
   if (isLoading && events.length === 0) {
@@ -203,6 +354,8 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
                       </span>
                     </div>
 
+                    {renderAnnotation(event)}
+
                     {event.transactionHash && (
                       <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between">
                         {eventTypeToAction(event.eventType) && (
@@ -258,6 +411,8 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
                     {event.eventType}
                   </span>
                 </div>
+
+                {renderAnnotation(event)}
 
                 {event.transactionHash && (
                   <div className="mt-4 pt-4 border-t border-white/5 flex items-center justify-between">

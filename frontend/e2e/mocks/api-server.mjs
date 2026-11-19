@@ -26,6 +26,125 @@ const accountSequence = ["1"];
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
+// ── Token metadata fixtures ──────────────────────────────────────────────────
+// Each token carries provenance, verification state and network-specific
+// addresses so the token-selection UI can be exercised end to end.
+
+const NETWORK = process.env.E2E_NETWORK || "testnet";
+
+const TOKEN_FIXTURES = {
+  [USDC_ADDRESS]: {
+    address: USDC_ADDRESS,
+    symbol: "USDC",
+    name: "USD Coin",
+    decimals: 7,
+    provenance: "configured",
+    verification: "verified",
+    verified: true,
+    deprecated: false,
+    blocked: false,
+    issuer: "GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
+    contractId: USDC_ADDRESS,
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: USDC_ADDRESS,
+      testnet: USDC_ADDRESS,
+      mainnet: "CCW67TSZV3SSS2HXMBQ5JFGCKJNXKZM7UQUWUZPUTHXSTZLEO7SJMI75",
+    },
+  },
+  // Deprecated but still selectable (with a warning).
+  CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA: {
+    address: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    symbol: "OLD",
+    name: "Legacy Token",
+    decimals: 7,
+    provenance: "configured",
+    verification: "deprecated",
+    verified: true,
+    deprecated: true,
+    blocked: false,
+    issuer: null,
+    contractId: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CAAAAAAADEPRECATEDTOKENAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+    },
+  },
+  // Unverified asset discovered on-chain but not in the configured allowlist.
+  CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB: {
+    address: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    symbol: "UNV",
+    name: "Unverified Token",
+    decimals: 7,
+    provenance: "discovered",
+    verification: "unverified",
+    verified: false,
+    deprecated: false,
+    blocked: false,
+    issuer: null,
+    contractId: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CBBBBBBBUNVERIFIEDTOKENBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+    },
+  },
+  // Blocked asset: must never be selectable, but raw identifiers stay visible.
+  CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC: {
+    address: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    symbol: "BLK",
+    name: "Blocked Token",
+    decimals: 7,
+    provenance: "configured",
+    verification: "blocked",
+    verified: false,
+    deprecated: false,
+    blocked: true,
+    blockedReason: "Asset is on the operator blocklist",
+    issuer: null,
+    contractId: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: {
+      [NETWORK]: "CCCCCCCCBLOCKEDTOKENCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+    },
+  },
+};
+
+// Token whose metadata cannot be resolved: the API returns the raw address
+// with null metadata fields so the UI can fall back without hiding identifiers.
+const UNKNOWN_METADATA_ADDRESS =
+  "CDDDDDDDUNKNOWNMETADATATOKENDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+
+function unknownMetadataToken(address) {
+  return {
+    address,
+    symbol: null,
+    name: null,
+    decimals: null,
+    provenance: "unknown",
+    verification: "unknown",
+    verified: false,
+    deprecated: false,
+    blocked: false,
+    issuer: null,
+    contractId: address,
+    network: NETWORK,
+    networkPassphrase: Networks.TESTNET,
+    addresses: { [NETWORK]: address },
+    metadataError: "metadata unavailable",
+  };
+}
+
+function lookupToken(address) {
+  if (!address) return null;
+  if (TOKEN_FIXTURES[address]) return TOKEN_FIXTURES[address];
+  if (address === UNKNOWN_METADATA_ADDRESS) return unknownMetadataToken(address);
+  return unknownMetadataToken(address);
+}
+
 function createStream() {
   return {
     id: "42",
@@ -177,6 +296,52 @@ function handleRest(req, res) {
     return sendJson(res, 200, { data: [stream] });
   }
 
+  // Token list used by the token-selection UI. Includes configured, verified,
+  // deprecated, unverified and blocked assets plus provenance/network data.
+  if (
+    req.method === "GET" &&
+    (url.pathname === "/v1/tokens" || url.pathname === "/api/v1/tokens")
+  ) {
+    const tokens = Object.values(TOKEN_FIXTURES);
+    return sendJson(res, 200, { data: tokens, network: NETWORK });
+  }
+
+  const tokenDetail = url.pathname.match(/^\/v1\/tokens\/([^/]+)$/);
+  if (req.method === "GET" && tokenDetail) {
+    const address = decodeURIComponent(tokenDetail[1]);
+    const token = lookupToken(address);
+    if (!token) {
+      return sendJson(res, 404, { error: "token not found", address });
+    }
+    if (token.blocked) {
+      // Blocked assets are rejected for stream creation/funding, but the raw
+      // identifiers are still returned so the UI can display them.
+      return sendJson(res, 403, {
+        error: "asset blocked",
+        code: "ASSET_BLOCKED",
+        reason: token.blockedReason ?? "asset blocked",
+        token,
+      });
+    }
+    return sendJson(res, 200, token);
+  }
+
+  // Simulate an unknown-metadata response for arbitrary addresses.
+  const tokenMetadata = url.pathname.match(/^\/v1\/tokens\/([^/]+)\/metadata$/);
+  if (req.method === "GET" && tokenMetadata) {
+    const address = decodeURIComponent(tokenMetadata[1]);
+    const token = lookupToken(address);
+    if (token.blocked) {
+      return sendJson(res, 403, {
+        error: "asset blocked",
+        code: "ASSET_BLOCKED",
+        reason: token.blockedReason ?? "asset blocked",
+        token,
+      });
+    }
+    return sendJson(res, 200, token);
+  }
+
   const streamDetail = url.pathname.match(/^\/v1\/streams\/(\d+)$/);
   if (req.method === "GET" && streamDetail) {
     return sendJson(res, 200, stream);
@@ -212,6 +377,22 @@ function handleRest(req, res) {
     }, 15000);
     res.on("close", () => clearInterval(heartbeat));
     return;
+  }
+
+  // E2E control: force a token to be reported as blocked.
+  const blockControl = url.pathname.match(/^\/__e2e\/token\/([^/]+)\/block$/);
+  if (req.method === "POST" && blockControl) {
+    const address = decodeURIComponent(blockControl[1]);
+    const existing = TOKEN_FIXTURES[address] ?? lookupToken(address);
+    TOKEN_FIXTURES[address] = {
+      ...existing,
+      address,
+      blocked: true,
+      verification: "blocked",
+      verified: false,
+      blockedReason: "Asset is on the operator blocklist",
+    };
+    return sendJson(res, 200, { ok: true, token: TOKEN_FIXTURES[address] });
   }
 
   const withdrawControl = url.pathname.match(/^\/__e2e\/stream\/(\d+)\/withdraw$/);

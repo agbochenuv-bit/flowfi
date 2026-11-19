@@ -11,6 +11,8 @@ vi.mock('react-hot-toast', () => ({
 import { CancelConfirmModal } from '../components/stream-creation/CancelConfirmModal';
 import { RecipientStep } from '../components/stream-creation/RecipientStep';
 import { AmountStep } from '../components/stream-creation/AmountStep';
+import { StreamChangePreview } from '../components/stream-creation/StreamChangePreview';
+import { AssetBadge } from '../components/stream-creation/AssetBadge';
 
 // ─── CancelConfirmModal ───────────────────────────────────────────────────────
 
@@ -212,5 +214,177 @@ describe('AmountStep', () => {
   it('disables Max when the spendable balance is zero (XLM reserve)', () => {
     render(<AmountStep value="" onChange={vi.fn()} token="XLM" availableBalance="1" />);
     expect(screen.getByText('Max')).toBeDisabled();
+  });
+});
+
+// ─── StreamChangePreview ─────────────────────────────────────────────────────
+
+describe('StreamChangePreview', () => {
+  const baseStream = {
+    streamId: 'stream-7',
+    token: 'USDC',
+    deposited: '1000.0000000',
+    withdrawn: '200.0000000',
+    ratePerSecond: '0.0000115740740',
+    recipient: 'GDEF456ABC789GHI012JKL345MNO678PQR901STU234VWX567YZA123BCD',
+    updatedAt: '2024-01-01T00:00:00.000Z',
+  };
+
+  it('renders before and after columns for a top-up', () => {
+    render(
+      <StreamChangePreview
+        change={{ kind: 'top-up', amount: '250' }}
+        stream={baseStream}
+      />,
+    );
+    expect(screen.getByText(/before/i)).toBeInTheDocument();
+    expect(screen.getByText(/after/i)).toBeInTheDocument();
+    expect(screen.getByText(/1,250/)).toBeInTheDocument();
+  });
+
+  it('rounds displayed amounts to the token precision and labels the assumption', () => {
+    render(
+      <StreamChangePreview
+        change={{ kind: 'top-up', amount: '0.123456789' }}
+        stream={{ ...baseStream, deposited: '1000.0000000' }}
+      />,
+    );
+    // 7-decimal precision: 0.1234567 (truncated/rounded), never more than 7 dp
+    const after = screen.getByTestId('preview-after-deposited');
+    expect(after.textContent).toMatch(/1,000\.1234567/);
+    expect(after.textContent).not.toMatch(/\d{8,}/);
+    expect(screen.getByText(/rounded to 7 decimal places/i)).toBeInTheDocument();
+  });
+
+  it('flags stale stream state when the stream was updated after the preview snapshot', () => {
+    render(
+      <StreamChangePreview
+        change={{ kind: 'top-up', amount: '10' }}
+        stream={baseStream}
+        snapshotUpdatedAt="2023-12-31T00:00:00.000Z"
+      />,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/stream has changed/i);
+  });
+
+  it('does not flag stale state when the snapshot matches the stream', () => {
+    render(
+      <StreamChangePreview
+        change={{ kind: 'top-up', amount: '10' }}
+        stream={baseStream}
+        snapshotUpdatedAt={baseStream.updatedAt}
+      />,
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('prompts the user to reconnect when the wallet is canceled', () => {
+    render(
+      <StreamChangePreview
+        change={{ kind: 'cancel' }}
+        stream={baseStream}
+        walletStatus="canceled"
+      />,
+    );
+    expect(screen.getByRole('alert')).toHaveTextContent(/wallet connection was canceled/i);
+    expect(screen.getByText(/reconnect/i)).toBeInTheDocument();
+  });
+
+  it('renders a cancellation preview showing the remaining balance', () => {
+    render(
+      <StreamChangePreview change={{ kind: 'cancel' }} stream={baseStream} />,
+    );
+    expect(screen.getByTestId('preview-after-deposited')).toHaveTextContent(/800/);
+  });
+
+  it('renders a beneficiary change preview with both addresses', () => {
+    const newRecipient = 'GAV4A377RAEV6YVAWZVHXF4VZD5ZBXGIKEMNHV5YIMV5LIKSNQVYUBR7';
+    render(
+      <StreamChangePreview
+        change={{ kind: 'beneficiary', recipient: newRecipient }}
+        stream={baseStream}
+      />,
+    );
+    expect(screen.getByText(baseStream.recipient)).toBeInTheDocument();
+    expect(screen.getByText(newRecipient)).toBeInTheDocument();
+  });
+});
+
+// ─── AssetBadge ──────────────────────────────────────────────────────────────
+
+describe('AssetBadge', () => {
+  it('shows a verified badge for a verified asset', () => {
+    render(
+      <AssetBadge
+        asset={{
+          code: 'USDC',
+          issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+          status: 'verified',
+          network: 'mainnet',
+        }}
+      />,
+    );
+    expect(screen.getByText(/verified/i)).toBeInTheDocument();
+  });
+
+  it('shows a deprecated badge for a deprecated asset', () => {
+    render(
+      <AssetBadge
+        asset={{
+          code: 'OLD',
+          issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+          status: 'deprecated',
+          network: 'mainnet',
+        }}
+      />,
+    );
+    expect(screen.getByText(/deprecated/i)).toBeInTheDocument();
+  });
+
+  it('shows an unverified badge and preserves the raw issuer identifier', () => {
+    const issuer = 'GUNKNOWNISSUER000000000000000000000000000000000000000000';
+    render(
+      <AssetBadge
+        asset={{ code: 'XYZ', issuer, status: 'unverified', network: 'testnet' }}
+      />,
+    );
+    expect(screen.getByText(/unverified/i)).toBeInTheDocument();
+    expect(screen.getByText(issuer)).toBeInTheDocument();
+  });
+
+  it('handles unknown metadata without hiding the raw code and issuer', () => {
+    const issuer = 'GRAWMETADATA0000000000000000000000000000000000000000000';
+    render(<AssetBadge asset={{ code: 'RAW', issuer, status: 'unknown' }} />);
+    expect(screen.getByText(/unknown/i)).toBeInTheDocument();
+    expect(screen.getByText('RAW')).toBeInTheDocument();
+    expect(screen.getByText(issuer)).toBeInTheDocument();
+  });
+
+  it('shows a blocked badge and keeps the raw identifiers visible', () => {
+    const issuer = 'GBLOCKED00000000000000000000000000000000000000000000000';
+    render(
+      <AssetBadge
+        asset={{ code: 'BLK', issuer, status: 'blocked', network: 'mainnet' }}
+      />,
+    );
+    expect(screen.getByText(/blocked/i)).toBeInTheDocument();
+    expect(screen.getByText('BLK')).toBeInTheDocument();
+    expect(screen.getByText(issuer)).toBeInTheDocument();
+  });
+
+  it('displays the network-specific address when provided', () => {
+    render(
+      <AssetBadge
+        asset={{
+          code: 'USDC',
+          issuer: 'GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN',
+          status: 'verified',
+          network: 'testnet',
+          contractAddress: 'CABCDEF1234567890',
+        }}
+      />,
+    );
+    expect(screen.getByText(/testnet/i)).toBeInTheDocument();
+    expect(screen.getByText('CABCDEF1234567890')).toBeInTheDocument();
   });
 });

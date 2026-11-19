@@ -7,18 +7,32 @@
  * Collects an amount, shows a confirmation summary, and calls onConfirm.
  */
 
-import React, { useRef, useState } from "react";
+import React, { useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { formatAmount, hasValidPrecision, parseAmountExact, validateAmountInput } from "@/utils/amount";
 import { useModalDialog } from "@/hooks/useModalDialog";
 import { getTokenDecimals, useTokenMetadata } from "@/hooks/useTokenMetadata";
 import toast from "react-hot-toast";
 import { transactionSuccessToast } from "@/lib/transaction-feedback";
+import {
+  buildStreamChangePreview,
+  type StreamChangePreview,
+  type StreamSnapshot,
+} from "@/utils/stream-change-preview";
 
 interface TopUpModalProps {
   streamId: string;
   token: string;
   currentDeposited: number;
+  /**
+   * Authoritative snapshot of the stream as last read from chain. When
+   * provided, the preview is computed from it and labeled with its
+   * assumptions; when omitted, only the deposited balance is known and the
+   * preview labels the remaining fields as assumed.
+   */
+  streamSnapshot?: StreamSnapshot | null;
+  /** True when the snapshot may be out of date (e.g. a refetch is pending). */
+  isSnapshotStale?: boolean;
   onConfirm: (streamId: string, amount: string, decimals: number) => Promise<void>;
   onClose: () => void;
 }
@@ -27,12 +41,15 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
   streamId,
   token,
   currentDeposited,
+  streamSnapshot,
+  isSnapshotStale = false,
   onConfirm,
   onClose,
 }) => {
   const [amount, setAmount] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [walletPromptCanceled, setWalletPromptCanceled] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const dialogRef = useModalDialog({
@@ -58,30 +75,45 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
     return true;
   };
 
+  const preview: StreamChangePreview | null = useMemo(() => {
+    if (!amount.trim()) return null;
+    try {
+      return buildStreamChangePreview({
+        kind: "top-up",
+        token,
+        decimals: tokenDecimals,
+        currentDeposited,
+        snapshot: streamSnapshot ?? null,
+        topUpAmount: amount,
+      });
+    } catch {
+      return null;
+    }
+  }, [amount, token, tokenDecimals, currentDeposited, streamSnapshot]);
+
+  const previewStale = isSnapshotStale || (preview?.isStale ?? false);
+  const submitBlocked = previewStale || walletPromptCanceled;
+
   const handleConfirm = async () => {
+    if (submitBlocked) return;
     if (!validate()) return;
     setIsSubmitting(true);
+    setWalletPromptCanceled(false);
     try {
       await onConfirm(streamId, amount, tokenDecimals);
       transactionSuccessToast(`Successfully added ${amount} ${token} to stream`);
-    } catch {
-      toast.error("Failed to top up stream. Please try again.");
+    } catch (err) {
+      // A rejected wallet prompt is not a transaction failure; surface it
+      // distinctly and keep the modal open so the user can retry.
+      if (isWalletRejection(err)) {
+        setWalletPromptCanceled(true);
+        toast.error("Wallet request was canceled. Review the preview and try again.");
+      } else {
+        toast.error("Failed to top up stream. Please try again.");
+      }
       setIsSubmitting(false);
     }
   };
-
-  let newTotal: string | null = null;
-  try {
-    if (amount.trim()) {
-      newTotal = formatAmount(
-        parseAmountExact(String(currentDeposited), tokenDecimals) +
-          parseAmountExact(amount, tokenDecimals),
-        tokenDecimals,
-      );
-    }
-  } catch {
-    newTotal = null;
-  }
 
   return (
     <div
@@ -173,16 +205,51 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
           )}
         </div>
 
-        {/* Preview */}
-        {newTotal !== null && (
-          <div className="mb-6 p-3 rounded-lg bg-accent/5 border border-accent/20 text-sm">
-            <p className="text-slate-300">
-              New total:{" "}
-              <strong className="text-accent">
-                {newTotal} {token}
-              </strong>
-            </p>
+        {/* Side-by-side preview */}
+        {preview && (
+          <div className="mb-6 rounded-lg bg-accent/5 border border-accent/20 text-sm">
+            <table className="w-full text-left">
+              <caption className="sr-only">Stream change preview</caption>
+              <thead>
+                <tr className="text-slate-400">
+                  <th scope="col" className="px-3 pt-3 pb-1 font-medium">Field</th>
+                  <th scope="col" className="px-3 pt-3 pb-1 font-medium">Current</th>
+                  <th scope="col" className="px-3 pt-3 pb-1 font-medium">After</th>
+                </tr>
+              </thead>
+              <tbody className="text-slate-300">
+                {preview.rows.map((row) => (
+                  <tr key={row.field} className="border-t border-accent/10">
+                    <th scope="row" className="px-3 py-1 font-normal text-slate-400">
+                      {row.label}
+                    </th>
+                    <td className="px-3 py-1 font-mono">{row.before}</td>
+                    <td className="px-3 py-1 font-mono">
+                      <strong className="text-accent">{row.after}</strong>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {preview.assumptions.length > 0 && (
+              <ul className="px-3 pb-3 pt-1 space-y-0.5 text-xs text-slate-400" aria-label="Preview assumptions">
+                {preview.assumptions.map((assumption) => (
+                  <li key={assumption}>Assumes: {assumption}</li>
+                ))}
+              </ul>
+            )}
           </div>
+        )}
+
+        {previewStale && (
+          <p className="mb-4 text-sm text-amber-400" role="status">
+            Stream state may be out of date. Refresh before signing.
+          </p>
+        )}
+        {walletPromptCanceled && (
+          <p className="mb-4 text-sm text-amber-400" role="status">
+            Wallet request canceled. Confirm again to retry.
+          </p>
         )}
 
         {/* Actions */}
@@ -190,7 +257,12 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
           <Button variant="outline" onClick={onClose} disabled={isSubmitting}>
             Cancel
           </Button>
-          <Button onClick={() => void handleConfirm()} loading={isSubmitting} glow>
+          <Button
+            onClick={() => void handleConfirm()}
+            loading={isSubmitting}
+            disabled={submitBlocked}
+            glow
+          >
             {isSubmitting ? "Topping up…" : "Confirm Top Up"}
           </Button>
         </div>
@@ -198,3 +270,11 @@ export const TopUpModal: React.FC<TopUpModalProps> = ({
     </div>
   );
 };
+
+function isWalletRejection(err: unknown): boolean {
+  if (!err || typeof err !== "object") return false;
+  const code = (err as { code?: unknown }).code;
+  if (code === 4001 || code === "ACTION_REJECTED") return true;
+  const name = (err as { name?: unknown }).name;
+  return name === "UserRejectedRequestError";
+}
