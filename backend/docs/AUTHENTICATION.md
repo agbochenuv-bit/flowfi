@@ -91,29 +91,64 @@ Challenges issued by `/v1/auth/challenge` are **single-use** and bound to a spec
 - Clients that previously reused a signed challenge (or cached a nonce across requests) **must** request a fresh challenge for every login. Reuse now returns `401 CHALLENGE_ALREADY_USED`.
 - Clients must send the same `network` and `audience` they used when requesting the challenge; mismatches are rejected.
 - If `AUTH_CHALLENGE_TTL_SECONDS` is lowered, clients should request and submit challenges promptly rather than pre-generating them.
-======>>> REPLACE
 
-<<<<<<< SEARCH
-## Error Responses
+## Server-Side Signing Boundary
 
-### 401 Unauthorized - Missing Token
+FlowFi is **non-custodial by default**. The SDK never holds user secret keys, and signing is confined to a server-only boundary module that is excluded from browser bundles.
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
+### Non-Custodial Defaults
+
+- Client code signs transactions locally with the user's wallet; the server only verifies signatures.
+- No secret keys, seeds, or signing material are ever shipped to or accepted from the browser.
+- Custodial signing is **disabled** unless an application explicitly supplies a signer policy that authorizes it.
+
+### Signer Policy Interface
+
+Applications that need custodial signing supply a `SignerPolicy` on the server. The policy is consulted for every signing request and must return an explicit decision:
+
+```typescript
+interface SignerPolicy {
+  // Return true to authorize signing this action, false to deny.
+  authorize(request: SigningRequest): Promise<boolean> | boolean;
 }
 ```
 
-### 401 Unauthorized - Invalid Signature
+- The default policy **denies all custodial signing** (`denyAllSignerPolicy`).
+- A denied action fails closed with `403 SIGNING_DENIED`; no signature is produced.
+- The policy is evaluated server-side only; it is never bundled into client code.
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-=======
+### Policy Audit Records
+
+Every signing decision (allowed or denied) emits an audit record containing the action, wallet, network, decision, and reason. Audit records are **redacted**: secret keys, seeds, tokens, and credentials are stripped before the record is written to logs or storage.
+
+### Secret Redaction
+
+Signing errors and audit records never include raw secret material. Redaction is applied to error messages and log output so that keys, tokens, and credentials cannot leak through failure paths.
+
+## Security Features
+
+1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
+2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
+3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
+4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
+5. **Network Validation**: Ensures transactions match the configured Stellar network
+6. **No Password Storage**: No sensitive credentials stored on the server
+7. **Server-Side Signing Boundary**: Custodial signing is isolated server-side, policy-gated, and denied by default
+
+## Endpoint-Specific Wallet Authorization Scopes
+
+Authenticated endpoints enforce ownership at the route/service boundary. The server derives the acting wallet from the verified JWT and **never trusts client-supplied sender or recipient addresses** for authorization decisions.
+
+| Resource | Read | Mutate |
+| --- | --- | --- |
+| User profile (`/v1/users/:publicKey`) | Owner wallet only | Owner wallet only |
+| Streams (`/v1/streams/:id`) | Sender or recipient wallet | Sender wallet only |
+| Admin (`/v1/admin/*`) | Admin wallet (allowlisted) | Admin wallet (allowlisted) |
+| Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
+| Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
+
+Violations return `403 WALLET_SCOPE_FORBIDDEN` without revealing whether the resource exists.
+
 ## Error Responses
 
 All errors share a predictable envelope produced by centralized validation and error mapping:
@@ -170,6 +205,19 @@ Returned when a request body, path parameter, or query parameter fails schema va
 }
 ```
 
+### 403 Forbidden - Signing Denied
+
+Returned when a signer policy denies a custodial signing action (including the default deny-all policy).
+
+```json
+{
+  "error": "Forbidden",
+  "code": "SIGNING_DENIED",
+  "message": "Signing action denied by signer policy",
+  "requestId": "b1f2c3d4-..."
+}
+```
+
 ### 403 Forbidden - Wallet Scope Violation
 
 Returned when an authenticated wallet attempts to read or mutate a resource it does not own. The response does not reveal whether the resource exists.
@@ -201,248 +249,4 @@ Unexpected failures return a generic message with no stack trace or internal ide
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
 - New `details` arrays appear only on `400 VALIDATION_ERROR` responses.
 - `requestId` is additive; clients may log it for support escalation.
-======>>> REPLACE
-
-<<<<<<< SEARCH
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-=======
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Single-Use Challenges**: Each challenge is consumed on first successful verification; replays are rejected
-3. **Challenge Binding**: Challenges are bound to wallet, audience, network, and expiry
-4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-5. **Network Validation**: Ensures transactions match the configured Stellar network
-6. **No Password Storage**: No sensitive credentials stored on the server
-
-## Endpoint-Specific Wallet Authorization Scopes
-
-Authenticated endpoints enforce ownership at the route/service boundary. The server derives the acting wallet from the verified JWT and **never trusts client-supplied sender or recipient addresses** for authorization decisions.
-
-| Resource | Read | Mutate |
-| --- | --- | --- |
-| User profile (`/v1/users/:publicKey`) | Owner wallet only | Owner wallet only |
-| Streams (`/v1/streams/:id`) | Sender or recipient wallet | Sender wallet only |
-| Admin (`/v1/admin/*`) | Admin wallet (allowlisted) | Admin wallet (allowlisted) |
-| Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
-| Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
-
-Violations return `403 WALLET_SCOPE_FORBIDDEN`. Cross-wallet enumeration attempts (e.g. listing another wallet's streams by spoofing a query parameter) are rejected rather than silently filtered.
-
-### Migration Notes (Scopes)
-
-- Clients that previously passed `sender`/`recipient` addresses in request bodies to act on behalf of another wallet must instead authenticate as that wallet. Such fields are ignored for authorization and may be rejected by validation.
-- Admin operations require the caller's wallet to be present in the admin allowlist (`ADMIN_PUBLIC_KEYS`).
-- Public endpoints remain unauthenticated; no client change is required for them.
-======>>> REPLACE
-
-<<<<<<< SEARCH
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-=======
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-
-# Challenge lifetime in seconds (default 300)
-AUTH_CHALLENGE_TTL_SECONDS=300
-
-# Intended audience bound into each challenge
-AUTH_AUDIENCE=flowfi-api
-
-# Comma-separated admin wallet public keys
-ADMIN_PUBLIC_KEYS=GADMIN1...,GADMIN2...
-```
-
-## Example: Creating a Signed Transaction (Client Side)
-
-```javascript
-import * as StellarSdk from '@stellar/stellar-sdk';
-
-// Create a keypair (in real app, this comes from the user's wallet)
-const keypair = StellarSdk.Keypair.fromSecret('S...');
-
-// Get the current network passphrase
-const networkPassphrase = StellarSdk.Networks.TESTNET;
-
-// Create a simple transaction for authentication
-const account = await server.loadAccount(keypair.publicKey());
-const transaction = new StellarSdk.TransactionBuilder(account, {
-  fee: StellarSdk.BASE_FEE,
-  networkPassphrase,
-})
-  .addOperation(
-    StellarSdk.Operation.manageData({
-      name: 'auth',
-      value: crypto.randomBytes(32), // Random challenge
-    })
-  )
-  .setTimeout(300) // 5 minutes validity
-  .build();
-
-// Sign the transaction
-transaction.sign(keypair);
-
-// Encode to XDR for the Bearer token
-const xdr = transaction.toEnvelope().toXDR('base64');
-
-// Use in Authorization header
-const response = await fetch('http://localhost:3001/v1/users/me', {
-  headers: {
-    'Authorization': `Bearer ${xdr}`
-  }
-});
-```
-
-## Error Responses
-
-### 401 Unauthorized - Missing Token
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
-}
-```
-
-### 401 Unauthorized - Invalid Signature
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-
-### Network Passphrases
-
-- **Testnet**: `Test SDF Network ; September 2015`
-- **Mainnet**: `Public Global Stellar Network ; September 2015`
-
-## Independence from Database
-
-Per issue #74 requirements, the middleware operates independently of the database:
-
-- **User Exists**: Returns user data from database
-- **User Missing**: Returns in-memory user object with `publicKey` and empty arrays
-- **Never Blocks**: Authentication succeeds based solely on valid signature
-
-Example in-memory response:
-
-```json
-{
-  "publicKey": "GABC123...",
-  "sentStreams": [],
-  "receivedStreams": [],
-  "inMemory": true
-}
-```
-
-## TypeScript Types
-
-### AuthUser
-
-```typescript
-interface AuthUser {
-  publicKey: string;
-  id?: string;
-}
-```
-
-### AuthenticatedRequest
-
-```typescript
-interface AuthenticatedRequest extends Request {
-  user: AuthUser;
-}
-```
-
-### Usage in Controllers
-
-```typescript
-import type { AuthenticatedRequest } from '../types/auth.types.js';
-
-export const getCurrentUser = async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const { publicKey } = authReq.user;
-
-  // Use publicKey...
-};
-```
-
-## Testing
-
-Test the middleware with a valid signed transaction:
-
-```bash
-# 1. Create a test transaction (use stellar-sdk)
-# 2. Sign it with a test keypair
-# 3. Encode to XDR
-# 4. Send request
-
-curl -X GET http://localhost:3001/v1/users/me \
-  -H "Authorization: Bearer <your_signed_transaction_xdr>"
-```
-
-## OpenAPI Parity in CI
-
-`backend/swagger/flowfi.openapi.json` is generated from the route definitions and validated in CI. The pipeline fails when:
-
-- The committed spec differs from the generated artifact (drift)
-- A route is missing from the spec, or the spec documents a route that no longer exists
-- Documented request/response schemas, status codes, or auth requirements diverge from the implementation
-- Error responses (`400`, `401`, `403`, `500`) are not documented for protected endpoints
-
-Generated artifacts are reproducible: running the generator twice produces byte-identical output. All versioned endpoints (`/v1/*`) and their error responses are included.
-
-### Operational Impact
-
-- Contributors must regenerate the spec (`npm run openapi:generate`) and commit the result when changing routes, schemas, status codes, or auth.
-- A deliberate spec mismatch fails CI, preventing undocumented API changes from merging.
-- No runtime behavior changes; this is a build/CI gate only.
-
-## Related Documentation
-
-- [Stellar SEP-10 Specification](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md)
-- [Stellar SDK Documentation](https://stellar.github.io/js-stellar-sdk/)
-- [Swagger API Docs](http://localhost:3001/api-docs)
+- Custodial signing now requires an explicit server-side signer policy; without one, signing requests fail with `403 SIGNING_DENIED`.

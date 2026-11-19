@@ -164,6 +164,61 @@ idempotent because:
    through the same `processEvent` path, which checks for duplicates before
    mutating stream state.
 
+## Partner Event Consumer Contract
+
+Partners that consume FlowFi events (webhooks or SSE) should follow the same
+ordering and idempotency rules the indexer applies internally. The reference
+consumer in `examples/partner-event-consumer/` demonstrates the full pattern;
+the contract it relies on is summarized here.
+
+### Versioned Envelope
+
+Every delivered event carries a versioned envelope. Consumers must reject
+envelopes whose `version` they do not understand rather than guessing at the
+shape:
+
+```jsonc
+{
+  "version": 1,
+  "id": "evt_01H...",
+  "type": "stream.topped_up",
+  "createdAt": "2026-05-01T12:00:00.000Z",
+  "data": { /* event payload */ },
+  "_ordering": { "ledgerSequence": 12345678, "eventId": "...", "eventType": "TOPPED_UP" }
+}
+```
+
+### Signature Verification
+
+Deliveries are signed with HMAC-SHA256 over the raw request body. The signature
+header is `X-FlowFi-Signature: t=<unix>,v1=<hex>`, where `v1` is
+`HMAC_SHA256(secret, "<t>.<rawBody>")`. Consumers must:
+
+- Verify the signature against the **raw** body before parsing JSON.
+- Reject timestamps outside a small tolerance window (replay protection).
+- Compare digests in constant time.
+
+### Idempotent Processing
+
+Each event has a stable `id`. Consumers must persist processed `id`s (or a
+projection keyed by `id`) so that redelivery — which is expected on retry — is a
+no-op. Processing must be transactional with the projection write so a crash
+mid-handler does not double-apply.
+
+### Cursor Recovery
+
+Consumers persist the last successfully applied `_ordering.eventId` (and
+`ledgerSequence`) as a cursor. On restart or after a detected gap, they resume
+from that cursor rather than from the head of the stream. A gap is detected when
+an incoming `ledgerSequence` is greater than `lastLedger + 1`; the consumer
+should pause, re-fetch from the cursor, and only then continue.
+
+### Redacted Logs
+
+Consumer logs must never include raw signatures, secrets, or full payloads that
+may contain wallet addresses. Log the event `id`, `type`, and `ledgerSequence`
+only; redact any address-like fields.
+
 ## Summary of Guarantees
 
 | Layer       | Guarantee                                                                 |
@@ -173,3 +228,4 @@ idempotent because:
 | API queries | All event-listing responses are sorted by `(ledgerSequence ASC, id ASC)`. |
 | Indexer     | Batch events are processed in ledger+paging-token order.                  |
 | SSE         | Every broadcast includes `_ordering.{ledgerSequence, eventId, eventType}` for client-side gap detection. |
+| Partners    | Versioned envelope, HMAC signature, idempotent `id` handling, cursor recovery, redacted logs. |

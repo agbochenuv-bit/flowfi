@@ -87,6 +87,122 @@ export function nativeTokenContractId(): string {
   return Asset.native().contractId(testnetConfig.networkPassphrase);
 }
 
+/**
+ * A single network's deployment identifiers. `contracts` maps a logical
+ * contract name (e.g. "escrow") to its on-chain contract ID.
+ */
+export interface NetworkEntry {
+  networkPassphrase: string;
+  rpcUrl: string;
+  friendbotUrl?: string;
+  contracts: Record<string, string>;
+}
+
+/**
+ * Versioned registry of supported networks. Bump `version` whenever any
+ * entry changes so operators can detect drift against their pinned values.
+ */
+export interface NetworkRegistry {
+  version: number;
+  networks: Record<string, NetworkEntry>;
+}
+
+/**
+ * Trust/update policy: the registry below is the source of truth shipped with
+ * the SDK. Operators pin approved values via `pinRegistry`; runtime resolution
+ * (`resolveNetwork`) then uses the pinned entries and rejects any entry whose
+ * passphrase or contract identity differs from the pin. To adopt a new
+ * registry version, review the diff, bump the pin, and re-run the e2e suite.
+ */
+export const NETWORK_REGISTRY: NetworkRegistry = {
+  version: 1,
+  networks: {
+    testnet: {
+      networkPassphrase: testnetConfig.networkPassphrase,
+      rpcUrl: testnetConfig.rpcUrl,
+      friendbotUrl: testnetConfig.friendbotUrl,
+      contracts: {},
+    },
+  },
+};
+
+const CONTRACT_ID_RE = /^C[A-Z2-7]{55}$/;
+
+/** Validate a single registry entry; throws on malformed passphrase/contracts. */
+export function validateNetworkEntry(name: string, entry: NetworkEntry): void {
+  if (!entry.networkPassphrase || entry.networkPassphrase.trim().length === 0) {
+    throw new Error(`registry entry "${name}": missing network passphrase`);
+  }
+  if (!entry.rpcUrl || !/^https?:\/\//.test(entry.rpcUrl)) {
+    throw new Error(`registry entry "${name}": invalid rpcUrl "${entry.rpcUrl}"`);
+  }
+  for (const [contractName, contractId] of Object.entries(entry.contracts)) {
+    if (!CONTRACT_ID_RE.test(contractId)) {
+      throw new Error(
+        `registry entry "${name}": contract "${contractName}" has invalid contract ID "${contractId}"`,
+      );
+    }
+  }
+}
+
+/** Validate every entry in a registry; throws on the first invalid entry. */
+export function validateRegistry(registry: NetworkRegistry): void {
+  if (!Number.isInteger(registry.version) || registry.version < 1) {
+    throw new Error(`registry: invalid version ${registry.version}`);
+  }
+  for (const [name, entry] of Object.entries(registry.networks)) {
+    validateNetworkEntry(name, entry);
+  }
+}
+
+/**
+ * Pin approved registry values. The pinned registry is validated up front and
+ * used by `resolveNetwork` instead of the shipped defaults.
+ */
+export function pinRegistry(registry: NetworkRegistry): NetworkRegistry {
+  validateRegistry(registry);
+  return registry;
+}
+
+/**
+ * Resolve a network from the registry, optionally against a pinned registry.
+ * Rejects unknown networks and any entry whose passphrase or contract identity
+ * changed relative to the pin.
+ */
+export function resolveNetwork(
+  name: string,
+  pinned?: NetworkRegistry,
+  registry: NetworkRegistry = NETWORK_REGISTRY,
+): NetworkEntry {
+  const source = pinned ?? registry;
+  const entry = source.networks[name];
+  if (!entry) {
+    throw new Error(`unknown network "${name}" in registry v${source.version}`);
+  }
+  validateNetworkEntry(name, entry);
+
+  if (pinned) {
+    const current = registry.networks[name];
+    if (!current) {
+      throw new Error(`network "${name}" removed from registry v${registry.version}`);
+    }
+    if (current.networkPassphrase !== entry.networkPassphrase) {
+      throw new Error(`network "${name}": passphrase changed since pin`);
+    }
+    const pinnedContracts = entry.contracts;
+    const currentContracts = current.contracts;
+    for (const [contractName, contractId] of Object.entries(pinnedContracts)) {
+      if (currentContracts[contractName] !== contractId) {
+        throw new Error(
+          `network "${name}": contract "${contractName}" changed since pin`,
+        );
+      }
+    }
+  }
+
+  return entry;
+}
+
 export interface InvokeResult {
   hash: string;
   ledger: number;

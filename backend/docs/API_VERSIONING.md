@@ -227,6 +227,51 @@ Response:
 }
 ```
 
+## Event Contract Versioning
+
+Event payloads are versioned independently of the HTTP API version. Every event
+carries a `schemaVersion` field (currently `1`) so partner consumers can evolve
+at their own pace without being coupled to the REST surface.
+
+### Event Envelope
+
+```json
+{
+  "id": "evt_01H...",
+  "type": "stream.created",
+  "schemaVersion": 1,
+  "occurredAt": "2024-02-21T12:00:00.000Z",
+  "cursor": "1708516800000-42",
+  "data": { "streamId": "1", "sender": "GABC..." }
+}
+```
+
+### Consumer Contract Rules
+
+1. **Verify the signature before parsing** - Reject events whose HMAC signature
+   does not match the shared secret. Never trust unverified payloads.
+2. **Process idempotently** - Deduplicate on `id`; replays and duplicate
+   deliveries must not double-apply to the local projection.
+3. **Persist the cursor atomically** - Store the last applied `cursor` in the
+   same transaction as the projection update so restarts resume exactly once.
+4. **Recover from gaps** - On reconnect, resume from the persisted cursor and
+   re-request any missed range; never skip ahead silently.
+5. **Redact logs** - Log event `id`, `type`, and `cursor` only. Never log
+   payload bodies, signatures, or secrets.
+
+A reference implementation of these rules lives in
+[`examples/partner-event-consumer`](../examples/partner-event-consumer/README.md).
+
+### Event Schema Version Lifecycle
+
+| `schemaVersion` | Status | Notes |
+|-----------------|--------|-------|
+| `1` | ✅ Current | Initial event envelope |
+
+Adding optional fields to `data` is non-breaking and stays within the current
+`schemaVersion`. Removing or retyping fields requires a new `schemaVersion` and
+a deprecation window matching the HTTP policy above.
+
 ## Future Considerations
 
 ### Version 2 Planning

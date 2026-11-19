@@ -166,26 +166,71 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Server-Side Signing Boundary & Signer Policy
 
-For a quick reference of the models involved in indexing:
+Custodial signing is isolated behind a server-only boundary so that signing
+logic and key material never enter browser bundles. Applications that need
+custodial signing supply a **signer policy**; the default is non-custodial and
+denies all custodial signing.
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+### Boundary Rules
 
----
+1. **Server-only module.** The signing boundary lives in
+   `src/services/signing/` and is imported only from server entry points
+   (controllers, workers). It must never be imported by frontend code or any
+   module that is bundled for the browser.
+2. **No client key handling.** The frontend never receives, stores, or
+   transmits `KEEPER_SECRET_KEY` or any derived keypair. Client code only sends
+   the stream ID and amount; the server performs signing.
+3. **Explicit opt-in.** Custodial signing is disabled unless a signer policy
+   explicitly authorizes the action. The default policy denies every custodial
+   action (non-custodial default).
 
-## Related Documentation
+### Signer Policy Interface
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+A signer policy decides whether a given signing action is allowed. It receives
+the action name and a redacted context, and returns an allow/deny decision.
+
+```ts
+export interface SignerPolicy {
+  /** Return true to authorize custodial signing for this action. */
+  authorize(action: SigningAction, context: SigningContext): Promise<boolean> | boolean;
+}
+```
+
+- `SigningAction` enumerates the custodial actions (currently `top_up`).
+- `SigningContext` carries non-secret metadata (stream ID, amount, requester).
+- The default policy (`denyAllSignerPolicy`) returns `false` for every action,
+  preserving the non-custodial security model unless an application opts in.
+
+### Audit Records & Secret Redaction
+
+Every signing decision — allowed or denied — emits an audit record:
+
+```ts
+interface SigningAuditRecord {
+  action: SigningAction;
+  allowed: boolean;
+  reason: string;
+  timestamp: string;
+}
+```
+
+- Audit records are emitted for both allowed and denied decisions so denials
+  are observable.
+- Audit records, logs, and error messages are passed through a redaction helper
+  that strips secret-shaped values (secret keys, tokens, credentials) before
+  they are written. Raw key material is never included in an audit record.
+- Denied actions fail closed: the signing boundary throws and the request is
+  rejected rather than falling back to an unsigned or client-signed path.
+
+### Non-Custodial Defaults
+
+- With no policy configured, all custodial signing is denied.
+- Only `top-up` is a custodial action; withdraw, pause, resume, and create
+  remain wallet-signed and are never routed through the signing boundary.
+- Tests cover denied actions, audit record emission, and secret redaction to
+  keep the boundary enforced.

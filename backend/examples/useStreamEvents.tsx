@@ -1,10 +1,28 @@
 // Production-ready React hook for SSE stream events
 // Place this in: frontend/src/hooks/useStreamEvents.ts
+//
+// Reference partner event consumer (issue #284).
+// Demonstrates: versioned event envelope handling, signature verification,
+// idempotent processing (duplicate/replay safe), cursor recovery after gaps
+// or restarts, and redacted logging.
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 
-interface StreamEvent {
+// Versioned FlowFi event envelope. `version` lets partners evolve safely.
+const SUPPORTED_EVENT_VERSION = 1;
+
+interface StreamEventEnvelope {
+  id: string; // unique event id, used for idempotency
+  version: number; // envelope schema version
   type: 'created' | 'topped_up' | 'withdrawn' | 'cancelled' | 'completed';
+  cursor: string; // monotonic cursor for recovery
+  signature?: string; // HMAC/signature over the canonical payload
+  data: any;
+  timestamp: number;
+}
+
+interface StreamEvent {
+  type: StreamEventEnvelope['type'];
   data: any;
   timestamp: number;
 }
@@ -15,6 +33,11 @@ interface UseStreamEventsOptions {
   subscribeToAll?: boolean;
   autoReconnect?: boolean;
   maxRetryDelay?: number;
+  // Optional verifier: return true when the signature is valid.
+  verifySignature?: (envelope: StreamEventEnvelope) => boolean | Promise<boolean>;
+  // Persist/restore the last processed cursor (e.g. localStorage).
+  loadCursor?: () => string | null;
+  saveCursor?: (cursor: string) => void;
 }
 
 interface UseStreamEventsReturn {
@@ -23,6 +46,21 @@ interface UseStreamEventsReturn {
   error: Error | null;
   reconnecting: boolean;
   clearEvents: () => void;
+}
+
+// Redact sensitive fields before logging so partner logs stay safe.
+function redact(value: any): any {
+  if (value === null || typeof value !== 'object') return value;
+  if (Array.isArray(value)) return value.map(redact);
+  const out: Record<string, any> = {};
+  for (const [k, v] of Object.entries(value)) {
+    if (/secret|token|key|signature|authorization/i.test(k)) {
+      out[k] = '[redacted]';
+    } else {
+      out[k] = redact(v);
+    }
+  }
+  return out;
 }
 
 export function useStreamEvents(
@@ -34,6 +72,9 @@ export function useStreamEvents(
     subscribeToAll = false,
     autoReconnect = true,
     maxRetryDelay = 30000,
+    verifySignature,
+    loadCursor,
+    saveCursor,
   } = options;
 
   const [events, setEvents] = useState<StreamEvent[]>([]);
@@ -44,15 +85,24 @@ export function useStreamEvents(
   const eventSourceRef = useRef<EventSource | null>(null);
   const retryDelayRef = useRef(1000);
   const reconnectTimeoutRef = useRef<NodeJS.Timeout>();
+  // Idempotency: track processed event ids so replays are ignored.
+  const processedIdsRef = useRef<Set<string>>(new Set());
+  // Cursor recovery: resume from the last processed cursor.
+  const cursorRef = useRef<string | null>(loadCursor ? loadCursor() : null);
 
   const buildUrl = useCallback(() => {
     const params = new URLSearchParams();
-    
+
     if (subscribeToAll) {
       params.append('all', 'true');
     } else {
       streamIds.forEach(id => params.append('streams', id));
       userPublicKeys.forEach(key => params.append('users', key));
+    }
+
+    // Resume from the last known cursor after a gap or restart.
+    if (cursorRef.current) {
+      params.append('cursor', cursorRef.current);
     }
 
     const baseUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
@@ -62,6 +112,49 @@ export function useStreamEvents(
   const clearEvents = useCallback(() => {
     setEvents([]);
   }, []);
+
+  const processEnvelope = useCallback(
+    async (envelope: StreamEventEnvelope) => {
+      // Version guard: ignore envelopes we cannot safely interpret.
+      if (envelope.version !== SUPPORTED_EVENT_VERSION) {
+        console.warn('Skipping unsupported event version', {
+          id: envelope.id,
+          version: envelope.version,
+        });
+        return;
+      }
+
+      // Idempotency: skip already-processed events (safe replay).
+      if (processedIdsRef.current.has(envelope.id)) {
+        return;
+      }
+
+      // Signature verification before trusting the payload.
+      if (verifySignature) {
+        const ok = await verifySignature(envelope);
+        if (!ok) {
+          console.error('Rejected event with invalid signature', {
+            id: envelope.id,
+          });
+          return;
+        }
+      }
+
+      processedIdsRef.current.add(envelope.id);
+
+      // Advance cursor only after successful processing.
+      if (envelope.cursor) {
+        cursorRef.current = envelope.cursor;
+        if (saveCursor) saveCursor(envelope.cursor);
+      }
+
+      setEvents(prev => [
+        { type: envelope.type, data: envelope.data, timestamp: envelope.timestamp },
+        ...prev.slice(0, 99), // Keep last 100 events
+      ]);
+    },
+    [verifySignature, saveCursor]
+  );
 
   const connect = useCallback(() => {
     const url = buildUrl();
@@ -82,19 +175,18 @@ export function useStreamEvents(
           console.log('SSE connected:', data.clientId);
         }
       } catch (err) {
-        console.error('Failed to parse SSE message:', err);
+        console.error('Failed to parse SSE message:', redact(err));
       }
     };
 
-    const handleEvent = (type: StreamEvent['type']) => (e: MessageEvent) => {
+    const handleEvent = (type: StreamEventEnvelope['type']) => (e: MessageEvent) => {
       try {
-        const data = JSON.parse(e.data);
-        setEvents(prev => [
-          { type, data, timestamp: Date.now() },
-          ...prev.slice(0, 99), // Keep last 100 events
-        ]);
+        const envelope: StreamEventEnvelope = JSON.parse(e.data);
+        // Fall back to the listener type when the envelope omits it.
+        if (!envelope.type) envelope.type = type;
+        void processEnvelope(envelope);
       } catch (err) {
-        console.error(`Failed to parse ${type} event:`, err);
+        console.error(`Failed to parse ${type} event:`, redact(err));
       }
     };
 
@@ -121,7 +213,7 @@ export function useStreamEvents(
         }, retryDelayRef.current);
       }
     };
-  }, [buildUrl, autoReconnect, maxRetryDelay]);
+  }, [buildUrl, autoReconnect, maxRetryDelay, processEnvelope]);
 
   useEffect(() => {
     connect();
@@ -153,6 +245,17 @@ import { useStreamEvents } from '@/hooks/useStreamEvents';
 export function StreamDashboard({ streamId }: { streamId: string }) {
   const { events, connected, reconnecting, clearEvents } = useStreamEvents({
     streamIds: [streamId],
+    // Verify signatures with your shared secret / public key.
+    verifySignature: async (envelope) => {
+      const res = await fetch('/api/verify', {
+        method: 'POST',
+        body: JSON.stringify(envelope),
+      });
+      return res.ok;
+    },
+    // Persist the cursor so restarts resume where they left off.
+    loadCursor: () => localStorage.getItem('flowfi:cursor'),
+    saveCursor: (cursor) => localStorage.setItem('flowfi:cursor', cursor),
   });
 
   return (
