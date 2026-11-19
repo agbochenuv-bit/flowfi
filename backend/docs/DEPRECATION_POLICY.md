@@ -140,6 +140,100 @@ X-API-Migration-Path: /v1/streams
 - API changelog updates
 - Response headers for automatic detection
 
+## Migration Guides by API Version
+
+Each supported API version has a dedicated migration guide. Every guide links to the
+OpenAPI schema for that version, includes a compatibility checklist, and lists explicit
+deprecation dates and behavior differences.
+
+| Version | Status | OpenAPI Schema | Migration Guide | Deprecation Date | Sunset Date |
+|---------|--------|----------------|-----------------|------------------|-------------|
+| v1 | Current | [`openapi/v1.yaml`](../openapi/v1.yaml) | [v1 guide](#migration-guide-v1) | — | — |
+| v0 (legacy unversioned) | Removed | [`openapi/v0.yaml`](../openapi/v0.yaml) | [v0 → v1 guide](#migration-guide-v0--v1) | 2024-02-21 | 2024-12-31 |
+
+> When a new version is introduced, add a row here and a matching guide section below
+> before announcing the deprecation of the previous version.
+
+### Migration Guide: v1
+
+**OpenAPI schema:** [`openapi/v1.yaml`](../openapi/v1.yaml)
+
+**Status:** Current — no deprecation date scheduled.
+
+**Behavior differences from v0:**
+
+- All routes are prefixed with `/v1/` (e.g. `/v1/streams`, `/v1/events`).
+- Responses include `X-API-Deprecated` / `X-API-Sunset-Date` headers when applicable.
+- The `/health` endpoint reports `apiVersions.supported`.
+
+**Compatibility checklist:**
+
+- [ ] All requests use the `/v1/` prefix.
+- [ ] Client reads `apiVersions.supported` from `/health` and fails fast if `v1` is absent.
+- [ ] Client monitors `X-API-Deprecated` headers.
+- [ ] Request/response shapes validated against `openapi/v1.yaml`.
+
+**Tested request/response example:**
+
+```http
+GET /v1/streams HTTP/1.1
+Host: api.flowfi.io
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  { "id": "stream_1", "status": "active" }
+]
+```
+
+### Migration Guide: v0 → v1
+
+**OpenAPI schema:** [`openapi/v0.yaml`](../openapi/v0.yaml) (archived) → [`openapi/v1.yaml`](../openapi/v1.yaml)
+
+**Status:** Removed. Deprecated 2024-02-21, sunset 2024-12-31, handlers deleted 2026-06-30.
+
+**Behavior differences:**
+
+- Unversioned paths (`/streams`, `/events`) no longer exist and return `404`.
+- Versioned paths (`/v1/streams`, `/v1/events`) are the only supported routes.
+- After sunset, calls to removed routes return `410 Gone` with a `migration` body
+  (see [After Sunset](#after-sunset)) until handlers are deleted, then `404`.
+
+**Compatibility checklist:**
+
+- [ ] Replace every unversioned path with its `/v1/` equivalent.
+- [ ] Update base URL to include `/v1`.
+- [ ] Re-validate payloads against `openapi/v1.yaml`.
+- [ ] Remove any reliance on unversioned-only response fields.
+
+**Tested request/response example:**
+
+```http
+GET /streams HTTP/1.1
+Host: api.flowfi.io
+```
+
+```http
+HTTP/1.1 404 Not Found
+```
+
+```http
+GET /v1/streams HTTP/1.1
+Host: api.flowfi.io
+```
+
+```http
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+[
+  { "id": "stream_1", "status": "active" }
+]
+```
+
 ## Current Deprecations
 
 ### Legacy Unversioned Routes

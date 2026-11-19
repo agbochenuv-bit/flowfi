@@ -28,15 +28,126 @@ All API endpoints are prefixed with a version identifier:
 
 ## Supported Versions
 
-| Version | Status | Introduced | Sunset Date |
-|---------|--------|------------|-------------|
-| `v1` | ✅ Current | 2024-02-21 | TBD |
+| Version | Status | Introduced | Sunset Date | OpenAPI Schema |
+|---------|--------|------------|-------------|----------------|
+| `v1` | ✅ Current | 2024-02-21 | TBD | [openapi/v1.yaml](../openapi/v1.yaml) |
 
 ### Version Lifecycle
 
 1. **Current** - Actively maintained, receives new features and bug fixes
 2. **Deprecated** - Still supported but will be sunset on a specific date
 3. **Sunset** - No longer available, returns 410 Gone
+
+## Migration Guides
+
+Each supported API version has a dedicated migration guide below. Every guide links to its OpenAPI schema, lists explicit behavior differences and timelines, and includes a compatibility checklist with deprecation dates.
+
+### Migrating to v1
+
+**OpenAPI schema:** [openapi/v1.yaml](../openapi/v1.yaml)
+
+**Behavior differences vs. unversioned (pre-v1) routes:**
+
+| Area | Pre-v1 (unversioned) | v1 |
+|------|----------------------|----|
+| Base path | `/streams` | `/v1/streams` |
+| Unsupported version | n/a | `400` with `supportedVersions` |
+| Deprecation signaling | none | `X-API-Deprecated`, `X-API-Sunset-Date`, `X-API-Migration-Path` headers |
+| Version discovery | none | `/health` returns `apiVersions` |
+
+**Timeline:**
+
+- `2024-02-21` — v1 introduced (current).
+- Unversioned routes: deprecated; sunset date **2024-12-31** (returns `410 Gone` after).
+- v1 sunset date: **TBD** (minimum 6 months notice before any sunset).
+
+**Compatibility checklist:**
+
+- [ ] All requests use the `/v1` prefix (no unversioned paths).
+- [ ] Client pins to `v1` explicitly rather than relying on the default.
+- [ ] Client reads `X-API-Deprecated` / `X-API-Sunset-Date` headers and logs warnings.
+- [ ] Client handles `400` unsupported-version responses using `supportedVersions`.
+- [ ] Client queries `/health` `apiVersions` at startup to confirm `v1` is supported.
+- [ ] Request/response shapes validated against [openapi/v1.yaml](../openapi/v1.yaml).
+
+**Tested request/response examples:**
+
+Create a stream:
+
+```bash
+POST /v1/streams
+Content-Type: application/json
+
+{
+  "sender": "GABC...",
+  "recipient": "GDEF...",
+  "tokenAddress": "CBCD...",
+  "amount": "10000",
+  "duration": 86400
+}
+```
+
+Response `201 Created`:
+
+```json
+{
+  "id": "1",
+  "sender": "GABC...",
+  "recipient": "GDEF...",
+  "tokenAddress": "CBCD...",
+  "amount": "10000",
+  "duration": 86400,
+  "status": "active"
+}
+```
+
+Subscribe to events:
+
+```bash
+GET /v1/events/subscribe?streams=1&streams=2
+Accept: text/event-stream
+```
+
+Response `200 OK` (`text/event-stream`):
+
+```
+event: connected
+data: {"streams":["1","2"]}
+```
+
+Unsupported version (boundary case):
+
+```bash
+GET /v2/streams
+```
+
+Response `400 Bad Request`:
+
+```json
+{
+  "error": "Unsupported API version",
+  "message": "API version 'v2' is not supported. Supported versions: v1",
+  "supportedVersions": ["v1"]
+}
+```
+
+Sunset endpoint (failure case):
+
+```bash
+GET /streams
+```
+
+Response `410 Gone`:
+
+```json
+{
+  "error": "Deprecated endpoint",
+  "message": "This endpoint has been deprecated. Please use /v1/streams instead.",
+  "deprecated": true,
+  "migration": { "old": "/streams", "new": "/v1/streams" },
+  "sunsetDate": "2024-12-31"
+}
+```
 
 ## Adding New Endpoints
 
