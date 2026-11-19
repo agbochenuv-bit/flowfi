@@ -1,174 +1,42 @@
 # Development Guide
 
-This guide is intended to let a new contributor run the full FlowFi stack from a fresh clone.
+## Verify a clean checkout
 
----
-
-## Prerequisites
-
-Required:
-
-- Rust toolchain (stable via rustup)
-- Node.js 20+
-- npm
-- PostgreSQL 16 (matches the version pinned in `docker-compose.yml` and CI)
-- Docker & Docker Compose (recommended for local infra)
-- Stellar CLI / Soroban CLI (https://github.com/stellar/stellar-cli)
-
-Optional:
-
-- Redis 7+ (for multi-instance SSE testing)
-
----
-
-## Quick Start (Recommended)
-
-### 1. Clone repository
+Install Git, Bash, curl, Node.js 22.12+ with npm, Docker with a running daemon,
+and stable Rust with Cargo. Use a fresh checkout with ports 3000 and 3001 free.
 
 ```bash
-git clone https://github.com/LabsCrypt/flowfi.git
+git clone https://github.com/agbochenuv-bit/flowfi.git
 cd flowfi
+bash scripts/verify-clean-clone.sh
 ```
 
----
+The script installs the locked workspace dependencies, creates a disposable
+Postgres database on a loopback port, generates Prisma and applies the schema,
+builds and tests the backend and frontend, and runs the contract tests. It then
+starts both builds and checks their HTTP responses before cleaning up the
+processes and database. The CI **Clean clone verification** job runs this path.
 
-### 2. Start infrastructure
+The database password is a local fixture. The script generates a fresh local
+JWT signing key on every run. The script rejects environment files and starts application commands
+with an isolated environment. Use a separate checkout for long-running
+development with the [backend](../backend/README.md) and
+[frontend](../frontend/README.md) setup instructions.
+
+## Optional Stellar Testnet smoke
 
 ```bash
-docker compose up -d postgres
+bash scripts/verify-clean-clone.sh --testnet-smoke
 ```
 
-(Optional for SSE fanout testing)
-
-```bash
-docker compose up -d redis
-```
-
----
-
-### 3. Backend setup
-
-```bash
-cd backend
-npm install
-cp .env.example .env
-```
-
-Configure `.env`:
-
-* DATABASE_URL
-* JWT_SECRET
-* STELLAR_NETWORK=testnet
-* REDIS_URL (optional)
-
-Run database setup:
-
-```bash
-npm run prisma:generate
-npm run prisma:migrate
-```
-
-These commands read their paths and connection string from `backend/prisma.config.ts`, which configures the Prisma CLI separately from the data model in `backend/prisma/schema.prisma`. See [Prisma Database](../backend/README.md#prismaconfigts-vs-prismaschemaprisma) in the backend README for what each file owns and what to check when a `generate`/`migrate` command misbehaves.
-
-Start backend:
-
-```bash
-npm run dev
-```
-
-Backend runs at:
-
-* [http://localhost:3001/v1](http://localhost:3001/v1)
-* [http://localhost:3001/health](http://localhost:3001/health)
-
----
-
-### 4. Frontend setup
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Frontend:
-
-* [http://localhost:3000](http://localhost:3000)
-
----
-
-### 5. Contracts (optional)
-
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release
-cargo test
-```
-
----
-
-## Full Stack Setup (Detailed Mode)
-
-### Backend
-
-```bash
-cd backend
-npm ci
-npm run dev
-```
-
-### Frontend
-
-```bash
-cd frontend
-npm ci
-npm run dev
-```
-
-### Database
-
-```bash
-docker compose up -d postgres
-```
-
----
-
-## Running Tests
-
-Backend:
-
-```bash
-cd backend
-npm test
-```
-
-Frontend:
-
-```bash
-cd frontend
-npm run lint
-npm test
-npm run test:coverage
-```
-
-Contracts:
-
-```bash
-cd contracts
-cargo test
-```
-
----
-
-## Testnet vs Local Mode
-
-Configure in `.env`:
-
-* `STELLAR_NETWORK=testnet`
-* `SANDBOX_MODE_ENABLED=true` (optional)
-* `STELLAR_HORIZON_URL` (if needed)
-
----
+This adds the existing network-health suite against public Testnet and Friendbot.
+It uses disposable test accounts and the suite's default endpoints, with no
+operator credentials. The scheduled [Testnet E2E workflow](../.github/workflows/testnet-e2e.yml)
+runs the same network-health suite with the full contract lifecycle.
+For contract deployment and indexed lifecycle verification, follow the
+[Testnet E2E runbook](../backend/e2e/testnet/README.md) using a separate scratch
+database and Testnet-only identities. Keep Mainnet keys and deployment secrets
+in the deployment secret store.
 
 ## Common Issues
 
@@ -206,39 +74,3 @@ Configure in `.env`:
 * Check `backend/prisma.config.ts` — it sets the schema path, migrations path, and the `DATABASE_URL` the CLI uses ([details](../backend/README.md#troubleshooting))
 
 ---
-
-## Suggested Day-1 Flow
-
-1. Start Postgres (and Redis if needed)
-2. Run backend migrations
-3. Start backend
-4. Start frontend
-5. Create a stream and verify SSE updates
-
----
-
-## Legacy Quick Setup (Minimal)
-
-```bash
-docker compose up -d
-cd backend && npm ci && npm run dev
-cd frontend && npm ci && npm run dev
-```
-
----
-
-## Contracts Build Only
-
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release
-```
-
----
-
-## Links
-
-* Architecture: `ARCHITECTURE.md`
-* Backend: `backend/`
-* Frontend: `frontend/`
-* Contracts: `contracts/stream_contract`
