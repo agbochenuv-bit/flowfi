@@ -292,3 +292,5 @@ To run the full stack end-to-end, set the following secrets. See [`backend/.env.
 | `NEXT_PUBLIC_USDC_ADDRESS` | USDC token contract address (testnet default provided) |
 | `NEXT_PUBLIC_EURC_ADDRESS` | EURC token contract address (testnet default provided) |
 | `NEXT_PUBLIC_XLM_ADDRESS` | XLM token contract address (testnet default provided) |
+
+See the [architecture decision records](adr/README.md) for proposed organization and recurring payment models.

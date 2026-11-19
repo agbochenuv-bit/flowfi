@@ -463,3 +463,5 @@ This project follows the [all-contributors](https://github.com/all-contributors/
 ## License
 
 MIT.
+
+See the [architecture decision records](docs/adr/README.md) for proposed organization and recurring payment models.
