@@ -140,6 +140,61 @@ X-API-Migration-Path: /v1/streams
 - API changelog updates
 - Response headers for automatic detection
 
+## Generated-Client Compatibility Fixtures
+
+Generated frontend and partner clients are validated against versioned response
+fixtures so that breaking response changes cannot ship silently.
+
+### Fixture Layout
+
+Fixtures live under `backend/tests/fixtures/api-compat/` and are organized by
+API version:
+
+```
+backend/tests/fixtures/api-compat/
+  v1/
+    streams.list.json          # current version, representative payload
+    events.list.json
+  v1-deprecated/
+    streams.list.json          # deprecated fields still present
+    events.list.json
+  migrations.json              # migration notes keyed by version + field
+```
+
+Each fixture captures a representative response body for a versioned
+endpoint. The `v1-deprecated/` set intentionally retains fields that are
+scheduled for removal so the deprecation window is exercised.
+
+### Compatibility Test Expectations
+
+The compatibility suite (`backend/tests/api-compat.test.ts`) runs the generated
+clients against every fixture and enforces the following:
+
+1. **No breaking changes without a migration note.** If a fixture's response
+   shape diverges from the recorded baseline (removed field, changed type,
+   renamed key), the test fails unless `migrations.json` contains a matching
+   entry for that version and field.
+2. **Deprecated fields remain present during the window.** Fields listed as
+   deprecated in `migrations.json` must still appear in the `v1-deprecated/`
+   fixtures until their sunset date; removing them early fails the suite.
+3. **Version boundary transitions.** Requests to a sunset version must return
+   `410 Gone` with the documented migration body, while the current version
+   continues to return `200 OK`.
+4. **Missing migration note is a failure.** A breaking change with no
+   corresponding migration note is treated as a hard failure, not a warning.
+
+### Adding or Changing a Fixture
+
+When a response shape changes:
+
+1. Update the affected fixture(s) under the matching version directory.
+2. Add a migration note to `migrations.json` describing the old and new shape,
+   the affected version, and the sunset date.
+3. Run the compatibility suite; it must pass before the change is merged.
+
+Breaking changes within a version remain disallowed (see below); a new version
+must be introduced instead.
+
 ## Current Deprecations
 
 ### Legacy Unversioned Routes

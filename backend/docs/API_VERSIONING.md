@@ -170,6 +170,48 @@ The API version middleware automatically:
 - Returns 400 for unsupported versions
 - Sets default version if none specified
 
+## Generated-Client Compatibility Fixtures
+
+Generated frontend and partner clients are validated against **versioned response
+fixtures** so that a breaking response change cannot ship silently. Fixtures live
+under `backend/tests/fixtures/api-compat/` and are organized by API version:
+
+```
+backend/tests/fixtures/api-compat/
+  v1/
+    streams.list.json          # current v1 response shape
+    streams.detail.json
+    events.stats.json
+  v1-deprecated/
+    streams.list.json          # deprecated fields still present during window
+  manifest.json                # version -> fixture map + migration notes
+```
+
+### Compatibility Test Expectations
+
+The compatibility suite (`backend/tests/api-compat.test.ts`) runs the generated
+clients against each fixture and enforces the following:
+
+1. **Current version fixtures** must parse cleanly with the generated client and
+   match the documented response contract. Any removed/renamed field or type
+   change fails the test.
+2. **Deprecated version fixtures** must still parse, and any field marked
+   deprecated in `manifest.json` must remain present until its sunset date.
+3. **Breaking changes require a migration note.** If a fixture diverges from the
+   previous snapshot, the test fails unless `manifest.json` contains a matching
+   `migrationNotes` entry describing the change and its migration path.
+4. **Version boundary transitions** (e.g. `v1` → `v1-deprecated`) are covered so
+   that a field disappearing exactly at the sunset boundary is detected.
+
+### Adding or Updating Fixtures
+
+When a response shape changes:
+
+1. Add or update the fixture under the appropriate version directory.
+2. If the change is breaking, add a `migrationNotes` entry to `manifest.json`
+   referencing the affected endpoint and the migration path.
+3. Run the compatibility suite; it must pass before merging.
+
 ## Best Practices
 
 ### For API Developers
@@ -179,6 +221,7 @@ The API version middleware automatically:
 3. **Provide migration guides** - Help consumers upgrade
 4. **Maintain backward compatibility** - Within a version
 5. **Test version isolation** - Ensure versions don't interfere
+6. **Keep compatibility fixtures current** - Update fixtures and migration notes with every response change
 
 ### For API Consumers
 

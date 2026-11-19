@@ -12,6 +12,7 @@
     "test:integration": "vitest run tests/integration",
     "test:integration:docker": "docker compose up -d postgres && vitest run tests/integration/stream-lifecycle.test.ts; docker compose stop postgres",
     "test:e2e:testnet": "vitest run --config e2e/testnet/vitest.config.ts",
+    "test:compat": "vitest run tests/compat",
     "dev": "nodemon",
     "build": "tsc",
     "start": "node dist/index.js",
