@@ -15,7 +15,7 @@ export async function createWebhook(
   res: Response,
 ): Promise<void> {
   try {
-    const { targetUrl, eventTypes } = req.body;
+    const { targetUrl, eventTypes, eventFilters, schemaVersion } = req.body;
 
     if (!targetUrl || !Array.isArray(eventTypes)) {
       res.status(400).json({
@@ -28,6 +28,7 @@ export async function createWebhook(
       getAuthenticatedAddress(req),
       targetUrl,
       eventTypes,
+      { eventFilters, schemaVersion },
     );
 
     // Don't expose the secret key in response
@@ -40,8 +41,9 @@ export async function createWebhook(
     });
   } catch (error: any) {
     logger.error("[Webhook Controller] Create error:", error);
+    const status = error?.statusCode ?? 500;
     res
-      .status(500)
+      .status(status)
       .json({ error: error.message || "Failed to create webhook" });
   }
 }
@@ -89,7 +91,51 @@ export async function updateWebhook(req: Request, res: Response): Promise<void> 
     const subscription = await webhookService.updateWebhookSubscription(id, getAuthenticatedAddress(req), req.body);
     res.json(subscription);
   } catch (error: any) {
-    res.status(400).json({ error: error.message || "Failed to update webhook" });
+    const status = error?.statusCode ?? 400;
+    res.status(status).json({ error: error.message || "Failed to update webhook" });
+  }
+}
+
+export async function getWebhookHealth(
+  req: Request,
+  res: Response,
+): Promise<void> {
+  try {
+    const idParam = req.params.id;
+    const id = Array.isArray(idParam) ? idParam[0] : idParam;
+    if (!id) {
+      res.status(400).json({ error: "id is required" });
+      return;
+    }
+
+    const health = await webhookService.getWebhookHealth(
+      id,
+      getAuthenticatedAddress(req),
+    );
+
+    if (!health) {
+      res.status(404).json({ error: "Webhook subscription not found" });
+      return;
+    }
+
+    // Only expose sanitized health fields - never secretKey, targetUrl
+    // credentials, or raw response bodies.
+    res.json({
+      health: {
+        subscriptionId: health.subscriptionId,
+        status: health.status,
+        lastSuccessAt: health.lastSuccessAt,
+        lastAttemptAt: health.lastAttemptAt,
+        consecutiveFailures: health.consecutiveFailures,
+        lastFailureCategory: health.lastFailureCategory,
+        lastFailureAt: health.lastFailureAt,
+      },
+    });
+  } catch (error: any) {
+    logger.error("[Webhook Controller] Health error:", error);
+    res
+      .status(500)
+      .json({ error: error.message || "Failed to get webhook health" });
   }
 }
 

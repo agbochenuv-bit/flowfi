@@ -139,6 +139,97 @@ export function isWalletOnNetwork(
   return formattedWallet === formattedConfig;
 }
 
+// ── Wallet ownership helpers ──────────────────────────────────────────────────
+
+/** Result of comparing the connected wallet against an acting member's wallet. */
+export interface WalletOwnershipResult {
+  /** True when the connected wallet public key matches the expected owner. */
+  matches: boolean;
+  /** The connected wallet public key, if any. */
+  connectedPublicKey: string | null;
+  /** The wallet address the acting member is expected to own, if any. */
+  expectedPublicKey: string | null;
+  /** Human-readable explanation when `matches` is false. */
+  reason?: string;
+}
+
+/**
+ * Compares the connected wallet public key against the wallet address of the
+ * acting organization member.
+ *
+ * Returns a mismatch result (never throws) so callers can render inline
+ * permission errors. Comparison is exact and case-sensitive because Stellar
+ * public keys are case-sensitive base32 strings.
+ *
+ * @param connectedPublicKey - The public key of the currently connected wallet.
+ * @param expectedPublicKey  - The wallet address owned by the acting member.
+ */
+export function checkWalletOwnership(
+  connectedPublicKey: string | null | undefined,
+  expectedPublicKey: string | null | undefined,
+): WalletOwnershipResult {
+  const connected = connectedPublicKey?.trim() || null;
+  const expected = expectedPublicKey?.trim() || null;
+
+  if (!connected) {
+    return {
+      matches: false,
+      connectedPublicKey: null,
+      expectedPublicKey: expected,
+      reason: "No wallet is connected. Connect the wallet that owns this member.",
+    };
+  }
+
+  if (!expected) {
+    return {
+      matches: false,
+      connectedPublicKey: connected,
+      expectedPublicKey: null,
+      reason: "This member has no wallet address on file.",
+    };
+  }
+
+  if (connected !== expected) {
+    return {
+      matches: false,
+      connectedPublicKey: connected,
+      expectedPublicKey: expected,
+      reason:
+        "The connected wallet does not own this member's wallet. Switch to the correct wallet before signing.",
+    };
+  }
+
+  return { matches: true, connectedPublicKey: connected, expectedPublicKey: expected };
+}
+
+/** Error thrown when a signing action is attempted from a non-owning wallet. */
+export class WalletOwnershipError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WalletOwnershipError";
+  }
+}
+
+/**
+ * Guard to call before any signing action performed on behalf of a member.
+ * Throws a WalletOwnershipError when the connected wallet does not own the
+ * acting member's wallet address, preventing cross-wallet signing.
+ *
+ * @param connectedPublicKey - The public key of the currently connected wallet.
+ * @param expectedPublicKey  - The wallet address owned by the acting member.
+ */
+export function assertWalletOwnership(
+  connectedPublicKey: string | null | undefined,
+  expectedPublicKey: string | null | undefined,
+): void {
+  const result = checkWalletOwnership(connectedPublicKey, expectedPublicKey);
+  if (!result.matches) {
+    throw new WalletOwnershipError(
+      result.reason ?? "The connected wallet does not own this member's wallet.",
+    );
+  }
+}
+
 // ── Key display helpers ───────────────────────────────────────────────────────
 
 /**

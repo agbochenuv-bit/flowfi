@@ -35,6 +35,12 @@ export const createStreamSchema = z.object({
     ),
   depositedAmount: z.string().regex(/^\d+$/, 'Amount must be a positive integer as string'),
   startTime: z.union([z.number().int().nonnegative(), z.string().regex(/^\d+$/).transform(v => parseInt(v))]),
+  /**
+   * Optional customer-defined payment policy identifier. When provided, the
+   * server evaluates the referenced policy before preparing the transaction.
+   * Backward compatible: omitting it skips policy evaluation.
+   */
+  policyId: z.string().min(1, 'policyId must be a non-empty string').optional(),
 });
 
 export type CreateStreamInput = z.infer<typeof createStreamSchema>;
@@ -126,3 +132,43 @@ export const streamHistoryQuerySchema = z.object({
 });
 
 export type StreamHistoryQueryInput = z.infer<typeof streamHistoryQuerySchema>;
+
+/**
+ * Schema for a payment policy evaluation request.
+ *
+ * This is a server-side business-rule boundary checked before a transaction
+ * is prepared. A successful evaluation is NOT on-chain authorization; wallet
+ * authorization and chain/network validation remain authoritative.
+ *
+ * Inputs:
+ * - actorWallet: the wallet performing the action (authorization subject).
+ * - walletAddress: the wallet address the transaction will be prepared for.
+ * - amount: the transaction amount as a positive integer string (base units).
+ * - tokenAddress: the token contract address involved.
+ * - recipient: the recipient address of the transaction.
+ * - network: the target chain/network identifier.
+ * - policyId: optional identifier of the customer-defined policy to evaluate.
+ */
+export const paymentPolicyEvaluationSchema = z.object({
+  actorWallet: z.string().min(1, 'actorWallet is required'),
+  walletAddress: z.string().min(1, 'walletAddress is required'),
+  amount: z
+    .string()
+    .regex(/^\d+$/, 'amount must be a positive integer as string')
+    .refine(
+      (val) => {
+        try {
+          return BigInt(val) <= MAX_I128;
+        } catch {
+          return true;
+        }
+      },
+      { message: 'amount exceeds maximum allowed value' },
+    ),
+  tokenAddress: z.string().min(1, 'tokenAddress is required'),
+  recipient: z.string().min(1, 'recipient is required'),
+  network: z.string().min(1, 'network is required'),
+  policyId: z.string().min(1, 'policyId must be a non-empty string').optional(),
+});
+
+export type PaymentPolicyEvaluationInput = z.infer<typeof paymentPolicyEvaluationSchema>;

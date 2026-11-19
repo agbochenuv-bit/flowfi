@@ -8,6 +8,7 @@ import {
   listDeliveries,
   regenerateSecret,
   testWebhook,
+  getWebhookHealth,
 } from '../../controllers/webhook.controller.js';
 
 const router = Router();
@@ -53,11 +54,25 @@ router.get('/', listWebhooks);
  *               eventTypes:
  *                 type: array
  *                 items: { type: string }
+ *               eventFilters:
+ *                 type: array
+ *                 description: >-
+ *                   Optional list of supported event families to subscribe to.
+ *                   When omitted, all supported event families are delivered.
+ *                   Unknown or unsupported families are rejected with 400.
+ *                 items:
+ *                   type: string
+ *                   enum: [transaction, wallet, contract, anchor, system]
+ *               schemaVersion:
+ *                 type: string
+ *                 description: Payload schema version used for deliveries.
+ *                 enum: [v1]
+ *                 default: v1
  *     responses:
  *       201:
  *         description: Webhook subscription created; secret key returned once
  *       400:
- *         description: Missing required fields
+ *         description: Missing required fields or invalid eventFilters/schemaVersion
  *       401:
  *         description: Unauthorized
  */
@@ -76,11 +91,37 @@ router.post('/', createWebhook);
  *         name: id
  *         required: true
  *         schema: { type: string }
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             properties:
+ *               targetUrl:
+ *                 type: string
+ *                 format: uri
+ *               eventTypes:
+ *                 type: array
+ *                 items: { type: string }
+ *               eventFilters:
+ *                 type: array
+ *                 description: >-
+ *                   Optional list of supported event families to subscribe to.
+ *                   Unknown or unsupported families are rejected with 400.
+ *                 items:
+ *                   type: string
+ *                   enum: [transaction, wallet, contract, anchor, system]
+ *               schemaVersion:
+ *                 type: string
+ *                 description: Payload schema version used for deliveries.
+ *                 enum: [v1]
+ *                 default: v1
  *     responses:
  *       200:
  *         description: Updated webhook subscription
  *       400:
- *         description: Invalid request
+ *         description: Invalid request or invalid eventFilters/schemaVersion
  *       401:
  *         description: Unauthorized
  *       404:
@@ -139,6 +180,64 @@ router.delete('/:id', deleteWebhook);
  *         description: Webhook not found
  */
 router.get('/:id/deliveries', listDeliveries);
+
+/**
+ * @openapi
+ * /v1/webhooks/{id}/health:
+ *   get:
+ *     tags: [Webhooks]
+ *     summary: Get delivery health and diagnostics for a webhook
+ *     description: >-
+ *       Returns sanitized delivery diagnostics for the endpoint, including
+ *       current status, last-success time, and failure categories. Response
+ *       bodies and signing secrets are never included.
+ *     security:
+ *       - bearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Delivery health for the webhook
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 id:
+ *                   type: string
+ *                 status:
+ *                   type: string
+ *                   enum: [healthy, degraded, failing, unknown]
+ *                 lastSuccessAt:
+ *                   type: string
+ *                   format: date-time
+ *                   nullable: true
+ *                 lastFailureAt:
+ *                   type: string
+ *                   format: date-time
+ *                   nullable: true
+ *                 consecutiveFailures:
+ *                   type: integer
+ *                 lastFailureCategory:
+ *                   type: string
+ *                   nullable: true
+ *                   enum:
+ *                     - timeout
+ *                     - connection_error
+ *                     - tls_error
+ *                     - http_4xx
+ *                     - http_5xx
+ *                     - invalid_response
+ *                     - unknown
+ *       401:
+ *         description: Unauthorized
+ *       404:
+ *         description: Webhook not found
+ */
+router.get('/:id/health', getWebhookHealth);
 
 /**
  * @openapi

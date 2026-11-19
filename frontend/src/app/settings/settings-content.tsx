@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useMemo } from "react";
-import { Copy, Check, LogOut, Moon, Sun, Bell, Globe, Volume2 } from "lucide-react";
+import { Copy, Check, LogOut, Moon, Sun, Bell, Globe, Volume2, Users, UserPlus, Trash2, ShieldAlert } from "lucide-react";
 import { STELLAR_NETWORK, shortenPublicKey } from "@/lib/wallet";
 import { useWallet } from "@/context/wallet-context";
 import { useRouter } from "next/navigation";
@@ -17,6 +17,57 @@ import { SOUND_STORAGE_KEY } from "@/lib/transaction-feedback";
 type DisplayCurrency = "USD" | "EUR" | "GBP" | "XLM" | "USDC";
 type AmountFormat = "full" | "compact";
 type DecimalPlaces = 2 | 4 | 7;
+
+type OrgRole = "owner" | "admin" | "member" | "viewer";
+type InvitationStatus = "pending" | "accepted" | "expired" | "revoked";
+
+interface OrgMember {
+  id: string;
+  name: string;
+  wallet: string;
+  role: OrgRole;
+}
+
+interface OrgInvitation {
+  id: string;
+  email: string;
+  role: OrgRole;
+  status: InvitationStatus;
+  invitedBy: string;
+  expiresAt: string;
+}
+
+interface OrgWorkspace {
+  id: string;
+  name: string;
+  members: OrgMember[];
+  invitations: OrgInvitation[];
+}
+
+const ROLE_LABELS: Record<OrgRole, string> = {
+  owner: "Owner",
+  admin: "Admin",
+  member: "Member",
+  viewer: "Viewer",
+};
+
+const INVITATION_STATUS_STYLES: Record<InvitationStatus, string> = {
+  pending: "bg-amber-500/20 text-amber-400 border-amber-500/30",
+  accepted: "bg-green-500/20 text-green-400 border-green-500/30",
+  expired: "bg-zinc-500/20 text-zinc-400 border-zinc-500/30",
+  revoked: "bg-red-500/20 text-red-400 border-red-500/30",
+};
+
+function canManageMembers(role: OrgRole | undefined): boolean {
+  return role === "owner" || role === "admin";
+}
+
+function canChangeRole(actorRole: OrgRole | undefined, targetRole: OrgRole): boolean {
+  if (!canManageMembers(actorRole)) return false;
+  // Only owners may promote/demote owners.
+  if (targetRole === "owner") return actorRole === "owner";
+  return true;
+}
 
 interface Settings {
   theme: "light" | "dark" | "system";
@@ -93,6 +144,126 @@ export default function SettingsContent() {
   const [saved, setSaved] = useState<Settings>(() => loadSavedSettings());
   const [lastLedger, setLastLedger] = useState<string>("Loading...");
   const [copied, setCopied] = useState(false);
+
+  const [org, setOrg] = useState<OrgWorkspace | null>(null);
+  const [orgLoading, setOrgLoading] = useState(true);
+  const [orgError, setOrgError] = useState<string | null>(null);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<OrgRole>("member");
+  const [inviteError, setInviteError] = useState<string | null>(null);
+  const [signingBlocked, setSigningBlocked] = useState<string | null>(null);
+
+  const currentMember = useMemo<OrgMember | undefined>(() => {
+    if (!org || !session?.publicKey) return undefined;
+    return org.members.find((m) => m.wallet === session.publicKey);
+  }, [org, session?.publicKey]);
+
+  const canManage = canManageMembers(currentMember?.role);
+
+  useEffect(() => {
+    let cancelled = false;
+    const fetchOrg = async () => {
+      setOrgLoading(true);
+      setOrgError(null);
+      try {
+        const response = await fetch(`${INDEXER_URL}/organizations/current`);
+        if (!response.ok) {
+          throw new Error(`Request failed (${response.status})`);
+        }
+        const data = (await response.json()) as OrgWorkspace;
+        if (!cancelled) setOrg(data);
+      } catch {
+        if (!cancelled) setOrgError("Unable to load your organization workspace.");
+      } finally {
+        if (!cancelled) setOrgLoading(false);
+      }
+    };
+    fetchOrg();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const guardSigning = (actingMember: OrgMember | undefined): boolean => {
+    if (!session?.publicKey) {
+      setSigningBlocked("Connect a wallet to perform organization actions.");
+      return false;
+    }
+    if (!actingMember || actingMember.wallet !== session.publicKey) {
+      setSigningBlocked(
+        "Your connected wallet does not own this member. Signing on another wallet's behalf is not allowed."
+      );
+      return false;
+    }
+    setSigningBlocked(null);
+    return true;
+  };
+
+  const handleInvite = () => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const email = inviteEmail.trim();
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      setInviteError("Enter a valid email address.");
+      return;
+    }
+    if (org.invitations.some((i) => i.email === email && i.status === "pending")) {
+      setInviteError("An invitation is already pending for this email.");
+      return;
+    }
+    setInviteError(null);
+    const invitation: OrgInvitation = {
+      id: `inv-${Date.now()}`,
+      email,
+      role: inviteRole,
+      status: "pending",
+      invitedBy: currentMember.name,
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(),
+    };
+    setOrg({ ...org, invitations: [invitation, ...org.invitations] });
+    setInviteEmail("");
+    toast.success("Invitation sent");
+  };
+
+  const handleRevokeInvitation = (id: string) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    setOrg({
+      ...org,
+      invitations: org.invitations.map((i) =>
+        i.id === id ? { ...i, status: "revoked" as InvitationStatus } : i
+      ),
+    });
+    toast.success("Invitation revoked");
+  };
+
+  const handleChangeRole = (memberId: string, role: OrgRole) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const target = org.members.find((m) => m.id === memberId);
+    if (!target || !canChangeRole(currentMember.role, target.role)) {
+      toast.error("You do not have permission to change this role.");
+      return;
+    }
+    setOrg({
+      ...org,
+      members: org.members.map((m) => (m.id === memberId ? { ...m, role } : m)),
+    });
+    toast.success("Role updated");
+  };
+
+  const handleRemoveMember = (memberId: string) => {
+    if (!org || !currentMember) return;
+    if (!guardSigning(currentMember)) return;
+    const target = org.members.find((m) => m.id === memberId);
+    if (!target) return;
+    if (target.role === "owner") {
+      toast.error("The organization owner cannot be removed.");
+      return;
+    }
+    setOrg({ ...org, members: org.members.filter((m) => m.id !== memberId) });
+    toast.success("Member removed");
+  };
 
   const isDirty = useMemo(
     () =>
@@ -390,6 +561,185 @@ export default function SettingsContent() {
                 </div>
               </div>
             </div>
+          </div>
+
+          {/* Organization Workspace */}
+          <div className="space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="p-2 rounded-lg bg-indigo-500/20 text-indigo-400">
+                <Users size={18} />
+              </div>
+              <div>
+                <p className="font-medium text-white dark:text-black">Organization Workspace</p>
+                <p className="text-sm opacity-60">Team payroll, subscriptions, and roles</p>
+              </div>
+            </div>
+
+            {signingBlocked && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300"
+              >
+                <ShieldAlert size={16} className="mt-0.5 flex-shrink-0" />
+                <span>{signingBlocked}</span>
+              </div>
+            )}
+
+            {orgLoading ? (
+              <p className="text-sm opacity-60 pl-12">Loading workspace…</p>
+            ) : orgError ? (
+              <div
+                role="alert"
+                className="rounded-xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300"
+              >
+                {orgError}
+              </div>
+            ) : !org ? (
+              <p className="text-sm opacity-60 pl-12">No organization workspace found.</p>
+            ) : (
+              <div className="space-y-6 pl-12">
+                <div>
+                  <p className="text-sm font-medium text-white dark:text-black">{org.name}</p>
+                  <p className="text-xs opacity-60">
+                    {currentMember
+                      ? `You are signed in as ${ROLE_LABELS[currentMember.role]}`
+                      : "Your connected wallet is not a member of this workspace"}
+                  </p>
+                </div>
+
+                {/* Members */}
+                <div className="space-y-2">
+                  <p className="text-sm text-white/60 dark:text-black/60">Members</p>
+                  {org.members.length === 0 ? (
+                    <p className="text-sm opacity-60">No members yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {org.members.map((member) => (
+                        <li
+                          key={member.id}
+                          className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 bg-black/30 dark:bg-white/30 px-4 py-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm text-white dark:text-black truncate">{member.name}</p>
+                            <p className="text-xs font-mono opacity-60 truncate">{shortenPublicKey(member.wallet)}</p>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            {canManage && member.role !== "owner" ? (
+                              <select
+                                aria-label={`Role for ${member.name}`}
+                                value={member.role}
+                                onChange={(e) => handleChangeRole(member.id, e.target.value as OrgRole)}
+                                className="px-2 py-1 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-xs"
+                              >
+                                {(["admin", "member", "viewer"] as OrgRole[]).map((r) => (
+                                  <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                                ))}
+                              </select>
+                            ) : (
+                              <span className="text-xs px-2 py-1 rounded-full border border-white/10 dark:border-black/10">
+                                {ROLE_LABELS[member.role]}
+                              </span>
+                            )}
+                            {canManage && member.role !== "owner" && (
+                              <button
+                                onClick={() => handleRemoveMember(member.id)}
+                                aria-label={`Remove ${member.name}`}
+                                className="opacity-60 hover:opacity-100 transition text-red-400"
+                              >
+                                <Trash2 size={14} />
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Invitations */}
+                <div className="space-y-2">
+                  <p className="text-sm text-white/60 dark:text-black/60">Invitations</p>
+                  {org.invitations.length === 0 ? (
+                    <p className="text-sm opacity-60">No invitations yet.</p>
+                  ) : (
+                    <ul className="space-y-2">
+                      {org.invitations.map((inv) => (
+                        <li
+                          key={inv.id}
+                          className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 px-4 py-3"
+                        >
+                          <div className="min-w-0">
+                            <p className="text-sm text-white dark:text-black truncate">{inv.email}</p>
+                            <p className="text-xs opacity-60">
+                              {ROLE_LABELS[inv.role]} · invited by {inv.invitedBy}
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2 flex-shrink-0">
+                            <span className={`text-xs px-2 py-1 rounded-full border ${INVITATION_STATUS_STYLES[inv.status]}`}>
+                              {inv.status}
+                            </span>
+                            {canManage && inv.status === "pending" && (
+                              <button
+                                onClick={() => handleRevokeInvitation(inv.id)}
+                                className="text-xs text-red-400 hover:opacity-80 transition"
+                              >
+                                Revoke
+                              </button>
+                            )}
+                          </div>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+
+                {/* Invite form */}
+                {canManage ? (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <UserPlus size={16} className="opacity-60" />
+                      <p className="text-sm text-white/60 dark:text-black/60">Invite a teammate</p>
+                    </div>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="email"
+                        value={inviteEmail}
+                        onChange={(e) => {
+                          setInviteEmail(e.target.value);
+                          setInviteError(null);
+                        }}
+                        placeholder="teammate@example.com"
+                        aria-label="Invite email"
+                        className="flex-1 px-3 py-2 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-sm"
+                      />
+                      <select
+                        value={inviteRole}
+                        onChange={(e) => setInviteRole(e.target.value as OrgRole)}
+                        aria-label="Invite role"
+                        className="px-3 py-2 rounded-lg bg-black/40 dark:bg-white/40 border border-white/10 dark:border-black/10 text-white dark:text-black text-sm"
+                      >
+                        {(["admin", "member", "viewer"] as OrgRole[]).map((r) => (
+                          <option key={r} value={r}>{ROLE_LABELS[r]}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={handleInvite}
+                        className="px-4 py-2 text-sm rounded-xl font-semibold bg-indigo-600 hover:bg-indigo-500 text-white transition"
+                      >
+                        Invite
+                      </button>
+                    </div>
+                    {inviteError && (
+                      <p role="alert" className="text-xs text-red-400">{inviteError}</p>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-xs opacity-60">
+                    Only owners and admins can invite or manage members.
+                  </p>
+                )}
+              </div>
+            )}
           </div>
 
           {/* Save Changes */}

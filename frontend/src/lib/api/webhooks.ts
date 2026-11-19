@@ -60,6 +60,40 @@ export interface WebhookDelivery {
 }
 
 /**
+ * Sanitized failure category reported by the backend for a webhook endpoint.
+ * Never contains response bodies or secrets — only a coarse classification.
+ */
+export type WebhookFailureCategory =
+  | "NONE"
+  | "TIMEOUT"
+  | "CONNECTION_ERROR"
+  | "HTTP_4XX"
+  | "HTTP_5XX"
+  | "INVALID_RESPONSE"
+  | "RATE_LIMITED"
+  | "UNKNOWN";
+
+/**
+ * Delivery health snapshot for a single webhook endpoint.
+ * TODO: add WebhookHealth to the backend OpenAPI spec.
+ */
+export interface WebhookHealth {
+  subscriptionId: string;
+  /** Coarse delivery status derived from recent attempts. */
+  status: "HEALTHY" | "DEGRADED" | "FAILING" | "UNKNOWN";
+  /** ISO timestamp of the last successful delivery, or null if never. */
+  lastSuccessAt: string | null;
+  /** ISO timestamp of the most recent delivery attempt, or null if never. */
+  lastAttemptAt: string | null;
+  /** Sanitized category of the most recent failure, or null if none. */
+  lastFailureCategory: WebhookFailureCategory | null;
+  /** Number of consecutive failed delivery attempts. */
+  consecutiveFailures: number;
+  /** Whether the endpoint is currently paused due to repeated failures. */
+  isPaused: boolean;
+}
+
+/**
  * Result of sending a test payload to a webhook.
  * TODO: add WebhookTestResult to the backend OpenAPI spec.
  */
@@ -86,6 +120,29 @@ export const WEBHOOK_EVENT_TYPES: WebhookEventType[] = [
   "RESUMED",
   "FEE_COLLECTED",
 ];
+
+/**
+ * Supported event families that can be used in `eventFilters`.
+ * Subscriptions may filter to a subset of families; an empty filter list
+ * means "all supported families".
+ */
+export const WEBHOOK_EVENT_FAMILIES = [
+  "stream",
+  "fee",
+  "lifecycle",
+] as const;
+
+export type WebhookEventFamily = (typeof WEBHOOK_EVENT_FAMILIES)[number];
+
+/**
+ * Documented payload schema versions a consumer may subscribe to.
+ * `v1` is the default and matches the legacy payload shape.
+ */
+export const WEBHOOK_SCHEMA_VERSIONS = ["v1", "v2"] as const;
+
+export type WebhookSchemaVersion = (typeof WEBHOOK_SCHEMA_VERSIONS)[number];
+
+export const DEFAULT_WEBHOOK_SCHEMA_VERSION: WebhookSchemaVersion = "v1";
 
 // ── HTTP helper ───────────────────────────────────────────────────────────────
 
@@ -121,8 +178,25 @@ export async function listWebhooks(accessToken: string): Promise<WebhookSubscrip
   return result.subscriptions;
 }
 
+export interface CreateWebhookOptions {
+  targetUrl: string;
+  eventTypes: string[];
+  /** Optional subset of supported event families. Empty/omitted = all. */
+  eventFilters?: WebhookEventFamily[];
+  /** Payload schema version; defaults to `v1` on the backend. */
+  schemaVersion?: WebhookSchemaVersion;
+}
+
+export interface UpdateWebhookOptions {
+  targetUrl?: string;
+  eventTypes?: string[];
+  isActive?: boolean;
+  eventFilters?: WebhookEventFamily[];
+  schemaVersion?: WebhookSchemaVersion;
+}
+
 export async function createWebhook(
-  input: { targetUrl: string; eventTypes: string[] },
+  input: CreateWebhookOptions,
   accessToken: string,
 ): Promise<{ subscription: WebhookSubscription; secretKey: string }> {
   return request(accessToken, "", { method: "POST", body: JSON.stringify(input) });
@@ -131,7 +205,7 @@ export async function createWebhook(
 export async function updateWebhook(
   id: string,
   accessToken: string,
-  input: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean },
+  input: UpdateWebhookOptions,
 ): Promise<WebhookSubscription> {
   return request(accessToken, `/${id}`, {
     method: "PATCH",
@@ -169,4 +243,16 @@ export async function regenerateWebhookSecret(id: string, accessToken: string): 
     method: "POST",
   });
   return result.secretKey;
+}
+
+/**
+ * Fetch delivery health and operator diagnostics for a webhook endpoint.
+ * The response is sanitized by the backend: no secrets or response bodies.
+ */
+export async function getWebhookHealth(
+  id: string,
+  accessToken: string,
+): Promise<WebhookHealth> {
+  const result = await request<{ health: WebhookHealth }>(accessToken, `/${id}/health`);
+  return result.health;
 }

@@ -14,7 +14,14 @@ import {
 } from "../services/sorobanService.js";
 import type { AuthenticatedRequest } from "../types/auth.types.js";
 import { parseStreamId } from "../lib/stream-id.js";
-import { createStreamSchema } from "../validators/stream.validator.js";
+import {
+  createStreamSchema,
+  paymentPolicyRequestSchema,
+} from "../validators/stream.validator.js";
+import {
+  evaluatePaymentPolicy,
+  recordAuditEvent,
+} from "../services/payment-policy.service.js";
 import {
   DEFAULT_EVENTS_PAGE_SIZE,
   MAX_EVENTS_PAGE_SIZE,
@@ -106,7 +113,69 @@ export const createStream = async (req: Request, res: Response) => {
       ratePerSecond,
       depositedAmount,
       startTime: parsedStartTime,
+      policyId,
     } = parsed.data;
+
+    // Issue #242: customer-defined payment policy evaluation. This is a
+    // server-side business-rule boundary only — it never replaces wallet
+    // authorization or on-chain verification below.
+    const policyParsed = paymentPolicyRequestSchema.safeParse({ policyId });
+    if (!policyParsed.success) {
+      const message = policyParsed.error.issues
+        .map((issue) => `${issue.path.join('.') || 'policyId'}: ${issue.message}`)
+        .join('; ');
+      return sendApiError(res, 400, 'INVALID_POLICY_ID', message);
+    }
+
+    const policyDecision = await evaluatePaymentPolicy({
+      policyId: policyParsed.data.policyId,
+      sender,
+      recipient,
+      tokenAddress,
+      ratePerSecond,
+      depositedAmount,
+      startTime: parsedStartTime,
+      callerPublicKey,
+    });
+
+    recordAuditEvent({
+      action: "PAYMENT_POLICY_EVALUATED",
+      policyId: policyDecision.policyId,
+      decision: policyDecision.decision,
+      reason: policyDecision.reason,
+      latencyMs: policyDecision.latencyMs,
+      callerPublicKey,
+      streamId: parsedStreamId,
+      sender,
+      recipient,
+      tokenAddress,
+    });
+
+    if (policyDecision.decision === "deny") {
+      return res.status(403).json({
+        error: "PAYMENT_POLICY_DENIED",
+        message: policyDecision.reason,
+        policyId: policyDecision.policyId,
+        policyDecision: {
+          decision: policyDecision.decision,
+          reason: policyDecision.reason,
+          latencyMs: policyDecision.latencyMs,
+        },
+      });
+    }
+
+    if (policyDecision.decision === "error") {
+      return res.status(422).json({
+        error: "PAYMENT_POLICY_EVALUATION_FAILED",
+        message: policyDecision.reason,
+        policyId: policyDecision.policyId,
+        policyDecision: {
+          decision: policyDecision.decision,
+          reason: policyDecision.reason,
+          latencyMs: policyDecision.latencyMs,
+        },
+      });
+    }
 
     // Issue #809: the authenticated wallet may only create/modify streams it owns.
     // Without this, any logged-in wallet could POST an arbitrary `sender` and have
@@ -179,7 +248,21 @@ export const createStream = async (req: Request, res: Response) => {
       },
     });
 
-    return res.status(201).json(JSON.parse(JSON.stringify(stream, (_key, value) => typeof value === "bigint" ? value.toString() : value)));
+    const serializedStream = JSON.parse(
+      JSON.stringify(stream, (_key, value) =>
+        typeof value === "bigint" ? value.toString() : value,
+      ),
+    );
+
+    return res.status(201).json({
+      ...serializedStream,
+      policyDecision: {
+        decision: policyDecision.decision,
+        reason: policyDecision.reason,
+        policyId: policyDecision.policyId,
+        latencyMs: policyDecision.latencyMs,
+      },
+    });
   } catch (error) {
     if (
       error instanceof RangeError ||

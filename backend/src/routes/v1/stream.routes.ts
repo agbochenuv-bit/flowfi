@@ -76,6 +76,16 @@ router.get('/', listStreams);
  *       Creates a DB projection for a stream that has already been confirmed
  *       on-chain. Rejects requests where the provided parameters do not match
  *       the on-chain state.
+ *
+ *       An optional customer-defined payment policy may be evaluated before the
+ *       stream is prepared by supplying `policyId`. Policy evaluation is a
+ *       server-side business-rule boundary only; it does not replace or imply
+ *       on-chain authorization, which remains the wallet's responsibility.
+ *       Policy results are deterministic for a given input and policy version.
+ *       If the policy service does not respond within the configured timeout,
+ *       the outcome depends on the policy's `failureMode`: `closed` (default)
+ *       rejects the request, `open` allows it and records the timeout in the
+ *       audit trail.
  *     security:
  *       - bearerAuth: []
  *     requestBody:
@@ -92,9 +102,18 @@ router.get('/', listStreams);
  *       401:
  *         description: Unauthorized
  *       403:
- *         description: Forbidden
+ *         description: |
+ *           Forbidden, or the referenced payment policy denied the request.
+ *           Policy denials include `code: POLICY_DENIED` and the audit fields
+ *           `policyId`, `policyVersion`, `decision`, and `evaluatedAt`.
  *       409:
  *         description: On-chain state mismatch
+ *       422:
+ *         description: |
+ *           The payment policy could not be evaluated (for example an unknown
+ *           `policyId`, an invalid policy definition, or a fail-closed timeout).
+ *           The response includes `code: POLICY_EVALUATION_FAILED` and the audit
+ *           fields `policyId`, `decision`, `reason`, and `evaluatedAt`.
  */
 router.post('/', requireAuth, createStream);
 

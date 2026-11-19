@@ -127,6 +127,15 @@ model WebhookSubscription {
   targetUrl   String   // Destination webhook URL (must be HTTPS)
   secretKey   String   // Secret used for HMAC-SHA256 signature
   eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
+  // Issue #240: optional event-family filters validated at configuration time.
+  eventFilters String[] @default([])
+  // Issue #240: documented payload schema version selected by the consumer.
+  schemaVersion String @default("v1")
+  // Issue #241: delivery health surfaced to operators (no secrets/response bodies).
+  healthStatus    String    @default("unknown") // "unknown" | "healthy" | "degraded" | "failing"
+  lastSuccessAt   DateTime?
+  lastFailureAt   DateTime?
+  failureCategory String?   // Sanitized category, e.g. "timeout", "http_4xx", "dns"
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
@@ -135,6 +144,7 @@ model WebhookSubscription {
 
   @@index([userAddress])
   @@index([isActive])
+  @@index([healthStatus])
 }
 
 // WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
@@ -147,12 +157,108 @@ model WebhookDelivery {
   attempts       Int      @default(0)
   deliveredAt    DateTime?
   error          String?
+  // Issue #241: sanitized failure category (never raw response bodies).
+  failureCategory String?
   createdAt      DateTime @default(now())
 
   subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
 
   @@index([subscriptionId])
   @@index([createdAt])
+}
+
+// PaymentPolicy model - customer-defined business rules evaluated server-side
+// before a transaction is prepared (Issue #242). Backend approval is NOT
+// on-chain authorization; wallet signing remains the sole authorization.
+model PaymentPolicy {
+  id          String   @id @default(uuid())
+  userAddress String   // Stellar public key of the policy owner
+  name        String
+  enabled     Boolean  @default(true)
+  // Fail-closed by default: on timeout/error the policy denies the payment.
+  failOpen    Boolean  @default(false)
+  timeoutMs   Int      @default(2000)
+  rules       Json     // Deterministic rule set (see docs/api/payment-policy.md)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  evaluations PolicyEvaluation[]
+
+  @@index([userAddress])
+  @@index([enabled])
+}
+
+// PolicyEvaluation model - audit record for each policy decision (Issue #242)
+model PolicyEvaluation {
+  id            String   @id @default(uuid())
+  policyId      String
+  actor         String   // Caller identity that requested the evaluation
+  walletAddress String   // Wallet the payment would be signed by
+  amount        String   // Amount as string to preserve precision (i128)
+  tokenAddress  String
+  recipient     String
+  network       String   // Stellar network (e.g. "testnet", "mainnet")
+  decision      String   // "allow" | "deny" | "error"
+  reason        String?  // Human-readable, sanitized reason
+  latencyMs     Int
+  createdAt     DateTime @default(now())
+
+  policy        PaymentPolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@index([policyId])
+  @@index([walletAddress])
+  @@index([decision])
+  @@index([createdAt])
+}
+
+// Organization model - workspace for team payroll and subscriptions (Issue #253)
+model Organization {
+  id           String   @id @default(uuid())
+  name         String
+  ownerAddress String   // Stellar public key of the workspace owner
+  createdAt    DateTime @default(now())
+
+  members     OrganizationMember[]
+  invitations OrganizationInvitation[]
+
+  @@index([ownerAddress])
+}
+
+// OrganizationMember model - explicit role-based membership (Issue #253).
+// Members never sign on another wallet's behalf; each wallet signs its own txs.
+model OrganizationMember {
+  id             String    @id @default(uuid())
+  organizationId String
+  walletAddress  String    // Stellar public key of the member
+  role           String    @default("viewer") // "owner" | "admin" | "operator" | "viewer"
+  status         String    @default("active") // "active" | "suspended"
+  invitedAt      DateTime  @default(now())
+  acceptedAt     DateTime?
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, walletAddress])
+  @@index([organizationId])
+  @@index([walletAddress])
+}
+
+// OrganizationInvitation model - invitation lifecycle (Issue #253)
+model OrganizationInvitation {
+  id             String   @id @default(uuid())
+  organizationId String
+  email          String?
+  walletAddress  String
+  role           String   @default("viewer")
+  status         String   @default("pending") // "pending" | "accepted" | "revoked" | "expired"
+  token          String   @unique
+  expiresAt      DateTime
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId])
+  @@index([walletAddress])
+  @@index([status])
 }
 
 // AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)

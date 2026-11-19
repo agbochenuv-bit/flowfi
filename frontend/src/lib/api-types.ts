@@ -106,6 +106,95 @@ export interface BackendStream
 }
 
 // ---------------------------------------------------------------------------
+// Organization workspace
+// ---------------------------------------------------------------------------
+
+/**
+ * Roles a user can hold within an organization workspace.
+ *
+ * - `owner`: full control, including wallet signing ownership and billing.
+ * - `admin`: can manage members and invitations, but cannot transfer ownership.
+ * - `member`: read access to workspace data; cannot manage members.
+ * - `viewer`: read-only access to streams and reports.
+ */
+export type OrganizationRole = "owner" | "admin" | "member" | "viewer";
+
+/**
+ * Lifecycle states of an organization invitation.
+ *
+ * - `pending`: sent, awaiting acceptance.
+ * - `accepted`: accepted by the invitee; a membership now exists.
+ * - `declined`: explicitly declined by the invitee.
+ * - `revoked`: cancelled by an admin/owner before acceptance.
+ * - `expired`: passed its expiry without being accepted.
+ */
+export type OrganizationInvitationStatus =
+  | "pending"
+  | "accepted"
+  | "declined"
+  | "revoked"
+  | "expired";
+
+/**
+ * A member of an organization workspace.
+ *
+ * `walletAddress` is the member's own wallet. Signing authority always stays
+ * with the wallet owner; membership never grants the ability to sign on
+ * another wallet's behalf.
+ */
+export interface OrganizationMember {
+  id: string;
+  organizationId: string;
+  userId: string;
+  walletAddress: string;
+  role: OrganizationRole;
+  /** Whether this member is the wallet-signing owner of the workspace. */
+  isSigningOwner: boolean;
+  joinedAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * An invitation to join an organization workspace.
+ *
+ * `invitedByUserId` identifies the member who issued the invitation.
+ * `expiresAt` is an ISO timestamp; invitations past it are `expired`.
+ */
+export interface OrganizationInvitation {
+  id: string;
+  organizationId: string;
+  email: string;
+  role: OrganizationRole;
+  status: OrganizationInvitationStatus;
+  invitedByUserId: string;
+  /** Wallet address the invitation is addressed to, if known at invite time. */
+  walletAddress?: string;
+  expiresAt: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * An organization workspace as returned by the backend API.
+ *
+ * `signingOwnerWallet` is the wallet that owns signing authority for the
+ * workspace. Only that wallet may sign transactions on the workspace's behalf.
+ */
+export interface Organization {
+  id: string;
+  name: string;
+  slug: string;
+  /** Wallet address holding signing authority for this workspace. */
+  signingOwnerWallet: string;
+  /** Role of the requesting user within this organization. */
+  currentUserRole: OrganizationRole;
+  members?: OrganizationMember[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ---------------------------------------------------------------------------
 // Operation-specific response types (derived from `paths`)
 // ---------------------------------------------------------------------------
 

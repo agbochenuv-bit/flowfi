@@ -14,6 +14,74 @@ by an indexed event.
 - Retries use **exponential backoff** on non-2xx responses and timeouts:
   30s → 1m → 5m → 30m → 2h (six attempts), then dead-letter.
 
+## Event families and filters
+
+Every delivery carries an event family. Subscribers may narrow which families
+they receive by setting `eventFilters` on the endpoint:
+
+| Family | Description |
+| ------ | ----------- |
+| `wallet` | Wallet lifecycle and balance-affecting events. |
+| `transaction` | Transaction prepared, submitted, confirmed, or failed. |
+| `payment` | Payment request and payment policy outcomes. |
+| `security` | Key, session, and authorization events. |
+
+- `eventFilters` is an optional array of family names. When omitted or empty,
+  the endpoint receives **all** families (the legacy behavior).
+- Filters are validated at configuration time (create and update). Unknown
+  family names, duplicates, or non-array values are rejected with a validation
+  error and nothing is stored.
+- Filtering happens at enqueue time: events outside the subscribed families
+  are not queued for the endpoint and are not delivered retroactively if the
+  filters are later widened.
+
+## Payload schema versions
+
+Each endpoint selects a payload schema version via `schemaVersion`:
+
+| Version | Status |
+| ------- | ------ |
+| `1` | Legacy envelope. Default for existing subscriptions. |
+| `2` | Adds `eventFamily`, `schemaVersion`, and richer failure metadata. |
+
+- `schemaVersion` is optional. When omitted, new and existing endpoints use
+  version `1`, so the payload shape for existing subscriptions is unchanged.
+- Unknown or unsupported versions are rejected at configuration time.
+- The selected version is included in the payload (`schemaVersion`) and is
+  stable for the lifetime of a delivery; retries re-send the same version.
+- Version `2` is additive: fields present in version `1` keep their names and
+  meaning, so consumers can migrate incrementally.
+
+## Delivery health and diagnostics
+
+`GET /v1/webhooks/:id/health` returns the delivery health of a single endpoint.
+It is authorized against endpoint ownership exactly like the lifecycle
+operations: a caller may only read health for endpoints belonging to their own
+account, and requests against another account's endpoint are rejected as
+not-found.
+
+```json
+{
+  "status": "degraded",
+  "lastSuccessAt": "2024-01-01T00:00:00Z",
+  "lastFailureAt": "2024-01-01T00:05:00Z",
+  "failureCategory": "timeout"
+}
+```
+
+| Field | Meaning |
+| ----- | ------- |
+| `status` | `healthy`, `degraded`, or `failing`. |
+| `lastSuccessAt` | Timestamp of the most recent successful delivery, or `null`. |
+| `lastFailureAt` | Timestamp of the most recent failed attempt, or `null`. |
+| `failureCategory` | Sanitized category of the most recent failure, or `null`. |
+
+`failureCategory` is a fixed enum (`timeout`, `connection_error`,
+`http_4xx`, `http_5xx`, `invalid_response`, `unknown`). The response never
+includes subscriber response bodies, headers, secrets, or signing keys. Status
+transitions as deliveries succeed, fail, retry, and recover; a successful
+delivery after failures moves the endpoint back toward `healthy`.
+
 ```mermaid
 sequenceDiagram
     participant W as Webhook worker
@@ -170,6 +238,16 @@ scoped and bounded by design:
   deliveries replayed. Replayed deliveries are marked as replays in the
   delivery history so operators can distinguish them from original attempts.
 
+## Payment policy evaluation
+
+Payment policy checks are a **server-side business-rule boundary** evaluated
+before a transaction is prepared. A policy approval is not on-chain
+authorization: it does not sign, submit, or authorize any transaction, and it
+never substitutes for wallet authorization or chain/network validation. Policy
+inputs, deterministic results, timeout behavior, and audit fields are
+documented with the payment policy API; policy failures are surfaced as
+`payment` family events.
+
 ## Rollout and migration notes
 
 - New schema fields back the lifecycle and replay features: an endpoint
@@ -183,3 +261,7 @@ scoped and bounded by design:
 - The public delivery contract (signature header, backoff schedule) is
   unchanged; lifecycle and replay are additive and do not alter existing
   endpoints' behavior until an operator uses them.
+- `eventFilters` and `schemaVersion` are additive and optional. Existing
+  subscriptions keep receiving all event families and the version `1`
+  payload, so no consumer changes are required to stay compatible.
+- Delivery health is read-only and additive; it exposes no new secret material.

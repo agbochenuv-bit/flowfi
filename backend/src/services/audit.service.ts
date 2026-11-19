@@ -35,3 +35,49 @@ export async function recordAuditEvent(
     },
   });
 }
+
+export type PolicyDecision = 'allow' | 'deny' | 'error';
+
+export interface PolicyEvaluationAuditRecord {
+  actor: string;
+  policyId: string;
+  decision: PolicyDecision;
+  reason: string;
+  latencyMs: number;
+  outcome: 'success' | 'failure';
+  metadata?: Record<string, unknown>;
+  requestId?: string;
+}
+
+/**
+ * Records an audit event for a customer-defined payment policy evaluation.
+ *
+ * Reuses `recordAuditEvent` so that requestId correlation (explicit or from the
+ * ambient request context) is preserved. The recorded action is
+ * `payment_policy.evaluate` and the target type is `payment_policy`, with the
+ * policy id as the target id. Metadata always carries the policy id, decision,
+ * reason, and latency so evaluations are fully auditable.
+ */
+export async function recordPolicyEvaluationAudit(
+  record: PolicyEvaluationAuditRecord,
+  transaction?: Prisma.TransactionClient,
+): Promise<void> {
+  await recordAuditEvent(
+    {
+      actor: record.actor,
+      action: 'payment_policy.evaluate',
+      targetType: 'payment_policy',
+      targetId: record.policyId,
+      outcome: record.outcome,
+      metadata: {
+        ...(record.metadata ?? {}),
+        policyId: record.policyId,
+        decision: record.decision,
+        reason: record.reason,
+        latencyMs: record.latencyMs,
+      },
+      ...(record.requestId ? { requestId: record.requestId } : {}),
+    },
+    transaction,
+  );
+}

@@ -15,6 +15,8 @@ export interface WebhookSubscription {
   targetUrl: string;
   secretKey: string;
   eventTypes: string[];
+  eventFilters?: string[];
+  schemaVersion?: string;
   isActive: boolean;
 }
 
@@ -23,6 +25,116 @@ export interface WebhookPayload {
   data: Record<string, any>;
   timestamp: string;
 }
+
+export const SUPPORTED_EVENT_FAMILIES = [
+  "STREAM_CREATED",
+  "STREAM_UPDATED",
+  "STREAM_CANCELLED",
+  "STREAM_COMPLETED",
+  "WITHDRAWAL",
+  "DEPOSIT",
+  "TEST_PING",
+] as const;
+
+export const SUPPORTED_SCHEMA_VERSIONS = ["v1"] as const;
+export const DEFAULT_SCHEMA_VERSION = "v1";
+
+export type WebhookFailureCategory =
+  | "timeout"
+  | "dns_failure"
+  | "tls_error"
+  | "http_4xx"
+  | "http_5xx"
+  | "network_error"
+  | "unknown";
+
+export interface WebhookHealth {
+  id: string;
+  status: string;
+  lastSuccessAt: Date | null;
+  lastFailureAt: Date | null;
+  failureCategory: string | null;
+  recentAttempts: number;
+  recentFailures: number;
+}
+
+/**
+ * Validate subscription filters and schema version at configuration time.
+ * Throws descriptive errors for unknown event families or unsupported schema versions.
+ */
+export function validateSubscriptionConfig(
+  eventTypes: string[],
+  eventFilters: string[] | undefined,
+  schemaVersion: string | undefined,
+): { eventTypes: string[]; eventFilters: string[]; schemaVersion: string } {
+  const supported = new Set<string>(SUPPORTED_EVENT_FAMILIES);
+  const normalizedTypes = Array.isArray(eventTypes) ? eventTypes : [];
+  const normalizedFilters = Array.isArray(eventFilters) ? eventFilters : [];
+
+  for (const eventType of normalizedTypes) {
+    if (!supported.has(eventType)) {
+      throw new Error(`Unsupported webhook event type: ${eventType}`);
+    }
+  }
+  for (const filter of normalizedFilters) {
+    if (!supported.has(filter)) {
+      throw new Error(`Unsupported webhook event filter: ${filter}`);
+    }
+  }
+
+  const resolvedVersion = schemaVersion ?? DEFAULT_SCHEMA_VERSION;
+  if (!(SUPPORTED_SCHEMA_VERSIONS as readonly string[]).includes(resolvedVersion)) {
+    throw new Error(`Unsupported webhook schema version: ${resolvedVersion}`);
+  }
+
+  return {
+    eventTypes: normalizedTypes,
+    eventFilters: normalizedFilters,
+    schemaVersion: resolvedVersion,
+  };
+}
+
+/**
+ * Serialize a payload according to the requested schema version.
+ */
+export function serializePayload(
+  schemaVersion: string,
+  event: WebhookPayload,
+): string {
+  switch (schemaVersion) {
+    case "v1":
+      return JSON.stringify(event);
+    default:
+      throw new Error(`Unsupported webhook schema version: ${schemaVersion}`);
+  }
+}
+
+function categorizeFailure(status?: number, error?: unknown): WebhookFailureCategory {
+  if (typeof status === "number" && status > 0) {
+    if (status >= 400 && status < 500) return "http_4xx";
+    if (status >= 500 && status < 600) return "http_5xx";
+  }
+  if (error) {
+    const message = error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
+    if (message.includes("timed out") || message.includes("timeout")) return "timeout";
+    if (message.includes("dns") || message.includes("enotfound") || message.includes("eai_again")) {
+      return "dns_failure";
+    }
+    if (message.includes("tls") || message.includes("certificate") || message.includes("ssl")) {
+      return "tls_error";
+    }
+    if (
+      message.includes("econnrefused") ||
+      message.includes("econnreset") ||
+      message.includes("network") ||
+      message.includes("socket")
+    ) {
+      return "network_error";
+    }
+  }
+  return "unknown";
+}
+=======
 
 const MAX_RETRY_ATTEMPTS = 5;
 const RETRY_DELAYS_MS = [0, 60000, 300000, 900000, 3600000]; // 0, 1m, 5m, 15m, 1h
@@ -237,7 +349,10 @@ export async function createWebhookSubscription(
   userAddress: string,
   targetUrl: string,
   eventTypes: string[],
+  eventFilters?: string[],
+  schemaVersion?: string,
 ): Promise<WebhookSubscription> {
+  const config = validateSubscriptionConfig(eventTypes, eventFilters, schemaVersion);
   const { url } = await resolveSafeWebhookTarget(targetUrl);
 
   // Generate secure secret
@@ -248,7 +363,9 @@ export async function createWebhookSubscription(
       userAddress,
       targetUrl: url.href,
       secretKey,
-      eventTypes,
+      eventTypes: config.eventTypes,
+      eventFilters: config.eventFilters,
+      schemaVersion: config.schemaVersion,
       isActive: true,
     },
   });
@@ -292,11 +409,33 @@ export async function deleteWebhookSubscription(
 export async function updateWebhookSubscription(
   id: string,
   userAddress: string,
-  input: { targetUrl?: string; eventTypes?: string[]; isActive?: boolean },
+  input: {
+    targetUrl?: string;
+    eventTypes?: string[];
+    eventFilters?: string[];
+    schemaVersion?: string;
+    isActive?: boolean;
+  },
 ): Promise<Omit<WebhookSubscription, "secretKey">> {
-  const data = input.targetUrl === undefined
-    ? input
-    : { ...input, targetUrl: (await resolveSafeWebhookTarget(input.targetUrl)).url.href };
+  const existing = await prisma.webhookSubscription.findFirst({ where: { id, userAddress } });
+  if (!existing) throw new Error("Webhook subscription not found");
+
+  const config = validateSubscriptionConfig(
+    input.eventTypes ?? existing.eventTypes,
+    input.eventFilters ?? existing.eventFilters ?? [],
+    input.schemaVersion ?? existing.schemaVersion ?? DEFAULT_SCHEMA_VERSION,
+  );
+
+  const data: Record<string, unknown> = {
+    ...input,
+    eventTypes: config.eventTypes,
+    eventFilters: config.eventFilters,
+    schemaVersion: config.schemaVersion,
+  };
+  if (input.targetUrl !== undefined) {
+    data.targetUrl = (await resolveSafeWebhookTarget(input.targetUrl)).url.href;
+  }
+
   const subscription = await prisma.webhookSubscription.updateMany({
     where: { id, userAddress },
     data,
@@ -305,6 +444,37 @@ export async function updateWebhookSubscription(
   const updated = await prisma.webhookSubscription.findUniqueOrThrow({ where: { id } });
   const { secretKey: _secretKey, ...safe } = updated;
   return safe;
+}
+
+/**
+ * Return sanitized delivery health for a webhook endpoint (Issue #241).
+ * Enforces ownership via userAddress and never exposes secrets or response bodies.
+ */
+export async function getWebhookHealth(
+  id: string,
+  userAddress: string,
+): Promise<WebhookHealth> {
+  const subscription = await prisma.webhookSubscription.findFirst({
+    where: { id, userAddress },
+  });
+  if (!subscription) throw new Error("Webhook subscription not found");
+
+  const recent = await prisma.webhookDelivery.findMany({
+    where: { subscriptionId: id },
+    orderBy: { createdAt: "desc" },
+    take: 20,
+    select: { deliveredAt: true },
+  });
+
+  return {
+    id: subscription.id,
+    status: subscription.healthStatus ?? (subscription.isActive ? "unknown" : "disabled"),
+    lastSuccessAt: subscription.lastSuccessAt ?? null,
+    lastFailureAt: subscription.lastFailureAt ?? null,
+    failureCategory: subscription.failureCategory ?? null,
+    recentAttempts: recent.length,
+    recentFailures: recent.filter((delivery) => delivery.deliveredAt === null).length,
+  };
 }
 
 export async function listWebhookDeliveries(
@@ -374,7 +544,18 @@ export async function deliverWebhook(
   subscription: WebhookSubscription,
   payload: WebhookPayload,
 ): Promise<{ success: boolean; status?: number; error?: string }> {
-  const payloadJson = JSON.stringify(payload);
+  const schemaVersion = subscription.schemaVersion ?? DEFAULT_SCHEMA_VERSION;
+  const eventFilters = subscription.eventFilters ?? [];
+  if (!subscription.eventTypes.includes(payload.eventType)) {
+    logger.info(`[Webhook] Skipping ${payload.eventType}: not subscribed`);
+    return { success: false, error: "Event not subscribed" };
+  }
+  if (eventFilters.length > 0 && !eventFilters.includes(payload.eventType)) {
+    logger.info(`[Webhook] Skipping ${payload.eventType}: excluded by filters`);
+    return { success: false, error: "Event filtered out" };
+  }
+
+  const payloadJson = serializePayload(schemaVersion, payload);
   const timestamp = Math.floor(Date.now() / 1000);
   const signature = generateWebhookSignature(
     payloadJson,
@@ -415,20 +596,30 @@ export async function deliverWebhook(
           "User-Agent": "FlowFi-Webhook/1.0",
         }, payloadJson);
 
-      // Update delivery record
+      const succeeded = lastStatus >= 200 && lastStatus < 300;
+      const failureCategory = succeeded ? null : categorizeFailure(lastStatus);
+
+      // Update delivery record (sanitized: no response bodies stored)
       await prisma.webhookDelivery.update({
         where: { id: delivery.id },
         data: {
           responseStatus: lastStatus,
           attempts: attempt + 1,
-          deliveredAt:
-            lastStatus >= 200 && lastStatus < 300 ? new Date() : null,
-          error:
-            lastStatus >= 200 && lastStatus < 300 ? null : `HTTP ${lastStatus}`,
+          deliveredAt: succeeded ? new Date() : null,
+          error: succeeded ? null : `HTTP ${lastStatus}`,
+          failureCategory,
         },
       });
 
-      if (lastStatus >= 200 && lastStatus < 300) {
+      if (succeeded) {
+        await prisma.webhookSubscription.update({
+          where: { id: subscription.id },
+          data: {
+            healthStatus: "healthy",
+            lastSuccessAt: new Date(),
+            failureCategory: null,
+          },
+        });
         logger.info(
           `[Webhook] Delivered ${payload.eventType} with status ${lastStatus} (attempt ${attempt + 1})`,
         );
@@ -439,8 +630,9 @@ export async function deliverWebhook(
       logger.warn(
         `[Webhook] Delivery failed with status ${lastStatus} (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
-    } catch {
+    } catch (error) {
       lastError = "Network error";
+      const failureCategory = categorizeFailure(undefined, error);
       logger.warn(
         `[Webhook] Delivery failed with a network error (attempt ${attempt + 1}/${MAX_RETRY_ATTEMPTS})`,
       );
@@ -450,10 +642,20 @@ export async function deliverWebhook(
         data: {
           attempts: attempt + 1,
           error: lastError || null,
+          failureCategory,
         },
       });
     }
   }
+
+  await prisma.webhookSubscription.update({
+    where: { id: subscription.id },
+    data: {
+      healthStatus: "failing",
+      lastFailureAt: new Date(),
+      failureCategory: categorizeFailure(lastStatus),
+    },
+  });
 
   // All retries exhausted - check if we should disable webhook
   await checkConsecutiveFailures(subscription.id);
@@ -520,6 +722,11 @@ export async function dispatchWebhookEvent(
     },
   });
 
+  const eligible = subscriptions.filter((subscription) => {
+    const filters = (subscription as WebhookSubscription).eventFilters ?? [];
+    return filters.length === 0 || filters.includes(eventType);
+  });
+
   const payload: WebhookPayload = {
     eventType,
     data,
@@ -527,7 +734,7 @@ export async function dispatchWebhookEvent(
   };
 
   // Dispatch to all subscriptions in parallel
-  const deliveries = subscriptions.map((subscription) =>
+  const deliveries = eligible.map((subscription) =>
     deliverWebhook(subscription as WebhookSubscription, payload).catch(
       (error) => {
         logger.error(`[Webhook] Dispatch failed for ${payload.eventType}`);

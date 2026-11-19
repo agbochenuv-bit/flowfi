@@ -203,6 +203,72 @@ describe('WalletProvider', () => {
     });
   });
 
+  describe('organization membership', () => {
+    it('should expose the connected wallet as the acting member wallet', async () => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mockSession));
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ publicKey: mockSession.publicKey, token: VALID_TOKEN }));
+
+      const { result } = renderHook(() => useWallet(), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isHydrated).toBe(true);
+      });
+
+      expect(result.current.organization).toBeNull();
+      expect(result.current.canSignForWallet(mockSession.publicKey)).toBe(true);
+    });
+
+    it('should refuse signing for a wallet that is not the connected wallet', async () => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mockSession));
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ publicKey: mockSession.publicKey, token: VALID_TOKEN }));
+
+      const { result } = renderHook(() => useWallet(), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isHydrated).toBe(true);
+      });
+
+      expect(result.current.canSignForWallet('GOTHERWALLET000000000000000000000000000000000000000')).toBe(false);
+      expect(result.current.canSignForWallet('')).toBe(false);
+    });
+
+    it('should refuse signing when no wallet is connected', async () => {
+      const { result } = renderHook(() => useWallet(), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isHydrated).toBe(true);
+      });
+
+      expect(result.current.canSignForWallet(mockSession.publicKey)).toBe(false);
+    });
+
+    it('should clear organization state on disconnect', async () => {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(mockSession));
+      localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ publicKey: mockSession.publicKey, token: VALID_TOKEN }));
+
+      const { result } = renderHook(() => useWallet(), {
+        wrapper: createWrapper(),
+      });
+
+      await waitFor(() => {
+        expect(result.current.isHydrated).toBe(true);
+      });
+
+      act(() => {
+        result.current.disconnect();
+      });
+
+      expect(result.current.organization).toBeNull();
+      expect(result.current.canSignForWallet(mockSession.publicKey)).toBe(false);
+    });
+  });
+
   describe('useWallet outside provider', () => {
     it('should throw when used outside WalletProvider', () => {
       const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
