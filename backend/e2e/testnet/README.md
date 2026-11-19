@@ -1,50 +1,61 @@
-# Stellar Testnet E2E suite
+# Testnet E2E Smoke Scenario
 
-Live end-to-end checks against the public Stellar Testnet. Unlike the mocked
-suites under `tests/`, these hit the real network to catch drift early:
+This directory documents the deployed-testnet smoke scenario used to validate
+stream creation and lifecycle calls against a real network. It is intentionally
+kept small and is **not** the primary integration surface — deterministic local
+fixtures (see below) are the default for automated coverage.
 
-| Suite | Detects |
-| --- | --- |
-| `network-health.e2e.test.ts` | RPC outages, passphrase/protocol changes, ledger close-time drift, RPC↔Horizon skew, fee surges, Friendbot regressions |
-| `stream-lifecycle.e2e.test.ts` | Contract regressions on the live protocol (`create_stream` → `withdraw` → `cancel_stream`, `getEvents`) |
-| `stream-lifecycle.e2e.test.ts` › indexer | Indexer drift — the real `SorobanEventWorker` must ingest those txs into Postgres with matching hashes, ledgers and amounts |
+## Deployed testnet smoke scenario
 
-It is **not** part of `npm test`. It runs on a schedule (every 6h) via
-`.github/workflows/testnet-e2e.yml`, which deploys a fresh contract from the
-current `contracts/` source, runs the suite, and opens/updates a
-`testnet-e2e-failure` issue when a scheduled run fails. It can also be run
-manually from the Actions tab, optionally against an existing contract ID.
+The smoke scenario exercises the same stream lifecycle as the local fixtures so
+that local and testnet behavior stay in parity:
 
-## Running locally
+1. Create a stream (deposit + start time).
+2. Read the stream back and assert the stored parameters.
+3. Withdraw a partial amount and assert balances.
+4. Cancel the stream and assert the remaining balance is refunded.
 
-```bash
-cd backend
-# Network health only (no contract / DB needed):
-npm run test:e2e:testnet -- network-health
+Run it only when a funded testnet account and a deployed contract are available.
+It is expected to be flaky by nature (network availability, faucet limits) and
+must not gate CI.
 
-# Full suite: deploy a contract, then point the suite at it and a Postgres DB
-export E2E_STREAM_CONTRACT_ID=C...
-export DATABASE_URL=postgresql://flowfi:flowfi_dev_password@127.0.0.1:5433/flowfi
-npx prisma db push --schema=prisma/schema.prisma
-npm run test:e2e:testnet
-```
+## Deterministic local Soroban integration fixtures
 
-The indexer test **resets the `IndexerState` cursor** in the target database —
-never point `DATABASE_URL` at a shared or production database.
+Local fixtures provide the same stream creation and lifecycle coverage without
+depending on public testnet availability. They are the source of truth for
+integration tests; the testnet smoke scenario is a periodic parity check.
 
-Contract tests are skipped when `E2E_STREAM_CONTRACT_ID` is unset; indexer
-tests are skipped when `DATABASE_URL` is unset.
+### Startup
 
-## Configuration
+1. Pin the contract artifact: the fixture loads the pre-built Soroban contract
+   WASM from the pinned artifact path/version recorded alongside the fixtures.
+   Do not rebuild from a moving branch — the artifact is versioned so results are
+   reproducible.
+2. Start a local Soroban/RPC environment (e.g. a local quickstart node) and
+   deploy the pinned artifact.
+3. Seed deterministic accounts with fixed keys and fixed starting balances.
 
-| Variable | Default |
-| --- | --- |
-| `E2E_SOROBAN_RPC_URL` | `https://soroban-testnet.stellar.org` |
-| `E2E_HORIZON_URL` | `https://horizon-testnet.stellar.org` |
-| `E2E_FRIENDBOT_URL` | `https://friendbot.stellar.org` |
-| `E2E_NETWORK_PASSPHRASE` | Testnet passphrase |
-| `E2E_STREAM_CONTRACT_ID` | _(unset → contract suites skipped)_ |
-| `E2E_MAX_LEDGER_CLOSE_SECONDS` | `15` |
-| `E2E_MAX_P90_INCLUSION_FEE` | `100000` stroops |
-| `E2E_TX_TIMEOUT_MS` | `90000` |
-| `E2E_INDEXER_TIMEOUT_MS` | `120000` |
+### State reset between cases
+
+Each test case runs against a freshly reset ledger state:
+
+- The fixture resets ledger state (or redeploys the pinned artifact) before every
+  case so cases are independent and order-insensitive.
+- Accounts, stream IDs, and timestamps are deterministic, so assertions are
+  stable across runs and machines.
+
+### Parity with the testnet smoke scenario
+
+The local fixture suite mirrors the smoke scenario steps above (create, read,
+partial withdraw, cancel/refund) and additionally covers the failure and
+boundary cases that are impractical to exercise on testnet:
+
+- Creating a stream with an invalid/zero deposit or invalid time range fails.
+- Withdrawing more than the vested amount fails.
+- Withdrawing after cancellation fails.
+- Cancelling an already-cancelled stream fails.
+- Boundary: withdrawing exactly the fully vested amount succeeds and leaves a
+  zero claimable balance.
+
+When the testnet smoke scenario changes, update the local fixtures in the same
+change so parity is preserved.

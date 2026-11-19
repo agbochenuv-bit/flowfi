@@ -170,6 +170,61 @@ The API version middleware automatically:
 - Returns 400 for unsupported versions
 - Sets default version if none specified
 
+## Event Schema Versioning
+
+Stream event schemas are published as machine-readable JSON Schema artifacts so downstream consumers can validate payloads and plan compatible upgrades. Event schemas are **versioned independently from package releases** — a schema version bump does not require (and is not tied to) an npm/package version bump.
+
+### Schema Location
+
+Published schemas live under `backend/schemas/` and are named by their schema version:
+
+```
+backend/schemas/stream-event.v1.json
+```
+
+Each artifact declares its own `$id` (e.g. `https://flowfi.io/schemas/stream-event.v1.json`) and a `version` field so consumers can pin to a specific schema version regardless of the package version they install.
+
+### Backward-Compatibility Rules
+
+Within a **major** schema version (e.g. `v1`), only **additive** changes are allowed:
+
+- ✅ Adding new **optional** properties
+- ✅ Adding new enum values only when consumers are documented to tolerate unknown values
+- ✅ Relaxing constraints (e.g. widening a `maxLength`)
+- ❌ Adding new **required** properties
+- ❌ Removing or renaming properties
+- ❌ Changing a property's type
+- ❌ Tightening constraints (e.g. narrowing an enum, adding `required`)
+
+Any breaking change requires publishing a **new major schema version** (e.g. `stream-event.v2.json`). The previous major version remains published and supported during its deprecation window.
+
+### Consumer Example
+
+Consumers validate a stream event payload against the published schema before processing it:
+
+```javascript
+import Ajv from 'ajv';
+import schema from 'flowfi-sdk/schemas/stream-event.v1.json' assert { type: 'json' };
+
+const ajv = new Ajv({ strict: false });
+const validate = ajv.compile(schema);
+
+const event = {
+  version: 'v1',
+  type: 'stream.created',
+  streamId: '1',
+  timestamp: '2024-02-21T00:00:00.000Z',
+  payload: { amount: '10000' }
+};
+
+if (!validate(event)) {
+  console.error('Invalid stream event:', validate.errors);
+  throw new Error('Stream event failed schema validation');
+}
+```
+
+Consumers should reject payloads that fail validation, and should treat an unknown `version` as a signal to upgrade their pinned schema rather than silently accepting the payload.
+
 ## Best Practices
 
 ### For API Developers
@@ -179,6 +234,7 @@ The API version middleware automatically:
 3. **Provide migration guides** - Help consumers upgrade
 4. **Maintain backward compatibility** - Within a version
 5. **Test version isolation** - Ensure versions don't interfere
+6. **Version event schemas independently** - Bump schema versions separately from package releases and follow the additive-only rule within a major version
 
 ### For API Consumers
 
@@ -187,6 +243,7 @@ The API version middleware automatically:
 3. **Plan migrations early** - Don't wait until sunset
 4. **Test thoroughly** - Before upgrading versions
 5. **Use health endpoint** - Check supported versions
+6. **Validate event payloads** - Compile the published schema and reject invalid or unknown-version events
 
 ## Examples
 

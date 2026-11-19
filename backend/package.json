@@ -22,7 +22,8 @@
     "prisma:studio": "prisma studio",
     "codegen:openapi": "tsx scripts/export-openapi.mts",
     "check:api-compat": "tsx scripts/check-api-compatibility.ts",
-    "check:schema-compat": "tsx scripts/check-schema-compat.ts"
+    "check:schema-compat": "tsx scripts/check-schema-compat.ts",
+    "codegen:event-schema-example": "tsx scripts/generate-event-schema-example.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"

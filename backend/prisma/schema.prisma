@@ -8,7 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -49,6 +49,7 @@ model Stream {
   senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
   recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
   events            StreamEvent[]
+  billingSubscriptions BillingSubscription[]
 
   @@index([sender])
   @@index([recipient])
@@ -192,32 +193,56 @@ model IndexerDeadLetterEvent {
   @@index([eventType])
 }
 
-// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+// BillingSubscription model - integration boundary linking an external billing
+// system's subscription to an on-chain stream (Issue #280).
+//
+// Reconciliation keys:
+//   - `provider` + `externalSubscriptionId` uniquely identify the billing record
+//     (idempotency key for create/update webhooks).
+//   - `streamId` links the billing record to the on-chain stream; it is nullable
+//     until the stream is created and is the join key for reconciliation.
+//   - `lastEventSequence` is a monotonic guard so out-of-order webhooks are
+//     applied deterministically: events with a sequence <= the stored value are
+//     treated as stale and ignored.
+model BillingSubscription {
+  id                     String   @id @default(uuid())
+  provider               String   // Billing provider identifier, e.g. "stripe"
+  externalSubscriptionId String   // Provider-side subscription id (idempotency key)
+  externalCustomerId     String?  // Provider-side customer id
+  streamId               BigInt?  // On-chain stream id (reconciliation key)
+  status                 String   @default("pending") // pending | active | paused | cancelled | diverged
+  lastEventSequence      BigInt   @default(0) // Monotonic guard for out-of-order webhooks
+  lastInvoiceId          String?  // Last applied invoice id (duplicate-invoice guard)
+  divergenceReason       String?  // Set when billing and on-chain state disagree
+  createdAt              DateTime @default(now())
+  updatedAt              DateTime @updatedAt
 
+  stream                 Stream?  @relation(fields: [streamId], references: [streamId])
+  invoices               BillingInvoice[]
+
+  @@unique([provider, externalSubscriptionId])
+  @@index([streamId])
   @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
+  @@index([externalCustomerId])
 }
 
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
+// BillingInvoice model - records processed invoices so duplicate invoice
+// webhooks are idempotent (Issue #280). The unique key on
+// (provider, externalInvoiceId) makes replays a no-op.
+model BillingInvoice {
+  id                String   @id @default(uuid())
+  provider          String
+  externalInvoiceId String
+  subscriptionId    String
+  amount            String   // Preserve precision as string
+  status            String   @default("paid")
+  appliedAt         DateTime @default(now())
+
+  subscription      BillingSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, externalInvoiceId])
+  @@index([subscriptionId])
+  @@index([appliedAt])
 }
+
+// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.

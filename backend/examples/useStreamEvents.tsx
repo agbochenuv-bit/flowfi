@@ -3,10 +3,16 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 
-interface StreamEvent {
+// Versioned event schema identifier. Schemas are published independently of
+// package releases under `schemas/stream-event.v<major>.json`; consumers pin a
+// major version and rely on additive-only evolution within it.
+export const STREAM_EVENT_SCHEMA_VERSION = 'v1' as const;
+
+export interface StreamEvent {
   type: 'created' | 'topped_up' | 'withdrawn' | 'cancelled' | 'completed';
   data: any;
   timestamp: number;
+  schemaVersion?: string;
 }
 
 interface UseStreamEventsOptions {
@@ -15,6 +21,12 @@ interface UseStreamEventsOptions {
   subscribeToAll?: boolean;
   autoReconnect?: boolean;
   maxRetryDelay?: number;
+  /**
+   * Major schema version the consumer expects. Events whose `schemaVersion`
+   * declares a different major version are rejected (version mismatch).
+   * Defaults to the currently published major version.
+   */
+  expectedSchemaVersion?: string;
 }
 
 interface UseStreamEventsReturn {
@@ -23,6 +35,50 @@ interface UseStreamEventsReturn {
   error: Error | null;
   reconnecting: boolean;
   clearEvents: () => void;
+}
+
+const REQUIRED_EVENT_FIELDS = ['type', 'data', 'timestamp'] as const;
+
+/**
+ * Backward-compatibility rules for stream event schemas:
+ * - Within a major version, changes are additive only (new optional fields).
+ * - Removing/renaming required fields or changing their types is breaking and
+ *   requires a new major version.
+ *
+ * Returns an error message when the payload violates the rules, else null.
+ */
+export function validateStreamEvent(
+  payload: unknown,
+  expectedSchemaVersion: string = STREAM_EVENT_SCHEMA_VERSION
+): string | null {
+  if (typeof payload !== 'object' || payload === null) {
+    return 'payload must be an object';
+  }
+  const record = payload as Record<string, unknown>;
+
+  for (const field of REQUIRED_EVENT_FIELDS) {
+    if (!(field in record) || record[field] === undefined) {
+      return `missing required field: ${field}`;
+    }
+  }
+
+  if (typeof record.timestamp !== 'number') {
+    return 'field timestamp must be a number';
+  }
+
+  // Optional field: absent is fine, but if present it must match the major version.
+  if (record.schemaVersion !== undefined) {
+    if (typeof record.schemaVersion !== 'string') {
+      return 'field schemaVersion must be a string';
+    }
+    const expectedMajor = expectedSchemaVersion.split('.')[0];
+    const actualMajor = record.schemaVersion.split('.')[0];
+    if (expectedMajor !== actualMajor) {
+      return `schema version mismatch: expected ${expectedSchemaVersion}, got ${record.schemaVersion}`;
+    }
+  }
+
+  return null;
 }
 
 export function useStreamEvents(
@@ -34,6 +90,7 @@ export function useStreamEvents(
     subscribeToAll = false,
     autoReconnect = true,
     maxRetryDelay = 30000,
+    expectedSchemaVersion = STREAM_EVENT_SCHEMA_VERSION,
   } = options;
 
   const [events, setEvents] = useState<StreamEvent[]>([]);
@@ -89,8 +146,13 @@ export function useStreamEvents(
     const handleEvent = (type: StreamEvent['type']) => (e: MessageEvent) => {
       try {
         const data = JSON.parse(e.data);
+        const validationError = validateStreamEvent(data, expectedSchemaVersion);
+        if (validationError) {
+          console.error(`Invalid ${type} event payload: ${validationError}`);
+          return;
+        }
         setEvents(prev => [
-          { type, data, timestamp: Date.now() },
+          { type, data, timestamp: Date.now(), schemaVersion: data.schemaVersion },
           ...prev.slice(0, 99), // Keep last 100 events
         ]);
       } catch (err) {
@@ -121,7 +183,7 @@ export function useStreamEvents(
         }, retryDelayRef.current);
       }
     };
-  }, [buildUrl, autoReconnect, maxRetryDelay]);
+  }, [buildUrl, autoReconnect, maxRetryDelay, expectedSchemaVersion]);
 
   useEffect(() => {
     connect();

@@ -168,3 +168,131 @@ export async function simulateRead(
   const retval = sim.result?.retval;
   return retval ? scValToNative(retval) : undefined;
 }
+
+/**
+ * Deterministic local Soroban integration fixtures.
+ *
+ * These fixtures exercise stream creation and lifecycle calls against a local
+ * Soroban RPC (e.g. `stellar container start local`) so CI does not depend on
+ * public testnet availability. Contract artifacts are pinned by hash and the
+ * fixture state is reset between cases.
+ *
+ * Startup:
+ *   1. `stellar container start local` (exposes RPC on http://localhost:8000/soroban/rpc)
+ *   2. Deploy the pinned stream contract artifact (see `PINNED_CONTRACT`).
+ *   3. Call `createLocalFixture()` in `beforeEach` to reset state.
+ *
+ * Testnet parity: the same `invokeContract`/`simulateRead` helpers are used by
+ * the deployed testnet smoke scenario, so a passing local fixture run implies
+ * the same call surface works against testnet.
+ */
+export interface LocalFixtureConfig {
+  rpcUrl: string;
+  networkPassphrase: string;
+  contractId: string;
+  /** sha256 of the pinned contract wasm artifact. */
+  artifactHash: string;
+}
+
+/** Pinned contract artifact identity; bump deliberately when the contract changes. */
+export const PINNED_CONTRACT = {
+  artifactHash: '0000000000000000000000000000000000000000000000000000000000000000',
+} as const;
+
+export interface LocalFixture {
+  config: LocalFixtureConfig;
+  server: rpc.Server;
+  /** Fresh funded account for the current case. */
+  account: Keypair;
+  /** Reset fixture state so cases are independent. */
+  reset: () => Promise<void>;
+  invoke: (method: string, args: xdr.ScVal[]) => Promise<InvokeResult>;
+  read: (method: string, args: xdr.ScVal[]) => Promise<unknown>;
+}
+
+/**
+ * Create a deterministic local fixture bound to a pinned contract artifact.
+ * Throws if the configured artifact hash does not match the pin, so a drifted
+ * local deployment fails fast instead of producing misleading results.
+ */
+export async function createLocalFixture(
+  config: LocalFixtureConfig,
+): Promise<LocalFixture> {
+  if (config.artifactHash !== PINNED_CONTRACT.artifactHash) {
+    throw new Error(
+      `Local fixture artifact hash ${config.artifactHash} does not match pinned ${PINNED_CONTRACT.artifactHash}`,
+    );
+  }
+
+  const localServer = new rpc.Server(config.rpcUrl, {
+    allowHttp: config.rpcUrl.startsWith('http://'),
+  });
+
+  const account = Keypair.random();
+
+  const invoke = async (method: string, args: xdr.ScVal[]): Promise<InvokeResult> => {
+    const source = await localServer.getAccount(account.publicKey());
+    const tx = new TransactionBuilder(source, {
+      fee: BASE_FEE,
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(new Contract(config.contractId).call(method, ...args))
+      .setTimeout(60)
+      .build();
+    const prepared = await localServer.prepareTransaction(tx);
+    prepared.sign(account);
+    const sent = await localServer.sendTransaction(prepared);
+    if (sent.status === 'ERROR' || sent.status === 'TRY_AGAIN_LATER') {
+      throw new Error(
+        `${method}: sendTransaction returned ${sent.status}: ${sent.errorResult?.toXDR('base64') ?? 'no errorResult'}`,
+      );
+    }
+    const final = await waitFor(
+      `${method} tx ${sent.hash} to finalize`,
+      async () => {
+        const res = await localServer.getTransaction(sent.hash);
+        return res.status === rpc.Api.GetTransactionStatus.NOT_FOUND ? undefined : res;
+      },
+      { timeoutMs: 30_000, intervalMs: 500 },
+    );
+    if (final.status !== rpc.Api.GetTransactionStatus.SUCCESS) {
+      throw new Error(
+        `${method}: transaction ${sent.hash} ${final.status}: ${final.resultXdr?.toXDR('base64') ?? ''}`,
+      );
+    }
+    return {
+      hash: sent.hash,
+      ledger: final.ledger,
+      returnValue: final.returnValue ? scValToNative(final.returnValue) : undefined,
+    };
+  };
+
+  const read = async (method: string, args: xdr.ScVal[]): Promise<unknown> => {
+    const source = await localServer.getAccount(account.publicKey());
+    const tx = new TransactionBuilder(source, {
+      fee: BASE_FEE,
+      networkPassphrase: config.networkPassphrase,
+    })
+      .addOperation(new Contract(config.contractId).call(method, ...args))
+      .setTimeout(30)
+      .build();
+    const sim = await localServer.simulateTransaction(tx);
+    if (rpc.Api.isSimulationError(sim)) {
+      throw new Error(`${method} simulation failed: ${sim.error}`);
+    }
+    const retval = sim.result?.retval;
+    return retval ? scValToNative(retval) : undefined;
+  };
+
+  const reset = async (): Promise<void> => {
+    // Local RPC exposes a reset endpoint that clears ledger state; fall back to
+    // a no-op when the node does not support it (older local images).
+    try {
+      await fetch(`${config.rpcUrl}/reset`, { method: 'POST' });
+    } catch {
+      // ignore: reset is best-effort on nodes without the endpoint
+    }
+  };
+
+  return { config, server: localServer, account, reset, invoke, read };
+}

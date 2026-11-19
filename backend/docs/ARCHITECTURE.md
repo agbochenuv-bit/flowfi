@@ -60,6 +60,73 @@ consolidation lands:
 
 ---
 
+## Subscription Billing Adapter
+
+The billing integration boundary (`src/integrations/billing/`) lets external
+billing systems (Stripe-style subscriptions) create or update streams and
+reconcile their status against on-chain events. It is an **adapter only** — it
+never signs transactions and never bypasses wallet authorization. Stream
+creation/updates still go through the normal wallet-signed path; the adapter
+records the intent and links it to the resulting on-chain stream.
+
+### Reconciliation Keys
+
+Every billing record is linked to a stream by an explicit reconciliation key so
+billing and on-chain state can be joined deterministically:
+
+| Key | Source | Purpose |
+|-----|--------|---------|
+| `invoiceId` | Billing system | Idempotency key for a single invoice. Unique per adapter. |
+| `subscriptionId` | Billing system | Groups invoices belonging to one subscription. |
+| `streamId` | On-chain (`Stream.id`) | Links the billing record to the canonical stream row. |
+| `eventSequence` | Billing webhook | Monotonic sequence/timestamp used to order webhooks. |
+
+`(invoiceId)` is the idempotency key: a repeated webhook for the same invoice is
+a **no-op** (returns the previously recorded result) rather than creating a
+duplicate stream or double-applying an update. `(subscriptionId, streamId)` is
+the reconciliation key used to detect divergence.
+
+### Duplicate-Invoice Behavior
+
+- The first webhook for an `invoiceId` creates/updates the stream and persists
+  the mapping.
+- Any subsequent webhook with the same `invoiceId` is deduplicated: the adapter
+  returns the stored result and does **not** re-apply the mutation.
+- If a duplicate arrives with a *different* payload for the same `invoiceId`,
+  the adapter rejects it as a conflict (surfaced to the caller) instead of
+  silently overwriting state.
+
+### Out-of-Order Webhooks
+
+Webhooks may arrive out of order. The adapter compares `eventSequence` against
+the last applied sequence for the subscription:
+
+- `eventSequence` **greater** than the last applied → apply and advance.
+- `eventSequence` **equal** → treated as a duplicate (idempotent no-op).
+- `eventSequence` **less** than the last applied → stale; ignored (not applied),
+  but recorded so operators can see late deliveries.
+
+This makes delivery order irrelevant: the highest sequence wins and replays are
+safe.
+
+### Resolving Divergence
+
+Divergence means billing state and on-chain stream state disagree (e.g. billing
+marks a subscription `active` but the stream is `cancelled` on-chain). To
+resolve:
+
+1. **On-chain state is authoritative** for stream lifecycle
+   (`active`/`paused`/`cancelled`/`completed`). The adapter never mutates chain
+   state to match billing.
+2. Run reconciliation by joining on `(subscriptionId, streamId)` and comparing
+   the billing status to the latest `StreamEvent` for that stream.
+3. Divergent records are reported (not auto-corrected) so an operator can
+   decide whether to cancel the subscription in billing or open a wallet-signed
+   on-chain action. The adapter must not weaken wallet authorization to
+   "fix" divergence automatically.
+
+---
+
 ## SSE Broadcast Flow
 
 The SSE (Server-Sent Events) subsystem delivers real-time contract event
@@ -166,26 +233,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
