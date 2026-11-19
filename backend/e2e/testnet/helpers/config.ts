@@ -27,3 +27,99 @@ export function hasContract(): boolean {
 export function hasDatabase(): boolean {
   return Boolean(process.env.DATABASE_URL);
 }
+
+/**
+ * Deployment manifest describing a single contract/application release.
+ * A manifest must be reviewed and machine-validated before a version is
+ * promoted between testnet and production environments.
+ */
+export interface DeploymentManifest {
+  /** Target network the release is promoted to (e.g. "testnet", "public"). */
+  network: string;
+  /** Stellar network passphrase the target network expects. */
+  networkPassphrase: string;
+  /** Deployed contract ID (C...) the release points at. */
+  contractId: string;
+  /** SHA-256 digest of the built artifact (wasm/binary). */
+  artifactDigest: string;
+  /** Schema version the release expects to be compatible with. */
+  schemaVersion: number;
+}
+
+/**
+ * Expected values a manifest is validated against. Supplied by the promotion
+ * pipeline (target environment config) so mismatches are rejected up front.
+ */
+export interface ManifestExpectation {
+  network: string;
+  networkPassphrase: string;
+  contractId: string;
+  artifactDigest: string;
+  /** Highest schema version the target environment can consume. */
+  maxSchemaVersion: number;
+}
+
+const CONTRACT_ID_PATTERN = /^C[A-Z2-7]{55}$/;
+const DIGEST_PATTERN = /^[0-9a-f]{64}$/;
+
+export interface ManifestValidationResult {
+  ok: boolean;
+  errors: string[];
+}
+
+/**
+ * Validate a deployment manifest against the target environment before
+ * promotion. Checks network, contract ID, artifact digest, and schema
+ * compatibility. Returns every failure so reviewers see the full picture.
+ */
+export function validateDeploymentManifest(
+  manifest: DeploymentManifest,
+  expected: ManifestExpectation,
+): ManifestValidationResult {
+  const errors: string[] = [];
+
+  if (manifest.network !== expected.network) {
+    errors.push(`network mismatch: manifest "${manifest.network}" != expected "${expected.network}"`);
+  }
+
+  if (manifest.networkPassphrase !== expected.networkPassphrase) {
+    errors.push('network passphrase mismatch');
+  }
+
+  if (!CONTRACT_ID_PATTERN.test(manifest.contractId)) {
+    errors.push(`invalid contract ID format: "${manifest.contractId}"`);
+  } else if (manifest.contractId !== expected.contractId) {
+    errors.push(`contract ID mismatch: manifest "${manifest.contractId}" != expected "${expected.contractId}"`);
+  }
+
+  if (!DIGEST_PATTERN.test(manifest.artifactDigest)) {
+    errors.push(`invalid artifact digest format: "${manifest.artifactDigest}"`);
+  } else if (manifest.artifactDigest !== expected.artifactDigest) {
+    errors.push('artifact digest mismatch');
+  }
+
+  if (!Number.isInteger(manifest.schemaVersion) || manifest.schemaVersion < 1) {
+    errors.push(`invalid schema version: ${manifest.schemaVersion}`);
+  } else if (manifest.schemaVersion > expected.maxSchemaVersion) {
+    errors.push(
+      `incompatible schema version: manifest ${manifest.schemaVersion} > supported ${expected.maxSchemaVersion}`,
+    );
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+/**
+ * Gate a promotion on a validated manifest. Throws with the aggregated
+ * validation errors when the manifest is rejected so the pipeline halts
+ * before any network change is applied.
+ */
+export function assertPromotionAllowed(
+  manifest: DeploymentManifest,
+  expected: ManifestExpectation,
+): void {
+  const result = validateDeploymentManifest(manifest, expected);
+  if (!result.ok) {
+    throw new Error(`deployment manifest rejected:\n- ${result.errors.join('\n- ')}`);
+  }
+}

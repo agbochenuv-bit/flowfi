@@ -83,6 +83,43 @@ concrete IDs does not explode series cardinality.
 | DB pool contention | `flowfi_db_pool_waiting_requests > 0 for 2m` |
 | Quarantined events | `increase(flowfi_indexer_events_processed_total{result="quarantined"}[1h]) > 0` |
 
+## Rollback decision evidence
+
+A single liveness probe is not enough to justify a rollback. The rollback
+decision helper (`src/lib/rollbackDecision.ts`) aggregates four independent
+signals into one transparent recommendation. It **only recommends** — it never
+executes a rollback. Execution stays a human/operator action gated on the
+recommendation and the runbook.
+
+### Signals and thresholds
+
+| Signal | Source | Threshold | Owner |
+| --- | --- | --- | --- |
+| Health | `/health` probe result | `unhealthy` → rollback signal | Platform on-call |
+| Indexer lag | `flowfi_indexer_lag_ledgers` | `> 60` ledgers → rollback signal | Indexer owner |
+| Migration | latest migration status | `failed` / `pending` → rollback signal | Backend owner |
+| Error rate | `flowfi_http_requests_total{status=~"5.."}` ratio | `> 5%` over the window → rollback signal | Backend owner |
+
+### Recommendation rules
+
+- **rollback** — any *critical* signal (health unhealthy, migration failed) or
+  at least two degraded signals agree.
+- **hold** — exactly one degraded signal, or insufficient evidence.
+- **proceed** — all signals healthy.
+
+### Missing metrics
+
+A signal with no data is reported as `unknown`, never as healthy. If any signal
+is `unknown` the overall recommendation is at best `hold` (insufficient
+evidence) so a missing metric can never trigger a false-positive rollback.
+
+### Decision ownership
+
+The recommendation is advisory. The owning on-call engineer for the failing
+signal confirms the evidence and decides whether to execute the rollback per the
+runbook; the helper records which signals drove the recommendation so the
+decision is auditable.
+
 ## Grafana
 
 `grafana-dashboard.json` is an importable dashboard covering all of the above.

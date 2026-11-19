@@ -4,6 +4,11 @@
 # and deploys + initializes the contract on Stellar Testnet on demand (or on
 # Mainnet for release tags). The resulting contract ID is surfaced in the job
 # summary and published as a release artifact.
+#
+# Network promotion is gated on a reviewed deployment manifest
+# (deployment-manifest.json). Before any deploy, the manifest is validated for
+# network, contract ID, artifact digest, and schema compatibility. See
+# docs/deployment-manifest.md for approval responsibilities.
 name: Deploy Soroban Contracts
 
 on:
@@ -37,6 +42,8 @@ jobs:
 
     env:
       NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      MANIFEST_PATH: deployment-manifest.json
+      MANIFEST_SCHEMA_VERSION: "1"
 
     steps:
       - name: Checkout code
@@ -86,6 +93,56 @@ jobs:
             exit 1
           fi
           echo "WASM_WASM_PATH=$WASM" >> $GITHUB_ENV
+
+      - name: Validate Deployment Manifest
+        run: |
+          set -euo pipefail
+          WASM="$WASM_WASM_PATH"
+          MANIFEST="$MANIFEST_PATH"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: deployment manifest not found at $MANIFEST"
+            echo "A reviewed manifest is required to promote between networks."
+            exit 1
+          fi
+
+          # Schema compatibility: manifest must declare the supported schema version.
+          SCHEMA=$(jq -r '.schemaVersion // empty' "$MANIFEST")
+          if [ "$SCHEMA" != "$MANIFEST_SCHEMA_VERSION" ]; then
+            echo "ERROR: unsupported manifest schemaVersion '$SCHEMA' (expected '$MANIFEST_SCHEMA_VERSION')"
+            exit 1
+          fi
+
+          # Network: manifest must target the network being deployed.
+          MANIFEST_NETWORK=$(jq -r '.network // empty' "$MANIFEST")
+          if [ "$MANIFEST_NETWORK" != "$NETWORK" ]; then
+            echo "ERROR: manifest network '$MANIFEST_NETWORK' does not match target network '$NETWORK'"
+            exit 1
+          fi
+
+          # Contract ID: manifest must pin a contract ID for this network.
+          CONTRACT_ID=$(jq -r --arg net "$NETWORK" '.contracts[$net].contractId // empty' "$MANIFEST")
+          if [ -z "$CONTRACT_ID" ]; then
+            echo "ERROR: manifest missing contracts.$NETWORK.contractId"
+            exit 1
+          fi
+
+          # Artifact digest: manifest digest must match the built WASM.
+          EXPECTED_DIGEST=$(jq -r --arg net "$NETWORK" '.contracts[$net].artifactDigest // empty' "$MANIFEST")
+          if [ -z "$EXPECTED_DIGEST" ]; then
+            echo "ERROR: manifest missing contracts.$NETWORK.artifactDigest"
+            exit 1
+          fi
+          ACTUAL_DIGEST="sha256:$(sha256sum "$WASM" | awk '{print $1}')"
+          if [ "$EXPECTED_DIGEST" != "$ACTUAL_DIGEST" ]; then
+            echo "ERROR: artifact digest mismatch for $NETWORK"
+            echo "  expected: $EXPECTED_DIGEST"
+            echo "  actual:   $ACTUAL_DIGEST"
+            exit 1
+          fi
+
+          echo "Manifest validated for network '$NETWORK' (contract $CONTRACT_ID)"
+          echo "MANIFEST_CONTRACT_ID=$CONTRACT_ID" >> $GITHUB_ENV
 
       - name: Generate and attach CycloneDX SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3

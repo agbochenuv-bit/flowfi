@@ -12,6 +12,52 @@ const DEMO_SENDER_PUBLIC_KEY = 'GCM5WPR4DDR24FSAX5LIEM4J7AI3KOWJYANSXEPKYXCSZOTA
 const DEMO_RECIPIENT_PUBLIC_KEY = 'GBJCHUKZMTFSLOMNC7P4TS4VJJBTCYL3XKSOLXAUJSD56C4LHND5TWUC';
 const DEMO_TOKEN_ADDRESS = 'CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA';
 
+// Optional large-dataset seeding for validating database maintenance and bloat
+// monitoring metrics (issue #289). Disabled by default so normal seeds stay
+// fast; enable with SEED_LARGE_DATASET=true. This only inserts rows — it never
+// runs VACUUM, REINDEX, or any destructive maintenance automatically.
+const SEED_LARGE_DATASET = process.env.SEED_LARGE_DATASET === 'true';
+const LARGE_DATASET_EVENT_COUNT = Number.parseInt(
+    process.env.SEED_LARGE_DATASET_EVENT_COUNT ?? '5000',
+    10,
+);
+
+async function seedLargeDataset(streamId: number): Promise<void> {
+    const count = Number.isFinite(LARGE_DATASET_EVENT_COUNT) && LARGE_DATASET_EVENT_COUNT > 0
+        ? LARGE_DATASET_EVENT_COUNT
+        : 5000;
+
+    console.log(`Seeding large dataset: ${count} stream events...`);
+
+    const now = Math.floor(Date.now() / 1000);
+    const batchSize = 500;
+
+    for (let offset = 0; offset < count; offset += batchSize) {
+        const batch = Array.from(
+            { length: Math.min(batchSize, count - offset) },
+            (_, i) => {
+                const index = offset + i;
+                return {
+                    streamId,
+                    eventType: 'WITHDRAWN',
+                    amount: '1000000',
+                    transactionHash: `seed-large-${index.toString(16).padStart(56, '0')}`,
+                    ledgerSequence: 200000 + index,
+                    timestamp: now - index,
+                    metadata: JSON.stringify({ memo: 'Large dataset seed', index }),
+                };
+            },
+        );
+
+        await prisma.streamEvent.createMany({
+            data: batch,
+            skipDuplicates: true,
+        });
+    }
+
+    console.log(`Large dataset seeding finished (${count} events).`);
+}
+
 async function main() {
     console.log('Seeding database...');
 
@@ -77,6 +123,10 @@ async function main() {
     });
 
     console.log({ event1 });
+
+    if (SEED_LARGE_DATASET) {
+        await seedLargeDataset(stream1.streamId);
+    }
 
     console.log('Seeding finished.');
 }

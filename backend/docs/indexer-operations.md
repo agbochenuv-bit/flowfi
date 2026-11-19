@@ -3,10 +3,11 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, deployment configuration drift
+detection, the automated rollback decision evidence, and the indexer metrics.
+It is written for operators and on-call engineers. All public interfaces
+described here are additive; existing endpoints and configuration keys keep
+working unless noted.
 
 ---
 
@@ -167,37 +168,69 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+- **Fencing still applies.** A rep
 
 ---
 
-## 4. Metrics
+## 4. Automated rollback decision evidence
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+### Purpose
 
-| Metric | Type | Unit | Labels | Meaning |
+A single liveness probe is not sufficient evidence to decide whether a
+deployment should be rolled back. The indexer exposes a **rollback
+recommendation** that aggregates independent health signals into a
+transparent, auditable decision. The recommendation is **advisory only**: it
+never executes a rollback. Rollback execution remains an explicit,
+human-controlled action (see *Decision ownership* below).
+
+### Signals and thresholds
+
+Each signal is evaluated independently and reported with its observed value,
+the threshold it was compared against, and a per-signal verdict
+(`ok` / `warn` / `breach` / `unknown`).
+
+| Signal | Source | Warn | Breach | Notes |
 | --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+| `health` | Liveness/readiness probe | any non-`ok` readiness | probe failing for > 2 consecutive checks | Liveness alone never triggers a breach |
+| `indexerLag` | `head_ledger - cursor` | > 50 ledgers | > 200 ledgers | Lag is measured in ledgers, not wall-clock |
+| `migration` | Applied vs. expected migration set | pending non-destructive migration | failed or partially-applied migration | Unknown when the expected set cannot be read |
+| `errorRate` | Rolling error ratio over the window | > 2% | > 5% | Window is the configured evaluation interval |
+
+Thresholds are configuration-driven and documented alongside the code that
+evaluates them. Changing a threshold is a reviewed change; the recommendation
+reports the thresholds it used so a decision can be reconstructed later.
+
+### Recommendation
+
+- **`rollback`** — at least one signal is in `breach`, or two or more signals
+  are in `warn`.
+- **`hold`** — no breaches and fewer than two warnings; the deployment may
+  continue but should be watched.
+- **`insufficient_evidence`** — one or more required signals are `unknown`
+  (e.g., a metric could not be collected). A missing metric is **never**
+  treated as healthy or as a breach; it downgrades the recommendation to
+  `insufficient_evidence` so the decision is not made on partial data.
+
+Each recommendation includes the per-signal evidence that produced it, so an
+operator can see exactly which signal drove the outcome.
+
+### Decision ownership
+
+- The system **recommends**; it does not act. No automatic rollback is
+  triggered by any signal or by the aggregate recommendation.
+- The on-call engineer owns the rollback decision and records the
+  recommendation and evidence in the incident timeline when acting on it.
+- Rollback execution follows the documented rollout/rollback procedures in
+  this guide and remains an explicit operator action.
+
+### Failure and boundary cases
+
+- **False positive:** a transient readiness blip with healthy lag, migrations,
+  and error rate yields at most a `warn` on `health` and a `hold`
+  recommendation — not a rollback.
+- **Missing metric:** if any required signal cannot be collected, the
+  recommendation is `insufficient_evidence` rather than `hold` or `rollback`.
+- **Boundary:** a signal exactly at its threshold is treated as `warn`, not
+  `breach`; breach requires strictly exceeding the threshold.
+
+---

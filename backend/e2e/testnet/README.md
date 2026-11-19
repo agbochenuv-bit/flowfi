@@ -48,3 +48,47 @@ tests are skipped when `DATABASE_URL` is unset.
 | `E2E_MAX_P90_INCLUSION_FEE` | `100000` stroops |
 | `E2E_TX_TIMEOUT_MS` | `90000` |
 | `E2E_INDEXER_TIMEOUT_MS` | `120000` |
+
+## Network promotion & deployment manifest review
+
+Promoting a contract or application version from **testnet** to **production**
+requires a reviewed, machine-validated deployment manifest. Promotion is
+**blocked** unless the manifest passes every check below.
+
+### Manifest fields
+
+| Field | Validated against |
+| --- | --- |
+| `network` | Target environment (`testnet` → `production`); must match the promotion target exactly |
+| `contractId` | The deployed contract ID for the source environment |
+| `artifactDigest` | SHA-256 digest of the built WASM/artifact being promoted |
+| `schemaVersion` | Schema compatibility with the target environment's expected version |
+
+### Validation rules
+
+A promotion is rejected when any of the following hold:
+
+- **Network mismatch** — `manifest.network` does not equal the promotion target
+  (e.g. promoting a `testnet` manifest into `production`).
+- **Contract ID mismatch** — `manifest.contractId` differs from the contract ID
+  recorded for the source environment.
+- **Artifact digest mismatch** — `manifest.artifactDigest` does not match the
+  digest of the artifact being promoted (tampered or stale build).
+- **Schema incompatibility** — `manifest.schemaVersion` is not compatible with
+  the target environment's expected schema version.
+
+Each rejection surfaces a clear, actionable error naming the offending field so
+operators can correct the manifest before retrying.
+
+### Approval responsibilities
+
+- **Release author** — produces the manifest, ensures the artifact digest is
+  computed from the exact build being promoted, and opens the promotion PR.
+- **Reviewer (release owner)** — independently verifies the manifest fields
+  against the source environment and approves the promotion. A reviewer must
+  not approve their own manifest.
+- **On-call operator** — confirms the target environment is healthy and that
+  the schema version is compatible before the promotion is executed.
+
+Promotion must never bypass manifest validation, wallet authorization, or
+chain/network validation to force a release through.
