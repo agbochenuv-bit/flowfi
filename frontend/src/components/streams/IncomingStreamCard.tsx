@@ -100,12 +100,12 @@ export const IncomingStreamCard = React.memo(function IncomingStreamCard({
         </div>
         <div className="col-span-2 rounded-[1.5rem] bg-gradient-to-r from-emerald-500/12 to-sky-500/10 p-4">
           <p className="text-xs uppercase tracking-[0.16em] text-slate-500 dark:text-slate-400">
-            Claimable amount
+            Estimated claimable
           </p>
           <p className="mt-2 text-2xl font-semibold text-slate-900 dark:text-slate-100">
             {formatTokenAmount(claimable)} {stream.token}
           </p>
-          <LiveValue value={`${formatTokenAmount(claimable)} ${stream.token}`} prefix="Claimable amount" />
+          <LiveValue value={`${formatTokenAmount(claimable)} ${stream.token}`} prefix="Estimated claimable" />
           <p className="mt-1 text-sm text-slate-600 dark:text-slate-400">
             Stream #{stream.streamId}
           </p>
@@ -118,7 +118,7 @@ export const IncomingStreamCard = React.memo(function IncomingStreamCard({
             ? "Withdrawals resume once the stream is active again."
             : stream.status === "Completed"
               ? "This stream has finished accruing."
-              : "Available balance updates in real time."}
+              : "The final withdrawal amount is determined on-chain."}
         </div>
         <Button
           onClick={() => setReviewOpen(true)}

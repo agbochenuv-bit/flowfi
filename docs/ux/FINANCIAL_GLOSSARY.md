@@ -1,0 +1,17 @@
+# Financial language and risk disclosures
+
+| Term | Meaning and source | Caveat |
+| --- | --- | --- |
+| Streamed | Tokens accrued under the stream schedule through a stated time. Use the [contract's accrual and settlement rules](../../contracts/stream_contract/src/lib.rs) for the relevant stream type. | Funding alone does not accrue tokens. Accrual can depend on time, pauses, cliffs, milestones, and cancellation. A streamed amount can include tokens already withdrawn. |
+| Claimable | Accrued tokens available for the recipient to withdraw at the evaluation time. The [claimable endpoint](../../backend/src/controllers/stream.controller.ts) uses indexed state and server-side calculation, or reports `source: "chain"` for its RPC fallback. The browser can also [project](../../frontend/src/hooks/useStreamingAmount.ts) this amount from fetched state. | Label the browser projection as an estimate. Even a chain quote can change before execution. The contract determines what is actually withdrawable when the transaction executes. |
+| Deposited | Funding recorded for the stream, including applied top-ups. Stream details read the indexed `depositedAmount` from the [stream API](../api/README.md). | This is a funding total, not the remaining escrow balance or the amount earned. |
+| Withdrawn | Total recorded as withdrawn by the recipient. Stream details read the indexed `withdrawnAmount` from the stream API. | Indexing can lag the transaction. A sender refund is separate from a recipient withdrawal. |
+| Estimated | A projection or conversion, such as browser-calculated claimable tokens or USD valued using a current market quote. | State the basis for the estimate. When no price is available, show USD as unavailable. A current quote cannot establish historical value. |
+| Finalized | A specific transaction succeeded in a closed ledger on the intended network. Use the network's RPC transaction result and record the hash and ledger. | Wallet signing, submission, simulation, and an indexer receipt alone do not establish finality. A finalized transaction can still be absent from an indexer view. |
+| Stale | A value whose underlying snapshot no longer meets the surface's freshness expectation. The claimable endpoint checks the indexed row's `updatedAt` and attempts RPC for stale state. | A failed RPC lookup can leave the endpoint serving a calculation from the older row. `calculatedAt` describes the evaluation time, while `cached` and `cachedAt` describe the calculation cache. Neither guarantees current chain state. Show the last known update or advise refreshing when freshness is uncertain. |
+
+## Surface usage
+
+The [stream details and receipt](../../frontend/src/app/streams/%5Bid%5D/stream-details-content.tsx) label indexed funding as Deposited, transfers as Withdrawn, and the browser projection as Estimated claimable. On the [dashboard details modal](../../frontend/src/components/dashboard/StreamDetailsModal.tsx), the progress ratio is withdrawn divided by deposited. The [incoming card](../../frontend/src/components/streams/IncomingStreamCard.tsx) also uses a browser projection. Review dialogs show a token estimate before signing. Check the actual token amount in the successful on-chain withdrawal.
+
+API field names and formats stay compatible. Keep exact amounts in token base units across API boundaries and format for display using the appropriate token precision. When an amount has uncertain freshness, refresh or verify on the intended network before relying on it.

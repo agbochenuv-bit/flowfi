@@ -542,12 +542,12 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                 : stream.startTime)) * 1000).toLocaleString()}
             />
             <ReceiptRow
-              label="Total streamed"
-              value={`${formatAmount(deposited, 7)} ${tokenSymbol} (${formatFiatAmount(convertToFiat(deposited, tokenPrice?.priceUSD ?? 0))})`}
+              label="Deposited"
+              value={`${formatAmount(deposited, 7)} ${tokenSymbol} (${tokenPrice ? formatFiatAmount(convertToFiat(deposited, tokenPrice.priceUSD)) : "USD unavailable"})`}
             />
             <ReceiptRow
               label="Withdrawn"
-              value={`${formatAmount(withdrawn, 7)} ${tokenSymbol} (${formatFiatAmount(convertToFiat(withdrawn, tokenPrice?.priceUSD ?? 0))})`}
+              value={`${formatAmount(withdrawn, 7)} ${tokenSymbol} (${tokenPrice ? formatFiatAmount(convertToFiat(withdrawn, tokenPrice.priceUSD)) : "USD unavailable"})`}
             />
             <ReceiptRow label="Token contract" value={stream.tokenAddress} />
           </dl>
@@ -557,7 +557,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
         {/* Financial Overview */}
         <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <StatCard
-            label="Total Deposited"
+            label="Deposited"
             value={`${formatAmount(deposited, 7)} ${tokenSymbol}`}
           />
           <StatCard
@@ -565,7 +565,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
             value={`${formatAmount(withdrawn, 7)} ${tokenSymbol}`}
           />
           <StatCard
-            label="Claimable"
+            label="Estimated claimable"
             value={`${formatAmount(liveClaimable, 7)} ${tokenSymbol}`}
             highlight
             live

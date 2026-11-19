@@ -89,7 +89,7 @@ export const StreamDetailsModal: React.FC<StreamDetailsModalProps> = ({
                         </div>
 
                         <div className="p-6 rounded-2xl border border-glass-border bg-gradient-to-br from-white/5 to-transparent">
-                            <label className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-4 block">Streaming Progress</label>
+                            <label className="text-xs uppercase tracking-widest text-slate-500 font-bold mb-4 block">Withdrawal progress</label>
 
                             <div className="flex justify-between items-end mb-2">
                                 <span className="text-2xl font-black text-white">{stream.withdrawn}</span>
@@ -104,7 +104,7 @@ export const StreamDetailsModal: React.FC<StreamDetailsModalProps> = ({
                             </div>
 
                             <p className="text-sm text-slate-400">
-                                {remaining} {stream.token} remaining to be streamed
+                                {remaining} {stream.token} deposited minus withdrawn
                             </p>
                         </div>
                     </div>
