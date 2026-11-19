@@ -83,6 +83,22 @@ jobs:
         run: bash ./scripts/check-bundle-size.sh
         working-directory: frontend
 
+  wallet-compatibility:
+    name: Wallet browser compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.2"
+          cache: npm
+      - run: npm ci --include=optional
+      - run: npm exec --workspace=frontend -- playwright install --with-deps chromium firefox
+      - run: npm run test:e2e:wallet --workspace=frontend
+
   backend:
     name: Backend CI
     runs-on: ubuntu-latest

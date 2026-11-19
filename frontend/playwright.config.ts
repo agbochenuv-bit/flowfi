@@ -6,6 +6,7 @@ const RPC_PORT = Number(process.env.MOCK_RPC_PORT || 3102);
 
 export default defineConfig({
   testDir: "./e2e",
+  testIgnore: "**/wallet-compat/**",
   globalSetup: "./e2e/global-setup.ts",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

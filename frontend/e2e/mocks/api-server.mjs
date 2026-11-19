@@ -3,7 +3,7 @@ import https from "node:https";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { xdr, Keypair, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
+import { xdr, Account, Keypair, TransactionBuilder, Networks } from "@stellar/stellar-sdk";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CERT_DIR = path.join(__dirname, "..", ".e2e-certs");
@@ -98,13 +98,14 @@ function accountEntryXdr(publicKey, seq) {
   const accountEntry = new xdr.AccountEntry({
     accountId: kp.xdrAccountId(),
     balance: xdr.Int64.fromString("0"),
-    seqNum: new xdr.SequenceNumber(xdr.Int64.fromString(String(seq))),
+    seqNum: xdr.Int64.fromString(String(seq)),
     numSubEntries: 0,
+    inflationDest: null,
     flags: 0,
     homeDomain: "",
     thresholds: new Uint8Array(4),
     signers: [],
-    ext: new xdr.AccountEntryExt(0),
+    ext: xdr.AccountEntryExt.v0(),
   });
   return xdr.LedgerEntryData.account(accountEntry);
 }
@@ -124,8 +125,8 @@ function sorobanTransactionDataBase64() {
   });
   const data = new xdr.SorobanTransactionData({
     resources,
-    resourceFee: 0n,
-    ext: new xdr.SorobanTransactionDataExt(0),
+    resourceFee: xdr.Int64.fromString("0"),
+    ext: xdr.SorobanTransactionDataExt.v0(),
   });
   return data.toXDR("base64");
 }
@@ -246,17 +247,17 @@ function successTxResultBase64() {
   return new xdr.TransactionResult({
     feeCharged: xdr.Int64.fromString("0"),
     result: xdr.TransactionResultResult.txSuccess([]),
-    ext: new xdr.TransactionResultExt(0),
+    ext: xdr.TransactionResultExt.v0(),
   }).toXDR("base64");
 }
 
 function zeroTxMetaBase64() {
-  return new xdr.TransactionMeta(0, []).toXDR("base64");
+  return xdr.TransactionMeta.operations([]).toXDR("base64");
 }
 
 function dummyEnvelopeBase64() {
   return new TransactionBuilder(
-    Keypair.fromPublicKey(SESSION_PUBLIC_KEY),
+    new Account(SESSION_PUBLIC_KEY, "1"),
     { fee: "1", networkPassphrase: Networks.TESTNET },
   )
     .setTimeout(30)
@@ -380,15 +381,16 @@ server.listen(PORT, "0.0.0.0", () => {
   console.log(`[mock-api] rest+sse listening on http://localhost:${PORT}`);
 });
 
-if (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH)) {
-  console.error("[mock-api] missing TLS certs — run the pw global-setup first (playwright install)");
+const useHttp = process.env.MOCK_RPC_HTTP === "1";
+if (!useHttp && (!fs.existsSync(CERT_PATH) || !fs.existsSync(KEY_PATH))) {
+  console.error("[mock-api] missing TLS certs");
   process.exit(1);
 }
 
-const rpcServer = https.createServer(
+const rpcServer = useHttp ? http.createServer(handleRpc) : https.createServer(
   { cert: fs.readFileSync(CERT_PATH), key: fs.readFileSync(KEY_PATH) },
   handleRpc,
 );
-rpcServer.listen(RPC_PORT, "0.0.0.0", () => {
-  console.log(`[mock-api] soroban rpc listening on https://localhost:${RPC_PORT}`);
+rpcServer.listen(RPC_PORT, "127.0.0.1", () => {
+  console.log(`[mock-api] soroban rpc listening on port ${RPC_PORT}`);
 });

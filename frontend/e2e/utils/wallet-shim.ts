@@ -3,6 +3,7 @@ import { WALLET_PUBLIC_KEY, SESSION_STORAGE_KEY } from "./freighter";
 
 export interface WalletShimOptions {
   address?: string;
+  version?: "legacy" | "current";
   network?: "TESTNET" | "PUBLIC" | "FUTURENET";
   rejectSignature?: boolean;
   signatureDelayMs?: number;
@@ -29,7 +30,8 @@ export function buildWalletShimScript(options: WalletShimOptions = {}): string {
       const signatureDelayMs = ${JSON.stringify(signatureDelayMs)};
       const rejectConnection = ${JSON.stringify(rejectConnection)};
 
-      window.freighter = { version: "controlled-shim" };
+      const version = ${JSON.stringify(options.version ?? "current")};
+      window.freighter = { version };
 
       const respond = (messageId, payload) => {
         window.postMessage(
@@ -37,8 +39,9 @@ export function buildWalletShimScript(options: WalletShimOptions = {}): string {
             source: "FREIGHTER_EXTERNAL_MSG_RESPONSE",
             messagedId: messageId,
             extensionName: "FREIGHTER",
-            apiVersion: 1,
+            ...(version === "current" ? { apiVersion: 1 } : {}),
             ...payload,
+            ...(payload.error ? { apiError: payload.error } : {}),
           },
           window.location.origin,
         );
@@ -70,8 +73,11 @@ export function buildWalletShimScript(options: WalletShimOptions = {}): string {
             respond(data.messageId, { isAllowed: !rejectConnection });
             break;
 
+          case "REQUEST_NETWORK":
           case "REQUEST_NETWORK_DETAILS":
             respond(data.messageId, {
+              network,
+              networkPassphrase: network === "PUBLIC" ? "Public Global Stellar Network ; September 2015" : "Test SDF Network ; September 2015",
               networkDetails: {
                 network: network,
                 networkName: network === "PUBLIC" ? "Stellar Mainnet" : "SDF Test Network",
