@@ -1,0 +1,147 @@
+name: Dependency compatibility
+
+on:
+  schedule:
+    - cron: "41 6 * * 2"
+  workflow_dispatch:
+    inputs:
+      npm_candidate:
+        description: "Optional exact frontend dependency candidate (name@version)"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: ${{ matrix.project }} / ${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [application, sdk]
+        lane: [baseline, candidate]
+    services:
+      postgres:
+        image: postgres:16-alpine@sha256:e013e867e712fec275706a6c51c966f0bb0c93cfa8f51000f85a15f9865a28cb
+        env:
+          POSTGRES_PASSWORD: flowfi_ci_password
+          POSTGRES_DB: flowfi_test
+        ports: ["5432:5432"]
+        options: --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:flowfi_ci_password@127.0.0.1:5432/flowfi_test
+      PROJECT: ${{ matrix.project }}
+      EXACT_CANDIDATE: ${{ inputs.npm_candidate }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24.22.2"
+      - run: node --test scripts/dependency-report.test.mjs
+      - name: Resolve and record inputs
+        shell: bash
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          set -euo pipefail
+          report="$RUNNER_TEMP/dependency-inputs"
+          mkdir -p "$report"
+          printf 'Source %s, Node %s, npm %s\n\n' "$GITHUB_SHA" "$(node -v)" "$(npm -v)" | tee "$report/toolchain.txt" >> "$GITHUB_STEP_SUMMARY"
+          if [[ $PROJECT == sdk ]]; then cd packages/flowfi-sdk; fi
+          cp package-lock.json "$report/baseline-lock.json"
+          if [[ $LANE == candidate ]]; then
+            if [[ $PROJECT == application && -n $EXACT_CANDIDATE ]]; then
+              [[ $EXACT_CANDIDATE =~ ^(@[a-z0-9._-]+/)?[a-z0-9._-]+@[0-9]+\.[0-9]+\.[0-9]+$ ]]
+              npm install --workspace=frontend --package-lock-only --ignore-scripts --save-exact "$EXACT_CANDIDATE"
+            else
+              npm update --package-lock-only --ignore-scripts
+            fi
+          fi
+          cp package.json package-lock.json "$report/"
+          if [[ $PROJECT == application ]]; then
+            cp --parents backend/package.json frontend/package.json "$report/"
+          fi
+          node "$GITHUB_WORKSPACE/scripts/dependency-report.mjs" "$report/baseline-lock.json" package-lock.json > "$report/changes.md"
+          head -100 "$report/changes.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install exact dependency snapshot
+        run: |
+          if [[ $PROJECT == sdk ]]; then cd packages/flowfi-sdk; fi
+          npm ci --include=optional
+      - name: Backend compatibility
+        if: matrix.project == 'application'
+        working-directory: backend
+        run: |
+          result=0
+          npx prisma db push || result=1
+          npm run build || result=1
+          npm test || result=1
+          exit "$result"
+      - name: Frontend compatibility
+        if: always() && matrix.project == 'application'
+        working-directory: frontend
+        run: |
+          result=0
+          npm run lint || result=1
+          npm test || result=1
+          npm run build || result=1
+          exit "$result"
+      - name: SDK compatibility
+        if: matrix.project == 'sdk'
+        working-directory: packages/flowfi-sdk
+        run: |
+          result=0
+          npm run build || result=1
+          npm test || result=1
+          exit "$result"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: ${{ matrix.project }}-${{ matrix.lane }}-inputs
+          path: ${{ runner.temp }}/dependency-inputs/
+
+  contracts:
+    name: Contracts / ${{ matrix.lane }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [baseline, candidate]
+    defaults:
+      run:
+        working-directory: contracts
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec
+        with:
+          toolchain: "1.100.0"
+          targets: wasm32v1-none
+          components: clippy
+      - name: Resolve and record inputs
+        env:
+          LANE: ${{ matrix.lane }}
+        run: |
+          report="$RUNNER_TEMP/dependency-inputs"
+          mkdir -p "$report"
+          rustc --version | tee "$report/toolchain.txt" >> "$GITHUB_STEP_SUMMARY"
+          cp Cargo.lock "$report/baseline.lock"
+          if [[ $LANE == candidate ]]; then cargo update; fi
+          cp Cargo.lock "$report/"
+          git diff --stat -- Cargo.lock >> "$GITHUB_STEP_SUMMARY"
+          git diff -- Cargo.lock > "$report/changes.diff"
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --release --target wasm32v1-none
+        if: always()
+      - run: cargo test --locked
+        if: always()
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: contracts-${{ matrix.lane }}-inputs
+          path: ${{ runner.temp }}/dependency-inputs/
