@@ -163,62 +163,20 @@ jobs:
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
-  backend-docker:
-    name: Backend Docker Image CI
+  runtime-images:
+    name: Runtime images
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
-      - name: Checkout code
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "20"
-          cache: "npm"
-          cache-dependency-path: package-lock.json
-
-      - name: Install dependencies
-        run: npm ci --include=optional
-
-      - name: Check changed files
-        id: filter
-        uses: dorny/paths-filter@15192bc058cc28a13dbf6cde61f19e18988b7af6 # v3
-        with:
-          filters: |
-            backend:
-              - 'backend/**'
-              - 'docker-compose.yml'
-
-      - name: Build Docker Image
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: docker build -f backend/Dockerfile backend -t flowfi-backend:test
-
-      - name: Docker Compose Build
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: docker compose build
-
-      - name: Boot and Check Health
-        if: steps.filter.outputs.backend == 'true' || github.event_name == 'push'
-        run: |
-          docker compose up -d postgres
-          sleep 10
-          DATABASE_URL=postgresql://flowfi:flowfi_dev_password@127.0.0.1:5433/flowfi \
-            npm exec --workspace=backend -- prisma db push --accept-data-loss --schema=prisma/schema.prisma
-          docker compose up -d backend
-          # Poll /health instead of a fixed sleep so cold-boot / Prisma-warmup
-          # latency does not flake the Backend Docker Image CI.
-          for i in $(seq 1 60); do
-            if curl --silent --fail --max-time 2 --connect-timeout 1 http://localhost:3001/health; then
-              echo "Backend health check passed after ${i}s"
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "Backend health check did not pass within 60s"
-          docker compose logs backend
-          exit 1
+          node-version: "26"
+          cache: npm
+      - run: npm ci --include=optional
+      - run: bash scripts/check-runtime-images.sh
 
   contracts:
     name: Soroban Contracts CI

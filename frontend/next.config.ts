@@ -3,6 +3,7 @@ import type { NextConfig } from "next";
 import { getSecurityHeaders } from "./src/lib/security-headers";
 
 const nextConfig: NextConfig = {
+  ...(process.env.FLOWFI_STANDALONE === "1" ? { output: "standalone", outputFileTracingRoot: path.resolve("..") } : {}),
   // The workspace root lives one level above this directory. Pinning it here
   // prevents Turbopack from inferring a wrong root when stray package-lock
   // files exist outside the repo (e.g. ~/package-lock.json).

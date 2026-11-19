@@ -64,7 +64,7 @@ jobs:
           DATABASE_URL: postgresql://postgres:password@127.0.0.1:5432/flowfi_preview
 
       - name: Build backend preview image
-        run: docker build -f backend/Dockerfile backend -t "flowfi-backend:pr-${PR_NUMBER}"
+        run: docker build -f backend/Dockerfile . -t "flowfi-backend:pr-${PR_NUMBER}"
 
       - name: Build frontend preview
         run: npm run build --workspace=frontend

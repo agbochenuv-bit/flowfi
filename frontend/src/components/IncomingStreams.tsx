@@ -679,7 +679,6 @@ const IncomingStreams: React.FC<IncomingStreamsProps> = ({
                     </div>
                 </div>
             )}
-            )}
         </div>
     );
 };

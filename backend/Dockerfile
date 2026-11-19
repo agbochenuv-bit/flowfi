@@ -1,38 +1,25 @@
-FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS builder
-
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS dependencies
 WORKDIR /app
+COPY package.json package-lock.json ./
+COPY backend/package.json backend/
+COPY frontend/package.json frontend/
 
-# Copy the prisma directory up front so that (a) any future postinstall
-# hook from @prisma/client sees the schema, and (b) the prebuild script
-# `prisma generate` fired by `npm run build` below can find it. Doing
-# the layout this way means the only required write is the generated
-# client under src/generated/prisma, which is already covered by the
-# later `COPY src ./src` step below + the runner-stage copy.
-COPY package*.json ./
-COPY prisma ./prisma
+FROM dependencies AS build
+RUN npm ci --workspace=backend --include=optional
+COPY backend backend
+WORKDIR /app/backend
+RUN npm run build -- --project tsconfig.build.json
 
-RUN npm install
+FROM dependencies AS production
+RUN npm ci --workspace=backend --omit=dev --ignore-scripts
 
-COPY tsconfig.json ./
-COPY prisma.config.ts ./
-COPY src ./src
-
-RUN npm run build
-
-FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS runner
-
-WORKDIR /app
-
+FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS runtime
+WORKDIR /app/backend
 ENV NODE_ENV=production
-
-COPY package*.json ./
-RUN npm install --omit=dev --ignore-scripts
-
-COPY --from=builder /app/dist ./dist
-COPY --from=builder /app/src/generated ./dist/generated
-
-EXPOSE 3001
-
+COPY --from=production /app/node_modules /app/node_modules
+COPY --from=production /app/backend /app/backend
+COPY --from=build /app/backend/dist ./dist
 USER node
-
+EXPOSE 3001
+HEALTHCHECK CMD node -e 'fetch("http://127.0.0.1:" + (process.env.PORT || 3001) + "/health").then(r => process.exit(r.ok ? 0 : 1), () => process.exit(1))'
 CMD ["node", "dist/index.js"]

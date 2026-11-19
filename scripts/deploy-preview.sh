@@ -130,7 +130,7 @@ deploy_backend() {
   fi
 
   echo "FLY_API_TOKEN not set — validating docker image locally instead of live deploy."
-  docker build -f "${ROOT}/backend/Dockerfile" "${ROOT}/backend" -t "flowfi-backend:pr-${PR}"
+  docker build -f "${ROOT}/backend/Dockerfile" "${ROOT}" -t "flowfi-backend:pr-${PR}"
   echo "preview_url=https://pr-${PR}.flowfi-preview.local (CI-validated image; live deploy skipped without FLY_API_TOKEN)"
 }
 
