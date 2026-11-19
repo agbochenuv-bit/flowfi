@@ -55,6 +55,9 @@ jobs:
       - name: Install dependencies
         run: npm ci --include=optional
 
+      - name: Verify partner webhook sample
+        run: node --test docs/api/examples/verify-webhook.test.mjs
+
       - name: Lint
         run: npm run lint
         working-directory: frontend

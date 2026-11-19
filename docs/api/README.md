@@ -9,3 +9,5 @@ This directory contains hand-maintained Postman/Hoppscotch collections for explo
 1. Update the `@openapi` annotations on the affected route/controller first.
 2. Re-check the endpoints in this directory's collections against `http://localhost:3001/api-docs.json` and update paths, methods, and bodies to match.
 3. If a collection and the Swagger spec ever disagree, the Swagger spec wins.
+
+For external integrations, follow the [partner onboarding and go-live checklist](PARTNER_ONBOARDING.md).
