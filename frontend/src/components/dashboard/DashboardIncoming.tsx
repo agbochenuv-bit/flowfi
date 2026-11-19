@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import IncomingStreams from "../IncomingStreams";
 import type { Stream } from "@/lib/dashboard";
 import { BatchClaimDrawer } from "./BatchClaimDrawer";
@@ -6,6 +6,11 @@ import { ShareAddressModal } from "./ShareAddressModal";
 import { Share2, Waves } from "lucide-react";
 import { Button } from "../ui/Button";
 import { useWallet } from "@/context/wallet-context";
+import {
+  summarizeIncomingObligations,
+  formatExposureAmount,
+  type ExposureSourceMeta,
+} from "@/lib/portfolio-exposure";
 
 interface DashboardIncomingProps {
   incomingStreams: Stream[];
@@ -17,6 +22,8 @@ interface DashboardIncomingProps {
   onBatchClaimSuccess?: () => Promise<void> | void;
   /** Stream highlighted by keyboard navigation (j/k). */
   selectedStreamId?: string | null;
+  /** Indexer/source metadata used to timestamp the expected-payments summary. */
+  sourceMeta?: ExposureSourceMeta;
 }
 
 export function DashboardIncoming({
@@ -26,10 +33,16 @@ export function DashboardIncoming({
   onOpenBatchClaim,
   onBatchClaimSuccess,
   selectedStreamId = null,
+  sourceMeta,
 }: DashboardIncomingProps) {
   const { session } = useWallet();
   const [showBatchClaim, setShowBatchClaim] = useState(false);
   const [showShareModal, setShowShareModal] = useState(false);
+
+  const obligations = useMemo(
+    () => summarizeIncomingObligations(incomingStreams, sourceMeta),
+    [incomingStreams, sourceMeta]
+  );
 
   const claimableCount = incomingStreams.filter(
     (stream) => stream.isActive && stream.status === "Active" && stream.deposited > stream.withdrawn
@@ -181,6 +194,63 @@ export function DashboardIncoming({
 
   return (
     <div className="mt-8">
+      <div className="mb-4 rounded-lg border border-white/10 bg-white/5 p-4">
+        <div className="flex flex-wrap items-baseline justify-between gap-2">
+          <h3 className="text-sm font-semibold text-slate-200">
+            Expected incoming payments
+          </h3>
+          <span className="text-xs text-slate-400">
+            {obligations.sourceTimestamp
+              ? `Source updated ${new Date(obligations.sourceTimestamp).toLocaleString()}`
+              : "Source timestamp unavailable"}
+            {obligations.isStale && (
+              <span className="ml-2 rounded bg-amber-500/20 px-2 py-0.5 text-amber-300">
+                Stale data
+              </span>
+            )}
+          </span>
+        </div>
+        <dl className="mt-3 grid grid-cols-2 gap-3 text-sm md:grid-cols-4">
+          <div>
+            <dt className="text-xs text-slate-400">Total expected</dt>
+            <dd className="font-semibold text-slate-100">
+              {formatExposureAmount(obligations.totalExpected)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-400">Claimable now</dt>
+            <dd className="font-semibold text-slate-100">
+              {formatExposureAmount(obligations.claimable)}
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-400">Paused streams</dt>
+            <dd className="font-semibold text-slate-100">
+              {obligations.pausedCount} ({formatExposureAmount(obligations.pausedExpected)})
+            </dd>
+          </div>
+          <div>
+            <dt className="text-xs text-slate-400">Active streams</dt>
+            <dd className="font-semibold text-slate-100">{obligations.activeCount}</dd>
+          </div>
+        </dl>
+        {obligations.byAsset.length > 0 && (
+          <ul className="mt-3 flex flex-wrap gap-2 text-xs text-slate-300">
+            {obligations.byAsset.map((entry) => (
+              <li
+                key={entry.asset}
+                className="rounded bg-white/5 px-2 py-1"
+              >
+                {entry.asset}: {formatExposureAmount(entry.expected)}
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="mt-3 text-xs text-slate-500">
+          Estimates are derived from streamed balances at the source timestamp and may
+          differ from on-chain values. Paused streams are included but not claimable.
+        </p>
+      </div>
       {claimableCount >= 2 && (
         <button
           type="button"

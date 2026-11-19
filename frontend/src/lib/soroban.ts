@@ -51,6 +51,155 @@ export type TransactionStage =
   | "submitted"
   | "confirming";
 
+export type SimulationStatus = "success" | "failed" | "unavailable";
+
+export type CongestionLevel = "low" | "moderate" | "high" | "unknown";
+
+/**
+ * A pre-signing cost estimate. `available: false` means the RPC could not be
+ * reached or returned an unusable response — callers must show this explicitly
+ * rather than falling back to a guessed fee.
+ */
+export interface TransactionCostEstimate {
+  available: boolean;
+  /** Total fee in stroops (base fee + resource fee), when available. */
+  feeStroops: bigint | null;
+  /** Total fee in XLM as a display string, when available. */
+  feeXlm: string | null;
+  simulationStatus: SimulationStatus;
+  congestionLevel: CongestionLevel;
+  /** Epoch ms when the estimate was fetched. */
+  fetchedAt: number;
+  /** True when the estimate is older than the staleness threshold. */
+  stale: boolean;
+  /** Human-readable reason when `available` is false. */
+  unavailableReason?: string;
+}
+
+/** Estimates older than this are flagged stale and should be refreshed. */
+export const FEE_ESTIMATE_STALE_MS = 30_000;
+
+const STROOPS_PER_XLM = 10_000_000n;
+
+export function isEstimateStale(
+  fetchedAt: number,
+  now: number = Date.now(),
+  thresholdMs: number = FEE_ESTIMATE_STALE_MS,
+): boolean {
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0) return true;
+  return now - fetchedAt > thresholdMs;
+}
+
+function unavailableEstimate(
+  reason: string,
+  simulationStatus: SimulationStatus = "unavailable",
+  fetchedAt: number = Date.now(),
+): TransactionCostEstimate {
+  return {
+    available: false,
+    feeStroops: null,
+    feeXlm: null,
+    simulationStatus,
+    congestionLevel: "unknown",
+    fetchedAt,
+    stale: false,
+    unavailableReason: reason,
+  };
+}
+
+function toBigIntFee(value: unknown): bigint | null {
+  if (typeof value === "bigint") return value >= 0n ? value : null;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) {
+    return BigInt(Math.trunc(value));
+  }
+  if (typeof value === "string" && /^\d+$/.test(value)) return BigInt(value);
+  return null;
+}
+
+function formatStroopsAsXlm(stroops: bigint): string {
+  const whole = stroops / STROOPS_PER_XLM;
+  const frac = (stroops % STROOPS_PER_XLM).toString().padStart(7, "0").replace(/0+$/, "");
+  return frac.length > 0 ? `${whole}.${frac}` : whole.toString();
+}
+
+/**
+ * Maps a fee level (in stroops) to a coarse congestion bucket. Thresholds are
+ * deliberately wide to avoid implying false precision.
+ */
+export function congestionFromFee(feeStroops: bigint | null): CongestionLevel {
+  if (feeStroops === null) return "unknown";
+  if (feeStroops <= 1_000n) return "low";
+  if (feeStroops <= 10_000n) return "moderate";
+  return "high";
+}
+
+export interface TransactionCostEstimateParams {
+  /** The unsigned transaction to simulate (built by the caller). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  transaction: any;
+  /** Override the staleness threshold (ms). */
+  staleThresholdMs?: number;
+}
+
+/**
+ * Fetches the current fee estimate and simulation status for a prepared
+ * transaction. Never throws: RPC failures produce an explicit unavailable
+ * result so the UI can label the data instead of guessing.
+ */
+export async function getTransactionCostEstimate(
+  params: TransactionCostEstimateParams,
+): Promise<TransactionCostEstimate> {
+  const fetchedAt = Date.now();
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sdk: any = await import("@stellar/stellar-sdk");
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rpc: any = sdk.rpc ?? sdk.SorobanRpc;
+
+    const config = activeNetworkConfig();
+    const server = new rpc.Server(config.rpcUrl, { allowHttp: config.id === "sandbox" });
+
+    const simResult = await server.simulateTransaction(params.transaction);
+    const isError = rpc.Api?.isSimulationError?.(simResult) ?? Boolean(simResult?.error);
+
+    if (isError) {
+      const message: string =
+        typeof simResult?.error === "string" ? simResult.error : (simResult?.error?.message ?? "unknown error");
+      return {
+        ...unavailableEstimate(`Simulation failed: ${message}`, "failed", fetchedAt),
+        stale: isEstimateStale(fetchedAt, Date.now(), params.staleThresholdMs),
+      };
+    }
+
+    const minResourceFee = toBigIntFee(simResult?.minResourceFee);
+    const baseFee = toBigIntFee(simResult?.transactionData?.resourceFee);
+    const feeStroops = minResourceFee ?? baseFee;
+
+    if (feeStroops === null) {
+      return {
+        ...unavailableEstimate("Fee estimate was not returned by the network.", "success", fetchedAt),
+        stale: isEstimateStale(fetchedAt, Date.now(), params.staleThresholdMs),
+      };
+    }
+
+    return {
+      available: true,
+      feeStroops,
+      feeXlm: formatStroopsAsXlm(feeStroops),
+      simulationStatus: "success",
+      congestionLevel: congestionFromFee(feeStroops),
+      fetchedAt,
+      stale: isEstimateStale(fetchedAt, Date.now(), params.staleThresholdMs),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "RPC unavailable";
+    return {
+      ...unavailableEstimate(`Unable to fetch fee estimate: ${message}`, "unavailable", fetchedAt),
+      stale: isEstimateStale(fetchedAt, Date.now(), params.staleThresholdMs),
+    };
+  }
+}
+
 export type TransactionStageCallback = (
   stage: TransactionStage,
   txHash?: string,

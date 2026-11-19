@@ -46,3 +46,101 @@ export function estimateRunwayDate(streams: ProjectionStream[], now = new Date()
 export function getCliffDates(streams: ProjectionStream[]): Date[] {
   return streams.flatMap((stream) => (stream.cliffDates ?? []).map((timestamp) => new Date(timestamp * 1000))).sort((a, b) => a.getTime() - b.getTime());
 }
+
+/** Default age (ms) after which indexer-sourced stream data is considered stale. */
+export const DEFAULT_STALE_THRESHOLD_MS = 5 * 60 * 1000;
+
+export interface PortfolioTokenExposure {
+  token: string;
+  /** Remaining (deposited - withdrawn) on active, non-paused outgoing streams. */
+  outgoingLiability: number;
+  /** Remaining (deposited - withdrawn) on active, non-paused incoming streams. */
+  incomingExpected: number;
+  /** Remaining on paused streams, reported but excluded from accruing obligations. */
+  pausedOutgoing: number;
+  pausedIncoming: number;
+  /** Share of total remaining exposure (incoming + outgoing) held in this token, 0..1. */
+  concentration: number;
+}
+
+export interface PortfolioExposure {
+  tokens: PortfolioTokenExposure[];
+  totalOutgoingLiability: number;
+  totalIncomingExpected: number;
+  totalPausedOutgoing: number;
+  totalPausedIncoming: number;
+  /** Latest stream update timestamp (ms) across all streams, or null when none. */
+  sourceTimestamp: number | null;
+  /** True when the newest source timestamp is older than the threshold. */
+  stale: boolean;
+}
+
+function remaining(stream: ProjectionStream): number {
+  return Math.max(0, stream.deposited - stream.withdrawn);
+}
+
+/**
+ * Aggregate outgoing liabilities, incoming expected payments and per-token
+ * concentration across a portfolio of streams. Paused streams are reported
+ * separately and never contribute to accruing obligations. Pure function so it
+ * can be exercised without a DOM.
+ */
+export function computePortfolioExposure(
+  streams: ProjectionStream[],
+  options: { now?: number; staleThresholdMs?: number } = {},
+): PortfolioExposure {
+  const now = options.now ?? Date.now();
+  const staleThresholdMs = options.staleThresholdMs ?? DEFAULT_STALE_THRESHOLD_MS;
+  const byToken = new Map<string, PortfolioTokenExposure>();
+
+  const entry = (token: string): PortfolioTokenExposure => {
+    let existing = byToken.get(token);
+    if (!existing) {
+      existing = { token, outgoingLiability: 0, incomingExpected: 0, pausedOutgoing: 0, pausedIncoming: 0, concentration: 0 };
+      byToken.set(token, existing);
+    }
+    return existing;
+  };
+
+  let sourceTimestamp: number | null = null;
+  for (const stream of streams) {
+    if (typeof stream.startTime === "number") {
+      const ts = stream.startTime * 1000;
+      sourceTimestamp = sourceTimestamp === null ? ts : Math.max(sourceTimestamp, ts);
+    }
+    const amount = remaining(stream);
+    const target = entry(stream.token);
+    const paused = stream.isPaused === true || !stream.isActive;
+    if (stream.direction === "outgoing") {
+      if (paused) target.pausedOutgoing += amount;
+      else target.outgoingLiability += amount;
+    } else if (paused) {
+      target.pausedIncoming += amount;
+    } else {
+      target.incomingExpected += amount;
+    }
+  }
+
+  const tokens = Array.from(byToken.values());
+  const totalOutgoingLiability = tokens.reduce((sum, t) => sum + t.outgoingLiability, 0);
+  const totalIncomingExpected = tokens.reduce((sum, t) => sum + t.incomingExpected, 0);
+  const totalPausedOutgoing = tokens.reduce((sum, t) => sum + t.pausedOutgoing, 0);
+  const totalPausedIncoming = tokens.reduce((sum, t) => sum + t.pausedIncoming, 0);
+  const totalExposure = totalOutgoingLiability + totalIncomingExpected;
+  for (const token of tokens) {
+    const tokenExposure = token.outgoingLiability + token.incomingExpected;
+    token.concentration = totalExposure > 0 ? tokenExposure / totalExposure : 0;
+  }
+
+  const stale = sourceTimestamp === null || now - sourceTimestamp > staleThresholdMs;
+
+  return {
+    tokens,
+    totalOutgoingLiability,
+    totalIncomingExpected,
+    totalPausedOutgoing,
+    totalPausedIncoming,
+    sourceTimestamp,
+    stale,
+  };
+}

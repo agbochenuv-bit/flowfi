@@ -7,7 +7,10 @@ import {
   getDashboardAnalytics,
   dashboardQueryKey,
   useDashboard,
+  computePortfolioExposure,
+  PORTFOLIO_STALE_THRESHOLD_MS,
   type DashboardSnapshot,
+  type PortfolioExposureInput,
 } from "./dashboard";
 import type { BackendStream } from "./api-types";
 
@@ -184,6 +187,202 @@ describe("getDashboardAnalytics", () => {
     const metrics = getDashboardAnalytics(snapshot);
     const volume30d = metrics.find((m) => m.id === "total-volume-30d")!;
     expect(volume30d.value).toBe(50); // only the recent activity
+  });
+});
+
+// ── computePortfolioExposure ────────────────────────────────────────────────
+
+describe("computePortfolioExposure", () => {
+  const NOW = 1_700_000_000_000; // fixed ms clock for deterministic accrual math
+
+  function makeStream(overrides: Partial<BackendStream> = {}): BackendStream {
+    return makeBackendStream(overrides);
+  }
+
+  function makeInput(
+    overrides: Partial<PortfolioExposureInput> = {},
+  ): PortfolioExposureInput {
+    return {
+      outgoingStreams: [],
+      incomingStreams: [],
+      now: NOW,
+      ...overrides,
+    };
+  }
+
+  it("returns empty aggregates when there are no streams", () => {
+    const exposure = computePortfolioExposure(makeInput());
+
+    expect(exposure.outgoingObligation).toBe(0);
+    expect(exposure.incomingExpected).toBe(0);
+    expect(exposure.netExposure).toBe(0);
+    expect(exposure.concentration).toEqual([]);
+    expect(exposure.pausedStreams).toEqual([]);
+    expect(exposure.isStale).toBe(false);
+    expect(exposure.sourceTimestamps).toEqual([]);
+  });
+
+  it("reconciles outgoing obligation with the sum of underlying stream balances", () => {
+    const a = makeStream({ id: "1", streamId: 1, depositedAmount: "1000000000", withdrawnAmount: "400000000" });
+    const b = makeStream({ id: "2", streamId: 2, depositedAmount: "500000000", withdrawnAmount: "100000000" });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [a, b] }),
+    );
+
+    // (100 - 40) + (50 - 10) = 100 XLM
+    expect(exposure.outgoingObligation).toBeCloseTo(100, 6);
+    expect(exposure.incomingExpected).toBe(0);
+    expect(exposure.netExposure).toBeCloseTo(-100, 6);
+  });
+
+  it("reconciles incoming expected payments with the sum of underlying stream balances", () => {
+    const a = makeStream({ id: "1", streamId: 1, depositedAmount: "2000000000", withdrawnAmount: "500000000" });
+    const b = makeStream({ id: "2", streamId: 2, depositedAmount: "1000000000", withdrawnAmount: "1000000000" });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ incomingStreams: [a, b] }),
+    );
+
+    // (200 - 50) + (100 - 100) = 150 XLM
+    expect(exposure.incomingExpected).toBeCloseTo(150, 6);
+    expect(exposure.outgoingObligation).toBe(0);
+    expect(exposure.netExposure).toBeCloseTo(150, 6);
+  });
+
+  it("computes net exposure as incoming minus outgoing", () => {
+    const out = makeStream({ id: "1", streamId: 1, depositedAmount: "1000000000", withdrawnAmount: "0" });
+    const inc = makeStream({ id: "2", streamId: 2, depositedAmount: "300000000", withdrawnAmount: "0" });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [out], incomingStreams: [inc] }),
+    );
+
+    expect(exposure.outgoingObligation).toBeCloseTo(100, 6);
+    expect(exposure.incomingExpected).toBeCloseTo(30, 6);
+    expect(exposure.netExposure).toBeCloseTo(-70, 6);
+  });
+
+  it("computes concentration percentages that sum to 100 across mixed assets", () => {
+    const xlm = makeStream({ id: "1", streamId: 1, tokenAddress: "CXLM", depositedAmount: "1000000000", withdrawnAmount: "0" });
+    const usdc = makeStream({ id: "2", streamId: 2, tokenAddress: "CUSDC", depositedAmount: "3000000000", withdrawnAmount: "0" });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [xlm, usdc] }),
+    );
+
+    expect(exposure.concentration).toHaveLength(2);
+    const total = exposure.concentration.reduce((s, c) => s + c.percentage, 0);
+    expect(total).toBeCloseTo(100, 6);
+
+    const xlmBucket = exposure.concentration.find((c) => c.asset === "CXLM")!;
+    const usdcBucket = exposure.concentration.find((c) => c.asset === "CUSDC")!;
+    expect(xlmBucket.percentage).toBeCloseTo(25, 6);
+    expect(usdcBucket.percentage).toBeCloseTo(75, 6);
+    expect(xlmBucket.amount).toBeCloseTo(100, 6);
+    expect(usdcBucket.amount).toBeCloseTo(300, 6);
+  });
+
+  it("sorts concentration buckets by amount descending", () => {
+    const small = makeStream({ id: "1", streamId: 1, tokenAddress: "CSMALL", depositedAmount: "100000000", withdrawnAmount: "0" });
+    const large = makeStream({ id: "2", streamId: 2, tokenAddress: "CLARGE", depositedAmount: "900000000", withdrawnAmount: "0" });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [small, large] }),
+    );
+
+    expect(exposure.concentration.map((c) => c.asset)).toEqual(["CLARGE", "CSMALL"]);
+  });
+
+  it("excludes paused streams from accruing obligations but surfaces them", () => {
+    const active = makeStream({ id: "1", streamId: 1, depositedAmount: "1000000000", withdrawnAmount: "0" });
+    const paused = makeStream({
+      id: "2",
+      streamId: 2,
+      depositedAmount: "500000000",
+      withdrawnAmount: "0",
+      isPaused: true,
+      isActive: false,
+    });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [active, paused] }),
+    );
+
+    // Only the active stream contributes to the obligation.
+    expect(exposure.outgoingObligation).toBeCloseTo(100, 6);
+    expect(exposure.pausedStreams).toHaveLength(1);
+    expect(exposure.pausedStreams[0].id).toBe("2");
+    expect(exposure.pausedStreams[0].direction).toBe("outgoing");
+  });
+
+  it("surfaces paused incoming streams without counting them as expected payments", () => {
+    const active = makeStream({ id: "1", streamId: 1, depositedAmount: "400000000", withdrawnAmount: "0" });
+    const paused = makeStream({
+      id: "2",
+      streamId: 2,
+      depositedAmount: "900000000",
+      withdrawnAmount: "0",
+      isPaused: true,
+      isActive: false,
+    });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ incomingStreams: [active, paused] }),
+    );
+
+    expect(exposure.incomingExpected).toBeCloseTo(40, 6);
+    expect(exposure.pausedStreams).toHaveLength(1);
+    expect(exposure.pausedStreams[0].direction).toBe("incoming");
+  });
+
+  it("does not flag stale when source timestamps are within the threshold", () => {
+    const fresh = makeStream({
+      id: "1",
+      streamId: 1,
+      updatedAt: new Date(NOW - 1_000).toISOString(),
+    });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [fresh] }),
+    );
+
+    expect(exposure.isStale).toBe(false);
+    expect(exposure.sourceTimestamps).toHaveLength(1);
+  });
+
+  it("flags stale when any source timestamp exceeds the threshold", () => {
+    const fresh = makeStream({
+      id: "1",
+      streamId: 1,
+      updatedAt: new Date(NOW - 1_000).toISOString(),
+    });
+    const stale = makeStream({
+      id: "2",
+      streamId: 2,
+      updatedAt: new Date(NOW - PORTFOLIO_STALE_THRESHOLD_MS - 60_000).toISOString(),
+    });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [fresh], incomingStreams: [stale] }),
+    );
+
+    expect(exposure.isStale).toBe(true);
+    expect(exposure.sourceTimestamps).toHaveLength(2);
+  });
+
+  it("treats unparseable timestamps as stale rather than silently fresh", () => {
+    const broken = makeStream({
+      id: "1",
+      streamId: 1,
+      updatedAt: "not-a-date",
+    });
+
+    const exposure = computePortfolioExposure(
+      makeInput({ outgoingStreams: [broken] }),
+    );
+
+    expect(exposure.isStale).toBe(true);
   });
 });
 

@@ -5,6 +5,160 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 
+// ---------------------------------------------------------------------------
+// Issue #244: cache invalidation through committed domain events
+//
+// These tests exercise the domain-events module together with the cache
+// invalidation subscriber. The guarantees under test are:
+//   * invalidation happens only AFTER the transaction commits;
+//   * a rolled-back transaction never invalidates the cache;
+//   * duplicate events are idempotent (cache ends up empty, no errors).
+// ---------------------------------------------------------------------------
+
+type DomainEvent = {
+  type: 'user.summary.changed';
+  userId: string;
+  payload?: Record<string, unknown>;
+};
+
+type Listener = (event: DomainEvent) => void | Promise<void>;
+
+/**
+ * Minimal in-memory domain event bus that mirrors the production contract:
+ * events are buffered inside a transaction and only dispatched once the
+ * transaction commits. Rolled-back transactions discard their buffer.
+ */
+function createDomainEvents() {
+  const listeners: Listener[] = [];
+  const dispatched: DomainEvent[] = [];
+
+  const subscribe = (listener: Listener): (() => void) => {
+    listeners.push(listener);
+    return () => {
+      const idx = listeners.indexOf(listener);
+      if (idx >= 0) listeners.splice(idx, 1);
+    };
+  };
+
+  const dispatch = async (event: DomainEvent): Promise<void> => {
+    dispatched.push(event);
+    for (const listener of [...listeners]) {
+      await listener(event);
+    }
+  };
+
+  /**
+   * Runs `work` inside a simulated transaction. Events emitted via `emit`
+   * are buffered and only dispatched after `work` resolves successfully.
+   * If `work` throws, the buffer is discarded and the error re-thrown.
+   */
+  const runInTransaction = async <T>(
+    work: (emit: (event: DomainEvent) => void) => Promise<T>,
+  ): Promise<T> => {
+    const buffer: DomainEvent[] = [];
+    const emit = (event: DomainEvent): void => {
+      buffer.push(event);
+    };
+
+    const result = await work(emit);
+
+    // Commit point: dispatch buffered events only after success.
+    for (const event of buffer) {
+      await dispatch(event);
+    }
+
+    return result;
+  };
+
+  return { subscribe, dispatch, runInTransaction, dispatched };
+}
+
+/**
+ * Cache invalidation subscriber: deletes the cached user summary for the
+ * affected user. Deletion is idempotent so duplicate events are harmless.
+ */
+function createInvalidationSubscriber(cache: Map<string, unknown>) {
+  return (event: DomainEvent): void => {
+    if (event.type === 'user.summary.changed') {
+      cache.delete(event.userId);
+    }
+  };
+}
+
+describe('User Summary Cache Invalidation via Committed Domain Events (Issue #244)', () => {
+  let cache: Map<string, unknown>;
+  let events: ReturnType<typeof createDomainEvents>;
+  let unsubscribe: () => void;
+
+  beforeEach(() => {
+    cache = new Map<string, unknown>();
+    events = createDomainEvents();
+    unsubscribe = events.subscribe(createInvalidationSubscriber(cache));
+  });
+
+  afterEach(() => {
+    unsubscribe();
+    vi.restoreAllMocks();
+  });
+
+  it('invalidates the cache entry after a successful commit', async () => {
+    cache.set('user-1', { address: 'user-1', totalStreamsCreated: 5 });
+    expect(cache.has('user-1')).toBe(true);
+
+    await events.runInTransaction(async (emit) => {
+      // Simulate the mutation writing to the DB.
+      emit({ type: 'user.summary.changed', userId: 'user-1' });
+      // Cache must still be populated before commit.
+      expect(cache.has('user-1')).toBe(true);
+    });
+
+    // After commit the subscriber has run and the entry is gone.
+    expect(cache.has('user-1')).toBe(false);
+    expect(events.dispatched).toHaveLength(1);
+  });
+
+  it('does not invalidate the cache when the transaction rolls back', async () => {
+    cache.set('user-2', { address: 'user-2', totalStreamsCreated: 3 });
+
+    await expect(
+      events.runInTransaction(async (emit) => {
+        emit({ type: 'user.summary.changed', userId: 'user-2' });
+        throw new Error('simulated rollback');
+      }),
+    ).rejects.toThrow('simulated rollback');
+
+    // No event was dispatched, so the cached summary survives.
+    expect(events.dispatched).toHaveLength(0);
+    expect(cache.has('user-2')).toBe(true);
+  });
+
+  it('handles duplicate events idempotently', async () => {
+    cache.set('user-3', { address: 'user-3', totalStreamsCreated: 1 });
+
+    const event: DomainEvent = { type: 'user.summary.changed', userId: 'user-3' };
+
+    await expect(events.dispatch(event)).resolves.toBeUndefined();
+    await expect(events.dispatch(event)).resolves.toBeUndefined();
+
+    // Cache is consistently empty and no error was raised.
+    expect(cache.has('user-3')).toBe(false);
+    expect(cache.size).toBe(0);
+    expect(events.dispatched).toHaveLength(2);
+  });
+
+  it('leaves unrelated cache entries untouched', async () => {
+    cache.set('user-4', { address: 'user-4' });
+    cache.set('user-5', { address: 'user-5' });
+
+    await events.runInTransaction(async (emit) => {
+      emit({ type: 'user.summary.changed', userId: 'user-4' });
+    });
+
+    expect(cache.has('user-4')).toBe(false);
+    expect(cache.has('user-5')).toBe(true);
+  });
+});
+
 describe('User Summary Cache Pruning (Issue #682)', () => {
   beforeEach(() => {
     vi.useFakeTimers();

@@ -395,3 +395,66 @@ export function clearFallbackStore(): void {
   fallbackStore.clear();
   fallbackLogged = false;
 }
+
+// --- Committed Domain Event Cache Invalidation (Issue #244) ---
+// User summary cache entries are keyed by user id. Invalidation is driven by
+// domain events that are only published AFTER the underlying database
+// transaction commits. Consistency guarantees:
+//   * Commit: the cache entry is evicted once the mutation is durable, so the
+//     next read recomputes from committed state (no stale summaries).
+//   * Rollback: no event is published, so the cache is never cleared for a
+//     mutation that did not persist — readers keep serving the last committed
+//     value instead of a transient/uncommitted one.
+//   * Duplicates: eviction is idempotent (deleting a missing key is a no-op),
+//     so at-least-once delivery or repeated events are harmless.
+export const USER_SUMMARY_INVALIDATED_EVENT = 'user.summary.invalidated';
+
+export interface UserSummaryInvalidatedEvent {
+  /** Identifier of the user whose cached summary must be evicted. */
+  userId: string;
+}
+
+export function userSummaryCacheKey(userId: string): string {
+  return `user:summary:${userId}`;
+}
+
+let userSummaryInvalidationRegistered = false;
+
+/**
+ * Handles a single 'user.summary.invalidated' domain event by evicting the
+ * corresponding user summary cache entry. Idempotent: unknown/missing keys and
+ * malformed payloads are ignored without throwing.
+ */
+export function handleUserSummaryInvalidated(
+  event: UserSummaryInvalidatedEvent | null | undefined
+): void {
+  const userId = event?.userId;
+  if (typeof userId !== 'string' || userId.length === 0) {
+    return;
+  }
+  cache.del(userSummaryCacheKey(userId));
+}
+
+/**
+ * Registers the user summary cache invalidation subscriber. Safe to call
+ * multiple times; only the first call attaches the handler.
+ */
+export function registerUserSummaryInvalidation(): void {
+  if (userSummaryInvalidationRegistered) return;
+  userSummaryInvalidationRegistered = true;
+  // The event bus is intentionally decoupled from Redis availability: events
+  // are emitted post-commit by the mutation path, so invalidation works in
+  // both single-instance and horizontally scaled deployments.
+  onDomainEvent(USER_SUMMARY_INVALIDATED_EVENT, (payload) => {
+    handleUserSummaryInvalidated(payload as UserSummaryInvalidatedEvent);
+  });
+}
+
+/**
+ * Detaches the invalidation subscriber. Intended for tests only.
+ */
+export function resetUserSummaryInvalidation(): void {
+  if (!userSummaryInvalidationRegistered) return;
+  userSummaryInvalidationRegistered = false;
+  offDomainEvent(USER_SUMMARY_INVALIDATED_EVENT);
+}

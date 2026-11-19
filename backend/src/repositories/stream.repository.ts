@@ -1,17 +1,40 @@
 import { prisma } from '../lib/prisma.js';
+import { runPostCommit, emitDomainEvent } from '../lib/postCommit.js';
+
+/**
+ * Emit `user.summary.invalidated` domain events for the given public keys.
+ * Only unique, non-empty keys are emitted so duplicate events are avoided.
+ */
+const emitSummaryInvalidations = (publicKeys: Array<string | null | undefined>): void => {
+  const unique = Array.from(new Set(publicKeys.filter((key): key is string => typeof key === 'string' && key.length > 0)));
+  for (const publicKey of unique) {
+    emitDomainEvent('user.summary.invalidated', { publicKey });
+  }
+};
 
 /**
  * Update the status and active flag of a stream in the database.
+ *
+ * The mutation runs inside the post-commit helper: the summary cache is only
+ * invalidated for the affected sender/recipient once the transaction commits.
+ * A rolled-back mutation therefore never evicts cached summaries.
  */
 export const updateStatus = async (streamId: bigint, status: 'ACTIVE' | 'CANCELLED' | 'COMPLETED' | 'PAUSED') => {
-  return prisma.stream.update({
-    where: { streamId },
-    data: {
-      isActive: status === 'ACTIVE' || status === 'PAUSED',
-      // Note: we don't have a 'status' field in the Stream model yet,
-      // it seems status is derived from isActive and events.
-      // However, we can update isActive to false for CANCELLED/COMPLETED.
-    }
+  return runPostCommit(async (tx) => {
+    const stream = await tx.stream.update({
+      where: { streamId },
+      data: {
+        isActive: status === 'ACTIVE' || status === 'PAUSED',
+        // Note: we don't have a 'status' field in the Stream model yet,
+        // it seems status is derived from isActive and events.
+        // However, we can update isActive to false for CANCELLED/COMPLETED.
+      }
+    });
+
+    const affected = stream as { sender?: string | null; recipient?: string | null } | null;
+    emitSummaryInvalidations([affected?.sender, affected?.recipient]);
+
+    return stream;
   });
 };
 

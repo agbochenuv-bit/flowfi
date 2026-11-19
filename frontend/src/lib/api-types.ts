@@ -106,6 +106,94 @@ export interface BackendStream
 }
 
 // ---------------------------------------------------------------------------
+// Stream event activity explorer (filters + pagination)
+// ---------------------------------------------------------------------------
+
+/**
+ * Lifecycle action filter accepted by the stream events activity endpoint.
+ *
+ * Mirrors the `action` query parameter of `GET /v1/streams/events` (see
+ * `paths["/v1/streams/events"]["get"]["parameters"]["query"]`).
+ * TODO: replace with the derived query-param type once the backend spec
+ * documents the `action` enum explicitly:
+ *   export type StreamEventActionFilter =
+ *     NonNullable<components["schemas"]["StreamEventListQuery"]["action"]>;
+ */
+export type StreamEventActionFilter =
+  | "created"
+  | "deposited"
+  | "withdrawn"
+  | "paused"
+  | "resumed"
+  | "cancelled"
+  | "completed"
+  | "fee_config_updated"
+  | "admin_transferred";
+
+/**
+ * Composable filter parameters for the activity explorer.
+ *
+ * All fields are optional; omitted fields mean "no constraint". The values are
+ * serialized into the URL query string so filter state is addressable and
+ * survives browser back/forward navigation.
+ *
+ * TODO: derive from the OpenAPI query parameters once the spec models the
+ * full filter set (asset, participant, action, date range, pagination).
+ */
+export interface StreamEventFilters {
+  /** Filter by streamed asset code (e.g. "USDC"). */
+  asset?: string;
+  /** Filter by participant public key (sender or recipient). */
+  participant?: string;
+  /** Filter by lifecycle action. */
+  action?: StreamEventActionFilter;
+  /** Inclusive lower bound on event time (ISO-8601 date or datetime). */
+  from?: string;
+  /** Inclusive upper bound on event time (ISO-8601 date or datetime). */
+  to?: string;
+}
+
+/**
+ * Pagination parameters for the activity explorer.
+ *
+ * `limit`/`offset` are the primary, stable pagination mechanism. `cursor` is an
+ * optional opaque token for keyset pagination; when present it takes
+ * precedence over `offset` on the backend.
+ *
+ * TODO: derive from the OpenAPI query parameters once documented.
+ */
+export interface StreamEventPagination {
+  limit?: number;
+  offset?: number;
+  cursor?: string;
+}
+
+/**
+ * A single page of stream events as returned by the activity endpoint.
+ *
+ * Derived from `components["schemas"]["StreamEvent"]` for the event items so
+ * the item shape stays in sync with the rest of the app (`BackendStreamEvent`).
+ *
+ * TODO: add a `StreamEventsPage` schema to the backend OpenAPI spec, then
+ * replace this hand-written interface with:
+ *   export type StreamEventsPage = components["schemas"]["StreamEventsPage"];
+ */
+export interface StreamEventsPage {
+  /** Events for the current page, newest first. */
+  events: BackendStreamEvent[];
+  /** Total number of events matching the filters (ignoring pagination). */
+  total: number;
+  /** Maximum number of events requested for this page. */
+  limit: number;
+  /** Number of events skipped before this page. */
+  offset: number;
+  /** True when more events exist beyond this page. */
+  hasMore: boolean;
+  /** Opaque cursor for fetching the next page, when cursor pagination is used. */
+  nextCursor?: string | null;
+}
+
+// ---------------------------------------------------------------------------
 // Operation-specific response types (derived from `paths`)
 // ---------------------------------------------------------------------------
 

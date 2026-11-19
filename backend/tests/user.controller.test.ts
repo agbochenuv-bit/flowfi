@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { registerUser, getUser, getUserEvents, getCurrentUser } from '../src/controllers/user.controller.js';
 import { prisma } from '../src/lib/prisma.js';
 import { ApiError } from '../src/lib/errors.js';
+import { domainEvents } from '../src/lib/domain-events.js';
 import type { Request, Response } from 'express';
 
 vi.mock('../src/lib/prisma.js', () => ({
@@ -22,6 +23,14 @@ vi.mock('../src/logger.js', () => ({
     info: vi.fn(),
     error: vi.fn(),
     warn: vi.fn(),
+  },
+}));
+
+vi.mock('../src/lib/domain-events.js', () => ({
+  domainEvents: {
+    emit: vi.fn(),
+    on: vi.fn(),
+    off: vi.fn(),
   },
 }));
 
@@ -72,6 +81,44 @@ describe('User Controller', () => {
       await registerUser(req as Request, res as Response, next);
 
       expect(next).toHaveBeenCalledWith(expect.any(Error));
+    });
+
+    it('emits user.summary.invalidated after a committed registration', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.body = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue(null);
+      (prisma.user.create as any).mockResolvedValue({ publicKey });
+
+      await registerUser(req as Request, res as Response, next);
+
+      expect(domainEvents.emit).toHaveBeenCalledTimes(1);
+      expect(domainEvents.emit).toHaveBeenCalledWith(
+        'user.summary.invalidated',
+        expect.objectContaining({ publicKey }),
+      );
+    });
+
+    it('does not emit user.summary.invalidated when the registration transaction rolls back', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.body = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue(null);
+      (prisma.user.create as any).mockRejectedValue(new Error('transaction rolled back'));
+
+      await registerUser(req as Request, res as Response, next);
+
+      expect(next).toHaveBeenCalledWith(expect.any(Error));
+      expect(domainEvents.emit).not.toHaveBeenCalled();
+    });
+
+    it('does not emit user.summary.invalidated when the user already exists', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.body = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue({ publicKey });
+
+      await registerUser(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(domainEvents.emit).not.toHaveBeenCalled();
     });
   });
 
@@ -319,6 +366,47 @@ describe('User Controller', () => {
         code: 'UNAUTHENTICATED',
       });
       expect(prisma.user.findUnique).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('post-commit cache invalidation', () => {
+    it('emits exactly one invalidation event per committed mutation', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.body = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue(null);
+      (prisma.user.create as any).mockResolvedValue({ publicKey });
+
+      await registerUser(req as Request, res as Response, next);
+
+      expect(domainEvents.emit).toHaveBeenCalledTimes(1);
+      expect(domainEvents.emit).toHaveBeenCalledWith(
+        'user.summary.invalidated',
+        expect.objectContaining({ publicKey }),
+      );
+    });
+
+    it('does not emit an invalidation event when the mutation fails before commit', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.body = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue(null);
+      (prisma.user.create as any).mockRejectedValue(new Error('commit failed'));
+
+      await registerUser(req as Request, res as Response, next);
+
+      expect(next).toHaveBeenCalledWith(expect.any(Error));
+      expect(domainEvents.emit).not.toHaveBeenCalled();
+    });
+
+    it('does not emit an invalidation event for read-only requests', async () => {
+      const publicKey = 'GD2XP6FNWL6IWULVMPNA2RV2T7GLCJHK3RH75GBCY7TSVIWDITJN4FXJ';
+      req.params = { publicKey };
+      (req as any).user = { publicKey };
+      (prisma.user.findUnique as any).mockResolvedValue({ publicKey });
+
+      await getUser(req as Request, res as Response, next);
+
+      expect(res.status).toHaveBeenCalledWith(200);
+      expect(domainEvents.emit).not.toHaveBeenCalled();
     });
   });
 });
