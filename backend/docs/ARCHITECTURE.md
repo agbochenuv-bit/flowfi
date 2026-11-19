@@ -11,6 +11,59 @@ timing, environment variables, and operational runbook) see
 
 ---
 
+## Service Dependency Budgets
+
+Every outbound dependency call (database, Redis, Soroban RPC, webhooks) is
+wrapped in an explicit latency/timeout budget with bounded retries so a slow or
+failing dependency cannot cascade indefinitely through request or worker paths.
+Budgets are centralized in `src/config/dependencyBudgets.ts` and applied via
+`src/utils/withBudget.ts`.
+
+### Budget Matrix
+
+| Dependency | Timeout | Max Attempts | Backoff | Env Overrides |
+|------------|---------|--------------|---------|---------------|
+| Database (Prisma) | 5,000 ms | 2 | 100 ms exp | `DB_TIMEOUT_MS`, `DB_MAX_ATTEMPTS` |
+| Redis | 1,000 ms | 2 | 50 ms exp | `REDIS_TIMEOUT_MS`, `REDIS_MAX_ATTEMPTS` |
+| Soroban RPC | 10,000 ms | 3 | 250 ms exp | `SOROBAN_RPC_TIMEOUT_MS`, `SOROBAN_RPC_MAX_ATTEMPTS` |
+| Webhook delivery | 3,000 ms | 3 | 500 ms exp | `WEBHOOK_TIMEOUT_MS`, `WEBHOOK_MAX_ATTEMPTS` |
+
+All values are bounded: timeouts are clamped to `[100 ms, 60,000 ms]` and
+attempts to `[1, 5]`, so a misconfigured env var cannot disable the budget.
+
+### Request Path Impact
+
+- **Database**: a request that cannot reach Postgres fails within
+  `DB_TIMEOUT_MS × DB_MAX_ATTEMPTS` (default ≤ 10 s) with a `DependencyTimeoutError`
+  mapped to HTTP 503, instead of hanging until the client disconnects.
+- **Redis**: SSE fanout and rate-limit lookups degrade to in-memory behavior
+  after `REDIS_TIMEOUT_MS × REDIS_MAX_ATTEMPTS` (default ≤ 2 s); the request
+  itself is not blocked beyond that.
+- **Soroban RPC**: simulate/submit endpoints return 503 within
+  `SOROBAN_RPC_TIMEOUT_MS × SOROBAN_RPC_MAX_ATTEMPTS` (default ≤ 30 s) rather
+  than holding the connection open.
+
+### Worker Path Impact
+
+- **Soroban RPC**: the event worker's poll cycle is bounded by the RPC budget;
+  a stalled RPC aborts the cycle and the next tick retries, so the cursor never
+  advances past unprocessed ledgers.
+- **Webhooks**: delivery attempts are bounded per event; exhausted retries are
+  logged and the event is dropped from the in-flight queue rather than blocking
+  subsequent deliveries.
+- **Database**: worker writes use the same DB budget; a timeout aborts the
+  current batch and the worker retries on the next tick without losing the
+  cursor position.
+
+### Failure Semantics
+
+`withBudget` throws `DependencyTimeoutError` (with `dependency` and `attempts`
+fields) when the budget is exhausted. Callers must treat this as a transient
+failure — never as a successful no-op — so financial accounting and chain
+validation invariants are preserved.
+
+---
+
 ## Indexer Ownership Model
 
 Three files with overlapping names handle indexing and indexer management. Only
@@ -166,26 +219,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow

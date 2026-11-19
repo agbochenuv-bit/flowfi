@@ -8,7 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -72,6 +72,27 @@ model IndexerState {
   lastLedger  Int      @default(0)
   lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
   version     Int      @default(0) // Optimistic-concurrency guard; bumped on every write
+  updatedAt   DateTime @updatedAt
+}
+
+// MaintenanceState model - singleton row tracking operator-controlled maintenance mode.
+//
+// Concurrency contract (issue #297): enter/exit transitions MUST take a row-level
+// lock (SELECT ... FOR UPDATE) on the singleton row inside a transaction before
+// reading or writing `enabled`, so concurrent enter/exit requests cannot race and
+// leave the flag inconsistent with the audit trail. `version` is an
+// optimistic-concurrency guard bumped on every transition; callers that observed a
+// stale version must retry. Transitions are idempotent: entering while already
+// enabled (or exiting while already disabled) is a no-op that does not bump the
+// version. While `enabled` is true, readiness reports not-ready but liveness stays
+// healthy, and user mutations are rejected with an explicit maintenance error.
+model MaintenanceState {
+  id          String   @id @default("singleton")
+  enabled     Boolean  @default(false)
+  reason      String?  // Operator-supplied reason shown in status/readiness responses
+  version     Int      @default(0) // Optimistic-concurrency guard; bumped on every transition
+  enteredAt   DateTime? // When maintenance mode was most recently entered
+  enteredBy   String?  // Operator identity that entered maintenance mode
   updatedAt   DateTime @updatedAt
 }
 
@@ -193,31 +214,3 @@ model IndexerDeadLetterEvent {
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
-}
-
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-}

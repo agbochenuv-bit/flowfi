@@ -91,29 +91,62 @@ Challenges issued by `/v1/auth/challenge` are **single-use** and bound to a spec
 - Clients that previously reused a signed challenge (or cached a nonce across requests) **must** request a fresh challenge for every login. Reuse now returns `401 CHALLENGE_ALREADY_USED`.
 - Clients must send the same `network` and `audience` they used when requesting the challenge; mismatches are rejected.
 - If `AUTH_CHALLENGE_TTL_SECONDS` is lowered, clients should request and submit challenges promptly rather than pre-generating them.
-======>>> REPLACE
 
-<<<<<<< SEARCH
-## Error Responses
+## Support Tooling Data Access (Auditable, Purpose-Bound)
 
-### 401 Unauthorized - Missing Token
+Support and operational tooling does **not** authenticate as the wallet owner. Instead, access is granted through an explicit, time-bounded **access grant** that records *who* is accessing, *why* (a documented purpose), *what* fields they may read, and *when* the grant expires. Every grant and every access attempt is written to an append-only audit trail.
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
-}
-```
+### Allowed Purposes
 
-### 401 Unauthorized - Invalid Signature
+A grant must declare one of the following documented purposes. Any other value is rejected with `403 ACCESS_PURPOSE_NOT_ALLOWED`.
 
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-=======
+| Purpose | Intended use |
+| --- | --- |
+| `SUPPORT_TICKET` | Resolving a customer support ticket |
+| `INCIDENT_RESPONSE` | Investigating a production incident |
+| `COMPLIANCE_REVIEW` | Responding to a compliance/legal request |
+| `FRAUD_INVESTIGATION` | Investigating suspected fraud |
+
+### Allowed Fields (Allowlist)
+
+Support tooling may only read fields on the allowlist below. Wallet-linked identifiers (full Stellar public keys, signing keys, secrets) are **excluded**; where a wallet reference is required it is returned as a truncated, non-reversible reference. Requests for any field outside the allowlist are denied with `403 ACCESS_FIELD_NOT_ALLOWED`.
+
+| Field | Notes |
+| --- | --- |
+| `streamId` | Opaque stream identifier |
+| `streamStatus` | Lifecycle status |
+| `createdAt` | Creation timestamp |
+| `updatedAt` | Last-update timestamp |
+| `amount` | Stream amount (no counterparty wallet) |
+| `assetCode` | Asset code |
+| `walletRef` | Truncated, non-reversible wallet reference |
+
+Fields such as `senderPublicKey`, `recipientPublicKey`, `signature`, and any secret material are never exposed to support tooling.
+
+### Access Duration
+
+Each grant carries an absolute `expiresAt`. Grants are bounded by `SUPPORT_ACCESS_MAX_TTL_SECONDS` (default 3600s); a requested duration exceeding the maximum is rejected with `400 ACCESS_DURATION_EXCEEDED`. Once `expiresAt` has passed, all access through the grant is denied with `403 ACCESS_GRANT_EXPIRED`.
+
+### Enforcement Rules
+
+| Condition | Status | `error` code |
+| --- | --- | --- |
+| Purpose missing or not in the allowlist | `403` | `ACCESS_PURPOSE_NOT_ALLOWED` |
+| Requested field not in the allowlist | `403` | `ACCESS_FIELD_NOT_ALLOWED` |
+| No approval recorded for the grant | `403` | `ACCESS_APPROVAL_REQUIRED` |
+| Grant expired | `403` | `ACCESS_GRANT_EXPIRED` |
+| Requested duration exceeds maximum | `400` | `ACCESS_DURATION_EXCEEDED` |
+
+### Audit Trail
+
+Every grant creation, approval, and access attempt (allowed or denied) appends an audit record containing: the acting operator, the grant id, the purpose, the requested fields, the outcome, and a timestamp. Audit records are append-only and are never mutated or deleted by support tooling. Denials are audited with the same completeness as successful accesses so that attempted misuse is reviewable.
+
+### Migration Notes (Support Access)
+
+- Support tooling that previously read wallet-linked fields directly must migrate to the allowlisted fields above; wallet references are now truncated.
+- Grants must be created with a documented purpose and an approval before use; unapproved or expired grants are denied.
+- Operators should expect `403` responses with the `ACCESS_*` codes above and surface them to the requesting support workflow.
+
 ## Error Responses
 
 All errors share a predictable envelope produced by centralized validation and error mapping:
@@ -201,16 +234,7 @@ Unexpected failures return a generic message with no stack trace or internal ide
 - Clients that parsed only `message` should migrate to branching on `code`, which is stable across releases.
 - New `details` arrays appear only on `400 VALIDATION_ERROR` responses.
 - `requestId` is additive; clients may log it for support escalation.
-======>>> REPLACE
 
-<<<<<<< SEARCH
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-=======
 ## Security Features
 
 1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
@@ -219,6 +243,7 @@ Unexpected failures return a generic message with no stack trace or internal ide
 4. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
 5. **Network Validation**: Ensures transactions match the configured Stellar network
 6. **No Password Storage**: No sensitive credentials stored on the server
+7. **Purpose-Bound Support Access**: Support tooling reads only allowlisted fields under documented, time-bounded, audited grants
 
 ## Endpoint-Specific Wallet Authorization Scopes
 
@@ -232,217 +257,4 @@ Authenticated endpoints enforce ownership at the route/service boundary. The ser
 | Webhooks (`/v1/webhooks/:id`) | Owner wallet only | Owner wallet only |
 | Public resources (e.g. `/v1/streams` list, health) | Anyone | N/A |
 
-Violations return `403 WALLET_SCOPE_FORBIDDEN`. Cross-wallet enumeration attempts (e.g. listing another wallet's streams by spoofing a query parameter) are rejected rather than silently filtered.
-
-### Migration Notes (Scopes)
-
-- Clients that previously passed `sender`/`recipient` addresses in request bodies to act on behalf of another wallet must instead authenticate as that wallet. Such fields are ignored for authorization and may be rejected by validation.
-- Admin operations require the caller's wallet to be present in the admin allowlist (`ADMIN_PUBLIC_KEYS`).
-- Public endpoints remain unauthenticated; no client change is required for them.
-======>>> REPLACE
-
-<<<<<<< SEARCH
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-=======
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-
-# Challenge lifetime in seconds (default 300)
-AUTH_CHALLENGE_TTL_SECONDS=300
-
-# Intended audience bound into each challenge
-AUTH_AUDIENCE=flowfi-api
-
-# Comma-separated admin wallet public keys
-ADMIN_PUBLIC_KEYS=GADMIN1...,GADMIN2...
-```
-
-## Example: Creating a Signed Transaction (Client Side)
-
-```javascript
-import * as StellarSdk from '@stellar/stellar-sdk';
-
-// Create a keypair (in real app, this comes from the user's wallet)
-const keypair = StellarSdk.Keypair.fromSecret('S...');
-
-// Get the current network passphrase
-const networkPassphrase = StellarSdk.Networks.TESTNET;
-
-// Create a simple transaction for authentication
-const account = await server.loadAccount(keypair.publicKey());
-const transaction = new StellarSdk.TransactionBuilder(account, {
-  fee: StellarSdk.BASE_FEE,
-  networkPassphrase,
-})
-  .addOperation(
-    StellarSdk.Operation.manageData({
-      name: 'auth',
-      value: crypto.randomBytes(32), // Random challenge
-    })
-  )
-  .setTimeout(300) // 5 minutes validity
-  .build();
-
-// Sign the transaction
-transaction.sign(keypair);
-
-// Encode to XDR for the Bearer token
-const xdr = transaction.toEnvelope().toXDR('base64');
-
-// Use in Authorization header
-const response = await fetch('http://localhost:3001/v1/users/me', {
-  headers: {
-    'Authorization': `Bearer ${xdr}`
-  }
-});
-```
-
-## Error Responses
-
-### 401 Unauthorized - Missing Token
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Missing or invalid Authorization header. Expected format: Bearer <signed_transaction>"
-}
-```
-
-### 401 Unauthorized - Invalid Signature
-
-```json
-{
-  "error": "Unauthorized",
-  "message": "Invalid or expired signature"
-}
-```
-
-## Security Features
-
-1. **Signature Verification**: Cryptographically verifies the transaction was signed by the claimed public key
-2. **Time Bounds**: Supports transaction time bounds to prevent replay attacks
-3. **Network Validation**: Ensures transactions match the configured Stellar network
-4. **No Password Storage**: No sensitive credentials stored on the server
-
-## Configuration
-
-### Environment Variables
-
-```env
-# Stellar Network (testnet or mainnet)
-STELLAR_NETWORK=testnet
-
-# For mainnet, use:
-# STELLAR_NETWORK=mainnet
-```
-
-### Network Passphrases
-
-- **Testnet**: `Test SDF Network ; September 2015`
-- **Mainnet**: `Public Global Stellar Network ; September 2015`
-
-## Independence from Database
-
-Per issue #74 requirements, the middleware operates independently of the database:
-
-- **User Exists**: Returns user data from database
-- **User Missing**: Returns in-memory user object with `publicKey` and empty arrays
-- **Never Blocks**: Authentication succeeds based solely on valid signature
-
-Example in-memory response:
-
-```json
-{
-  "publicKey": "GABC123...",
-  "sentStreams": [],
-  "receivedStreams": [],
-  "inMemory": true
-}
-```
-
-## TypeScript Types
-
-### AuthUser
-
-```typescript
-interface AuthUser {
-  publicKey: string;
-  id?: string;
-}
-```
-
-### AuthenticatedRequest
-
-```typescript
-interface AuthenticatedRequest extends Request {
-  user: AuthUser;
-}
-```
-
-### Usage in Controllers
-
-```typescript
-import type { AuthenticatedRequest } from '../types/auth.types.js';
-
-export const getCurrentUser = async (req: Request, res: Response) => {
-  const authReq = req as AuthenticatedRequest;
-  const { publicKey } = authReq.user;
-
-  // Use publicKey...
-};
-```
-
-## Testing
-
-Test the middleware with a valid signed transaction:
-
-```bash
-# 1. Create a test transaction (use stellar-sdk)
-# 2. Sign it with a test keypair
-# 3. Encode to XDR
-# 4. Send request
-
-curl -X GET http://localhost:3001/v1/users/me \
-  -H "Authorization: Bearer <your_signed_transaction_xdr>"
-```
-
-## OpenAPI Parity in CI
-
-`backend/swagger/flowfi.openapi.json` is generated from the route definitions and validated in CI. The pipeline fails when:
-
-- The committed spec differs from the generated artifact (drift)
-- A route is missing from the spec, or the spec documents a route that no longer exists
-- Documented request/response schemas, status codes, or auth requirements diverge from the implementation
-- Error responses (`400`, `401`, `403`, `500`) are not documented for protected endpoints
-
-Generated artifacts are reproducible: running the generator twice produces byte-identical output. All versioned endpoints (`/v1/*`) and their error responses are included.
-
-### Operational Impact
-
-- Contributors must regenerate the spec (`npm run openapi:generate`) and commit the result when changing routes, schemas, status codes, or auth.
-- A deliberate spec mismatch fails CI, preventing undocumented API changes from merging.
-- No runtime behavior changes; this is a build/CI gate only.
-
-## Related Documentation
-
-- [Stellar SEP-10 Specification](https://github.com/stellar/stellar-protocol/blob/master/ecosystem/sep-0010.md)
-- [Stellar SDK Documentation](https://stellar.github.io/js-stellar-sdk/)
-- [Swagger API Docs](http://localhost:3001/api-docs)
+Violations return `403 WALLET_SCOPE_FORBIDDEN` without disclosing resource existence. Support tooling access is governed separately by the purpose-bound grant rules above and never bypasses wallet authorization for owner-scoped endpoints.

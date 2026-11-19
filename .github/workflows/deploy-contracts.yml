@@ -4,6 +4,18 @@
 # and deploys + initializes the contract on Stellar Testnet on demand (or on
 # Mainnet for release tags). The resulting contract ID is surfaced in the job
 # summary and published as a release artifact.
+#
+# Staged promotion: the `build` job produces a single optimized WASM artifact
+# keyed by its SHA-256 digest. The `promote` job moves that exact artifact
+# between environments (staging -> production) without rebuilding, verifying
+# the digest and deployment identity at every stage. Promotion aborts on any
+# digest or identity mismatch.
+#
+# Signer & approval requirements:
+#   - staging:    environment `staging` (no required reviewers)
+#   - production: environment `production` (required reviewers + signed release)
+#   - DEPLOYER_SECRET must be a hardware-backed / KMS signer; the deployer
+#     public key is recorded in deployment-info.json and re-verified per stage.
 name: Deploy Soroban Contracts
 
 on:
@@ -19,6 +31,19 @@ on:
         options:
           - testnet
           - mainnet
+      promote_from:
+        description: "Promote an existing artifact from this environment (leave empty to build)"
+        required: false
+        default: ""
+        type: choice
+        options:
+          - ""
+          - staging
+          - production
+      artifact_digest:
+        description: "Expected SHA-256 digest of the artifact to promote (required when promote_from is set)"
+        required: false
+        default: ""
 
 concurrency:
   group: ${{ github.workflow }}-${{ inputs.network || github.ref }}
@@ -28,15 +53,12 @@ permissions:
   contents: read
 
 jobs:
-  deploy:
-    name: Build & Deploy stream_contract
+  build:
+    name: Build stream_contract artifact
+    if: ${{ !inputs.promote_from }}
     runs-on: ubuntu-latest
-    environment: ${{ github.event_name == 'release' && 'production' || 'staging' }}
     permissions:
-      contents: write
-
-    env:
-      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      contents: read
 
     steps:
       - name: Checkout code
@@ -87,6 +109,14 @@ jobs:
           fi
           echo "WASM_WASM_PATH=$WASM" >> $GITHUB_ENV
 
+      - name: Compute artifact digest
+        id: digest
+        run: |
+          set -euo pipefail
+          DIGEST=$(sha256sum "$WASM_WASM_PATH" | awk '{print $1}')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+          echo "Artifact digest: $DIGEST"
+
       - name: Generate and attach CycloneDX SBOM
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
@@ -97,13 +127,99 @@ jobs:
           upload-artifact: true
           upload-release-assets: true
 
+      - name: Upload Optimized WASM Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: stream-contract-artifact
+          path: contracts/target/wasm32-unknown-unknown/release/stream_contract.optimized.wasm
+          if-no-files-found: error
+
+      - name: Record artifact digest
+        run: |
+          {
+            echo "## Build Summary"
+            echo ""
+            echo "- **Artifact digest (sha256)**: \`${{ steps.digest.outputs.digest }}\`"
+            echo "- **WASM**: \`$WASM_WASM_PATH\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  promote:
+    name: Promote stream_contract artifact
+    needs: build
+    if: ${{ always() && (inputs.promote_from || needs.build.result == 'success') }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event_name == 'release' && 'production' || 'staging' }}
+    permissions:
+      contents: write
+
+    env:
+      NETWORK: ${{ inputs.network || (github.event_name == 'release' && 'mainnet' || 'testnet') }}
+      PROMOTE_FROM: ${{ inputs.promote_from }}
+      EXPECTED_DIGEST: ${{ inputs.artifact_digest }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install Stellar CLI
+        run: |
+          curl -fsSL https://github.com/stellar/stellar-cli/raw/main/install.sh | sh -s -- --install-deps
+          echo "$HOME/.stellar-cli/bin" >> $GITHUB_PATH
+
+      - name: Download artifact to promote
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e881e0000a2c1ba077 # v4
+        with:
+          name: stream-contract-artifact
+          path: artifacts
+
+      - name: Verify artifact digest and deployment identity
+        id: verify
+        run: |
+          set -euo pipefail
+          WASM=artifacts/stream_contract.optimized.wasm
+          if [ ! -f "$WASM" ]; then
+            echo "ERROR: artifact not found at $WASM; aborting promotion"
+            exit 1
+          fi
+          ACTUAL=$(sha256sum "$WASM" | awk '{print $1}')
+          if [ -n "$EXPECTED_DIGEST" ] && [ "$ACTUAL" != "$EXPECTED_DIGEST" ]; then
+            echo "ERROR: artifact digest mismatch (expected $EXPECTED_DIGEST, got $ACTUAL); aborting promotion"
+            exit 1
+          fi
+          if [ -n "$PROMOTE_FROM" ]; then
+            # Deployment identity: the source environment must have recorded
+            # this exact digest before we promote it forward.
+            if [ ! -f deployment-info.json ]; then
+              echo "ERROR: deployment-info.json missing; cannot verify deployment identity; aborting promotion"
+              exit 1
+            fi
+            RECORDED=$(jq -r --arg net "$PROMOTE_FROM" '.[$net].artifactDigest // empty' deployment-info.json)
+            if [ -z "$RECORDED" ]; then
+              echo "ERROR: no recorded artifact digest for $PROMOTE_FROM; aborting promotion"
+              exit 1
+            fi
+            if [ "$RECORDED" != "$ACTUAL" ]; then
+              echo "ERROR: deployment identity mismatch for $PROMOTE_FROM (recorded $RECORDED, got $ACTUAL); aborting promotion"
+              exit 1
+            fi
+          fi
+          echo "digest=$ACTUAL" >> $GITHUB_OUTPUT
+          echo "Verified artifact digest: $ACTUAL"
+
       - name: Deploy & Initialize Contract
-        run: ./scripts/deploy.sh --network "$NETWORK"
+        run: ./scripts/deploy.sh --network "$NETWORK" --wasm "artifacts/stream_contract.optimized.wasm"
         env:
           DEPLOYER_SECRET: ${{ secrets.DEPLOYER_SECRET }}
           ADMIN_ADDRESS: ${{ secrets.ADMIN_ADDRESS }}
           TREASURY_ADDRESS: ${{ secrets.TREASURY_ADDRESS }}
           FEE_RATE_BPS: ${{ secrets.FEE_RATE_BPS }}
+
+      - name: Record artifact digest in deployment info
+        run: |
+          set -euo pipefail
+          jq --arg net "$NETWORK" --arg digest "${{ steps.verify.outputs.digest }}" \
+            '.[$net].artifactDigest = $digest' deployment-info.json > deployment-info.tmp
+          mv deployment-info.tmp deployment-info.json
 
       - name: Read Deployed Contract ID
         id: contract
@@ -120,20 +236,14 @@ jobs:
             echo "## Deployment Summary"
             echo ""
             echo "- **Network**: \`$NETWORK\`"
+            echo "- **Promoted from**: \`${PROMOTE_FROM:-fresh build}\`"
+            echo "- **Artifact digest**: \`${{ steps.verify.outputs.digest }}\`"
             echo "- **Contract ID**: \`${{ steps.contract.outputs.contract_id }}\`"
-            echo "- **WASM**: \`${{ env.WASM_WASM_PATH }}\`"
             echo "- **Deployment info**: "
             echo '```json'
             echo "${{ steps.contract.outputs.deployment-json }}"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Upload Optimized WASM Artifact
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: stream-contract-${{ env.NETWORK }}
-          path: contracts/target/wasm32-unknown-unknown/release/stream_contract.optimized.wasm
-          if-no-files-found: error
 
       - name: Upload Deployment Info
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

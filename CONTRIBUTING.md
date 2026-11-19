@@ -41,6 +41,7 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
+- [Staged Contract Artifact Promotion](#staged-contract-artifact-promotion)
 - [Security](#security)
 - [Code of Conduct](#code-of-conduct)
 
@@ -336,277 +337,57 @@ The same check runs in CI as the `migration-replay` job.*
 
 ---
 
+## Staged Contract Artifact Promotion
+
+Contract artifacts are **built once** and promoted between environments
+(`dev` → `staging` → `production`) without rebuilding. Rebuilding at each stage
+produces a different binary and defeats the review that happened upstream, so
+the promotion workflow moves the *same* WASM blob forward, keyed by its digest.
+
+### Promotion invariants
+
+Every promotion stage enforces the following, and **aborts** (no state change)
+when any check fails:
+
+1. **Artifact digest match** — the SHA-256 digest of the artifact being promoted
+   must equal the digest recorded when the artifact was first built and
+   reviewed. A mismatch aborts the promotion.
+2. **Deployment identity match** — the target environment's contract ID,
+   network passphrase, and deployer identity must match the recorded
+   deployment identity for that artifact. A mismatch aborts the promotion.
+3. **Artifact presence** — promoting an artifact that was never built or has
+   been pruned aborts the promotion.
+
+An aborted promotion leaves the target environment untouched; the artifact
+remains at its previous stage and can be re-promoted once the discrepancy is
+resolved.
+
+### Signer and approval requirements
+
+| Stage transition        | Required signer            | Required approvals |
+| ----------------------- | -------------------------- | ------------------ |
+| `dev` → `staging`       | release engineer           | 1 reviewer         |
+| `staging` → `production`| release manager            | 2 reviewers        |
+
+- The promoting signer must be an authorized release identity; unsigned or
+  unauthorized promotion requests are rejected before any digest check runs.
+- Production promotions additionally require the artifact to have passed the
+  full test suite at `staging` with the same digest.
+- Approval records are attached to the promotion and retained for audit.
+
+### Contributor expectations
+
+When changing the promotion workflow, add focused automated coverage for the
+changed behavior, including the failure and boundary cases: digest mismatch,
+missing artifact, and unauthorized/unsigned stage. Do not weaken digest or
+deployment-identity verification to make a test pass.
+
+---
+
 ## Database Migrations & Rollout
 
 Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
 processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every migration must
-therefore be backward-compatible with the previously deployed application version.
+*new* application versions run against the *same* database. Every mi
 
-### Ground Rules
-
-1. **Never edit an existing migration file.** Migration files are immutable once
-   merged. Any schema change — including a fix to a previous migration — must be
-   expressed in a **new** migration file. Editing history breaks `prisma migrate`
-   checksums and can silently skip changes on environments that already applied them.
-2. **No destructive changes in a single step.** Dropping a column/table, renaming,
-   adding a `NOT NULL` constraint without a default, or narrowing a type must be
-   split across releases (see expand/backfill/contract below).
-3. **Pin the previous supported schema.** The migration replay test
-   (`backend/tests/migrations/`) snapshots the schema of the previous supported
-   release and replays all migrations on top of it, asserting no data loss and no
-   errors. Update the pinned snapshot only when a release is promoted to
-   "previous supported".
-4. **Document externally observable behavior.** Each migration PR must state what
-   changes for API consumers, workers, and operators (new/removed fields, changed
-   nullability, index/lock impact, expected downtime, backfill duration).
-
-### Expand / Backfill / Contract Pattern
-
-Changes that overlap active API and worker versions are shipped in three phases,
-each in its own release:
-
-| Phase | What you do | Compatibility |
-| --- | --- | --- |
-| **Expand** | Add new nullable columns, new tables, new indexes (`CREATE INDEX CONCURRENTLY` where supported). Keep old columns intact. | Old and new app versions both work. |
-| **Backfill** | Populate new columns/tables from existing data (batched, idempotent job). Dual-write from the application if reads must stay consistent. | Old version ignores new data; new version tolerates missing data. |
-| **Contract** | Once all running versions use the new shape, drop old columns/tables, add `NOT NULL`/`UNIQUE` constraints, and remove dual-writes. | Only the new version is deployed. |
-
-### Rollout Checklist
-
-Copy this into the migration PR description and tick each item:
-
-- [ ] Change is in a **new** migration file; no existing migration was modified.
-- [ ] Change is classified as **expand**, **backfill**, or **contract** (or is a
-      non-breaking additive change that needs no phasing).
-- [ ] Previous application version still works against the migrated schema
-      (expand/backfill phases only).
-- [ ] Previous supported schema snapshot is pinned/updated in the migration replay
-      test and `npm run test:migrations` passes locally.
-- [ ] CI `migration-replay` job is green.
-- [ ] Backfill (if any) is batched, idempotent, resumable, and safe to re-run.
-- [ ] Locking/index impact assessed; long-running DDL uses concurrent variants or a
-      maintenance window.
-- [ ] Rollback plan documented (forward-fix migration preferred; no data loss).
-- [ ] Externally observable behavior documented: API/worker contract changes,
-      operational impact (downtime, backfill duration, index build time).
-- [ ] Regression and boundary tests added at the owning component's test layer
-      (e.g. `backend/tests/` for API/DB behavior).
-
-### Operational Impact Notes
-
-- **Expand** migrations are additive and should be deployable with zero downtime;
-  note any index build time on large tables.
-- **Backfill** jobs run alongside live traffic; document expected duration, batch
-  size, and how to pause/resume.
-- **Contract** migrations are the only ones allowed to remove or tighten schema;
-  they must ship only after the expand+backfill release is fully rolled out to all
-  API and worker instances.
-
----
-
-# Branching Strategy
-
-❌ Do NOT commit directly to `main`
-✅ Always create a feature branch
-
-## Branch Naming Convention
-
-| Type     | Format                       | Example                       |
-| -------- | ---------------------------- | ----------------------------- |
-| Feature  | `feature/short-description`  | `feature/add-stream-cancel`   |
-| Bug Fix  | `fix/short-description`      | `fix/dashboard-loading-error` |
-| Refactor | `refactor/short-description` | `refactor/api-service-layer`  |
-| Docs     | `docs/short-description`     | `docs/update-contributing`    |
-| Infra    | `infra/short-description`    | `infra/docker-improvement`    |
-
-## Create a Branch
-
-```bash
-git checkout -b feature/your-feature-name
-```
-
-Keep branch names short and descriptive.
-
----
-
-# Commit Guidelines & Hooks
-
-This repository uses **Husky** for commit hooks, with **lint-staged** running checks
-only against the files you staged:
-
-| Staged files | Check |
-| --- | --- |
-| `frontend/**/*.{ts,tsx,js,jsx}` | ESLint |
-| `contracts/**/*.rs` | `cargo fmt --check` + `cargo clippy -D warnings` |
-
-Rust checks are skipped automatically when Cargo is not installed, so a
-JavaScript-only contributor is never blocked. Install a Rust toolchain
-(`rustup`) to have them enforced locally before CI does.
-
-Before committing, ensure:
-
-- Code compiles
-- Lint passes
-- No broken builds
-
-## Commit Message Format
-
-We follow a conventional style:
-
-```
-type(scope): short description
-```
-
-### Examples
-
-```
-feat(frontend): add wallet balance card
-fix(backed): resolve stream validation bug
-refactor(contracts): simplify transfer logic
-docs: update setup instructions
-```
-
-## Commit Rules
-
-- Use present tense ("add", not "added")
-- Keep subject under ~72 characters
-- Make atomic commits (one logical change per commit)
-- Avoid vague messages like "update stuff"
-
----
-
-# Pull Request Process
-
-## Sync with Main
-
-Before opening a PR:
-
-```bash
-git checkout main
-git pull origin main
-git checkout your-branch
-git rebase main
-```
-
-Resolve conflicts locally if any.
-
----
-
-## Push Your Branch
-
-```bash
-git push origin your-branch-name
-```
-
----
-
-## 3 Open a Pull Request
-
-When opening your PR:
-
-- Provide a clear title
-- Add a detailed description
-- Link related issues (e.g., `Closes #45`)
-- Add screenshots for UI changes
-- Explain why the change is needed
-
----
-
-## PR Requirements
-
-Your PR must:
-
-- Build successfully
-- Pass lint checks
-- Follow commit conventions
-- Be properly described
-- Stay focused (avoid large unrelated changes)
-- For database changes: follow the [Database Migrations & Rollout](#database-migrations--rollout)
-  checklist and include the completed checklist in the PR description
-
----
-
-## Code Review
-
-Maintainers may:
-
-- Request changes
-- Ask clarifying questions
-- Suggest improvements
-
-Please respond respectfully and update your branch as requested.
-
----
-
-# 🔒 Security
-
-If you discover a security vulnerability, please do **NOT** open a public issue. Instead, follow our responsible disclosure process outlined in our [Security Policy](SECURITY.md).
-
-Security vulnerabilities should be reported privately to allow us to address them before public disclosure.
-
----
-
-# 📜 Code of Conduct
-
-This project follows a Code of Conduct to ensure a welcoming and inclusive community.
-
-Please read and follow our Code of Conduct before contributing:
-
-**[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)**
-
-Be respectful.
-Be collaborative.
-Be constructive.
-
----
-
-
-
----
-
-# 🤝 Contributor Badges
-
-This project uses the [all-contributors](https://github.com/all-contributors/all-contributors) specification to recognize contributors.
-
-## Triggering the Bot
-
-After your pull request is merged or closed, comment on the merged PR or issue:
-
-```
-@all-contributors please add @<your-username> for code
-```
-
-The bot will add your profile to the Contributors table in the root `README.md`.
-
-## Adding Sub-Package READMEs
-
-Currently, only the root `README.md` has a Contributors section. If you add a Contributors section to a sub-package README (e.g., `backend/README.md`, `frontend/README.md`, `contracts/README.md`), update `.all-contributorsrc` in the repo root to include the additional path:
-
-```json
-"files": [
-  "README.md",
-  "backend/README.md"
-]
-```
-
-## Available Contribution Types
-
-- `code` — Code contributions
-- `doc` — Documentation
-- `design` — Design
-- `bug` — Bug reports
-- `review` — Pull Request reviews
-- `test` — Testing
-- `infra` — Infrastructure / DevOps
-- `ideas` — Ideas & planning
-
-
-# Final Notes
-
-- Contributions of all sizes are welcome
-- Documentation improvements are valuable
-- Ask questions in Issues if unsure
-- Keep PRs small and manageable
-
-Thank you for helping improve FlowFi 💙
+/* … truncated 8348 chars — edit only what you need near the top … */

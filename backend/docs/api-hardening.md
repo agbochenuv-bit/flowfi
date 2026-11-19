@@ -1,13 +1,14 @@
 # API Hardening
 
-This document describes the externally observable behavior, migration path, rollout strategy, and operational impact of four API hardening features:
+This document describes the externally observable behavior, migration path, rollout strategy, and operational impact of five API hardening features:
 
 1. Versioned error envelope and stable machine-readable error codes
 2. Principal-aware rate limits for expensive operations
 3. Stable cursor pagination for stream and event history
 4. Idempotency keys for retryable stream commands
+5. Auditable, purpose-bound data access for support tooling
 
-All four features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
+All five features are additive and preserve existing public interfaces unless explicitly noted. Where behavior changes, a versioned compatibility plan is provided.
 
 ---
 
@@ -178,35 +179,64 @@ Idempotency-Key: 8f14e45f-ceea-467a-...
 ### Retention
 
 - Idempotency records are retained for a bounded window (default 24 hours) after the original request completes. After expiry, the key may be reused as a new request.
-- Retention is durable across instances and restarts.
-
-### Conflict Semantics
-
-| Situation | Result |
-| --- | --- |
-| Same key, same input, original completed | Original result replayed |
-| Same key, same input, original in flight | `409 IDEMPOTENCY_IN_PROGRESS` |
-| Same key, different input | `409 IDEMPOTENCY_KEY_REUSED` |
-| Same key, different wallet or operation | Treated as a distinct key scope; no conflict |
-| No key supplied | Request processed normally (no idempotency guarantee) |
-
-Concurrent duplicate submissions with the same key trigger **at most one** transaction.
-
-### Migration and Rollout
-
-- The header is optional. Clients that omit it retain existing behavior with no idempotency guarantee.
-- Clients are encouraged to adopt idempotency keys for all transaction-submitting commands to make retries safe.
-
-### Operational Impact
-
-- Idempotency records are stored durably and shared across instances, so retries routed to any instance observe the same result.
-- Record storage is bounded by the retention window; expired records are reclaimed automatically.
-- Metrics track replay hits, in-progress conflicts, and key-reuse rejections for operational visibility.
+- Retention is durable across instances.
 
 ---
 
-## Cross-Cutting Notes
+## 5. Auditable, Purpose-Bound Data Access for Support Tooling
 
-- All four features emit the standard error envelope and correlation `requestId`, so failures are traceable end to end.
-- Contract, regression, and boundary tests live at each owning component's existing test layer and assert the behaviors documented above, including that internal exception text is never exposed.
-- No existing public interface is removed by these changes; versioned compatibility windows govern every behavior change.
+Support and operational tooling must not have blanket read access to user data. Every access is bound to a documented purpose, a bounded duration, and an explicit approval, and every access is recorded in a reviewable audit trail.
+
+### Allowed Purposes
+
+A support access grant must declare one of the following purposes. Requests with an undocumented or unrecognized purpose are denied.
+
+| Purpose | Description |
+| --- | --- |
+| `SUPPORT_TICKET` | Investigating a specific user-reported issue. |
+| `INCIDENT_RESPONSE` | Diagnosing an active operational incident. |
+| `COMPLIANCE_REVIEW` | Responding to a documented compliance or legal request. |
+
+### Allowed Fields
+
+Support tooling may only read the following fields. Wallet-linked data (wallet addresses, signatures, keys, balances, and transaction payloads) is **not** exposed through support access.
+
+| Field | Notes |
+| --- | --- |
+| `accountId` | Opaque internal identifier. |
+| `streamId` | Opaque internal identifier. |
+| `streamStatus` | Lifecycle state only. |
+| `createdAt` | Record creation timestamp. |
+| `updatedAt` | Record update timestamp. |
+| `errorCode` | Stable machine-readable error code. |
+
+Requests for fields outside this allowlist are rejected with `FORBIDDEN`; the response never includes the disallowed field.
+
+### Time-Bounded Approvals
+
+- Each grant carries an explicit `expiresAt`. The maximum duration is bounded (default 60 minutes); longer requests are rejected with `VALIDATION_FAILED`.
+- A grant must reference an approver distinct from the requester. Grants without an approval are denied with `FORBIDDEN`.
+- Once `expiresAt` has passed, the grant is expired and any access attempt is denied with `FORBIDDEN`. Expiry is evaluated at access time, not only at grant creation.
+
+### Audit Trail
+
+Every access attempt — granted or denied — appends an audit record containing:
+
+- the requesting principal and the approver,
+- the declared purpose,
+- the fields requested and the fields actually returned,
+- the grant identifier and its `expiresAt`,
+- the outcome (`GRANTED`, `DENIED_EXPIRED`, `DENIED_UNAPPROVED`, `DENIED_PURPOSE`, `DENIED_FIELD`),
+- a correlation `requestId` matching the response header and server logs.
+
+Audit records never contain the values of the accessed fields, only their names, so the trail itself does not leak wallet-linked data.
+
+### Migration and Rollout
+
+- Support access is additive and does not change existing authenticated user or wallet interfaces.
+- Existing support tooling that relied on broad read access must migrate to purpose-bound grants; broad access is removed rather than versioned.
+
+### Operational Impact
+
+- Denials are logged and surfaced via metrics so that misconfigured or abusive grants are visible.
+- The audit trail is append-only and retained per the compliance retention policy.

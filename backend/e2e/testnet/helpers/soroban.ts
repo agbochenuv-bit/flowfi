@@ -8,6 +8,7 @@ import {
   scValToNative,
   type xdr,
 } from '@stellar/stellar-sdk';
+import { createHash } from 'node:crypto';
 import { testnetConfig } from './config.js';
 
 export const server = new rpc.Server(testnetConfig.rpcUrl, {
@@ -85,6 +86,111 @@ export async function createFundedAccount(): Promise<Keypair> {
 /** Stellar Asset Contract address for native XLM on the configured network. */
 export function nativeTokenContractId(): string {
   return Asset.native().contractId(testnetConfig.networkPassphrase);
+}
+
+/**
+ * A reviewed, already-built contract artifact. Promotion moves this exact
+ * artifact between environments; it is never rebuilt per stage.
+ */
+export interface ContractArtifact {
+  /** sha256 of the wasm bytes, hex encoded. */
+  digest: string;
+  /** Raw wasm bytes of the reviewed artifact. */
+  wasm: Buffer;
+  /** Contract id the artifact is expected to be deployed at. */
+  contractId: string;
+  /** Network passphrase the artifact was built for. */
+  networkPassphrase: string;
+}
+
+/** sha256 hex digest of a wasm artifact. */
+export function artifactDigest(wasm: Buffer): string {
+  return createHash('sha256').update(wasm).digest('hex');
+}
+
+/**
+ * Build a {@link ContractArtifact} from reviewed wasm bytes, recording the
+ * digest and deployment identity that every promotion stage must re-verify.
+ */
+export function createArtifact(
+  wasm: Buffer,
+  contractId: string,
+  networkPassphrase: string = testnetConfig.networkPassphrase,
+): ContractArtifact {
+  return { digest: artifactDigest(wasm), wasm, contractId, networkPassphrase };
+}
+
+export interface PromotionStage {
+  name: string;
+  /** Signer that must authorize the promotion into this stage. */
+  signer: Keypair;
+  /** Whether this stage requires an explicit approval before promotion. */
+  requiresApproval: boolean;
+}
+
+export interface PromotionRequest {
+  artifact: ContractArtifact;
+  stage: PromotionStage;
+  /** Digest the operator claims the artifact has; must match the artifact. */
+  expectedDigest: string;
+  /** Contract id the operator claims the artifact deploys to. */
+  expectedContractId: string;
+  /** Network passphrase of the target environment. */
+  targetNetworkPassphrase: string;
+  /** Approval reference recorded for stages that require approval. */
+  approval?: string;
+}
+
+/**
+ * Verify an artifact's digest and deployment identity before promoting it into
+ * a stage. Throws (aborting the promotion) on any mismatch so a different
+ * binary can never be silently deployed at a later stage.
+ */
+export function verifyPromotion(request: PromotionRequest): void {
+  const { artifact, stage, expectedDigest, expectedContractId, targetNetworkPassphrase, approval } =
+    request;
+
+  if (!artifact.wasm || artifact.wasm.length === 0) {
+    throw new Error(`promotion to ${stage.name} aborted: artifact is missing or empty`);
+  }
+
+  const actualDigest = artifactDigest(artifact.wasm);
+  if (actualDigest !== artifact.digest) {
+    throw new Error(
+      `promotion to ${stage.name} aborted: artifact digest ${actualDigest} does not match recorded digest ${artifact.digest}`,
+    );
+  }
+  if (expectedDigest !== artifact.digest) {
+    throw new Error(
+      `promotion to ${stage.name} aborted: expected digest ${expectedDigest} does not match artifact digest ${artifact.digest}`,
+    );
+  }
+  if (expectedContractId !== artifact.contractId) {
+    throw new Error(
+      `promotion to ${stage.name} aborted: expected contract ${expectedContractId} does not match artifact contract ${artifact.contractId}`,
+    );
+  }
+  if (targetNetworkPassphrase !== artifact.networkPassphrase) {
+    throw new Error(
+      `promotion to ${stage.name} aborted: target network does not match artifact network`,
+    );
+  }
+  if (!stage.signer || !stage.signer.publicKey()) {
+    throw new Error(`promotion to ${stage.name} aborted: stage has no authorized signer`);
+  }
+  if (stage.requiresApproval && !approval) {
+    throw new Error(`promotion to ${stage.name} aborted: stage requires an approval reference`);
+  }
+}
+
+/**
+ * Promote a reviewed artifact into a stage without rebuilding it. Verifies the
+ * digest and deployment identity, then returns the artifact bound to the stage
+ * signer so the caller can deploy the exact same bytes.
+ */
+export function promoteArtifact(request: PromotionRequest): ContractArtifact {
+  verifyPromotion(request);
+  return request.artifact;
 }
 
 export interface InvokeResult {
