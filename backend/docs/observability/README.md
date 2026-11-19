@@ -116,6 +116,67 @@ itself, because ES module imports are hoisted past the entrypoint's own
 Telemetry never blocks serving: a failed SDK start logs a warning and the
 process continues untraced.
 
+## Dependency outage game days
+
+Repeatable game days for the four external dependencies the backend cannot
+serve without: **database**, **cache**, **Soroban RPC**, and **webhook
+providers**. Each game day runs in an isolated environment, records detection
+and recovery outcomes, and asserts that outages fail closed — no unsafe
+mutation fallback — with production execution gated behind explicit approval.
+
+### Isolation rules
+
+- Run against a dedicated stack (`docker compose -f docker-compose.gameday.yml`)
+  with its own database, cache, and a stub RPC/webhook endpoint. Never point a
+game day at staging or production data.
+- Use a throwaway `DATABASE_URL` and `REDIS_URL`; the stack is torn down after
+  each run so state cannot leak between scenarios.
+- Production execution is **opt-in only**: the runner refuses to target a
+  production environment unless `GAMEDAY_ALLOW_PRODUCTION=true` is set *and* an
+  approver is recorded in the run log. Default is isolated-only.
+
+### Scenarios
+
+| Scenario | Injection | Expected detection | Expected recovery |
+| --- | --- | --- | --- |
+| Database outage | Stop the DB container / revoke connections | `flowfi_db_pool_waiting_requests` rises, `flowfi_http_requests_total{status=~"5.."}` climbs | Pool drains, 5xx rate returns to baseline |
+| Cache outage | Stop the cache container | Cache-miss latency rises; requests still served from source of truth | Latency returns to baseline once cache is back |
+| Soroban RPC outage | Point `SOROBAN_RPC_URL` at a stub that times out | `flowfi_rpc_circuit_breaker_trips_total` increments, `flowfi_indexer_polls_total{outcome="rpc_error"}` climbs | Breaker closes, indexer lag recovers |
+| Webhook provider outage | Stub returns 5xx / hangs | Delivery retries logged, no partial mutation committed | Retries succeed, no duplicate side effects |
+
+### Fail-closed assertions
+
+Every scenario must confirm that mutations **fail closed** during the outage:
+
+- Write endpoints return an error (5xx / 503) rather than silently succeeding or
+  falling back to an in-memory or unauthenticated path.
+- No partial financial state is committed; accounting invariants hold after
+  recovery.
+- Wallet authorization and chain/network validation are never bypassed to keep
+  serving during an outage.
+
+### Recording outcomes
+
+Each run appends a structured record so game days are repeatable and diffable:
+
+```json
+{
+  "scenario": "soroban_rpc_outage",
+  "environment": "isolated",
+  "startedAt": "2024-01-01T00:00:00Z",
+  "detected": true,
+  "detectionSignal": "flowfi_rpc_circuit_breaker_trips_total > 0",
+  "recovered": true,
+  "recoverySeconds": 42,
+  "failClosed": true,
+  "productionApproved": false
+}
+```
+
+A run is only considered passing when `detected`, `recovered`, and
+`failClosed` are all `true`. Production runs additionally require
+`productionApproved: true`.
+
 ## Configuration reference
 
 | Variable | Default | Purpose |
@@ -126,3 +187,4 @@ process continues untraced.
 | `SOROBAN_RPC_TIMEOUT_MS` | `10000` | Per-call RPC deadline (drives breaker trips) |
 | `SOROBAN_RPC_MAX_RETRIES` | `2` | Retry budget (drives failover counts) |
 | `SIMULATION_VALIDITY_LEDGERS` | `10` | Ledgers a `/simulate` footprint stays fresh for |
+| `GAMEDAY_ALLOW_PRODUCTION` | `false` | Opt-in gate for running a game day against production |

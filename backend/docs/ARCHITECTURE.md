@@ -9,6 +9,91 @@ For the full project-wide architecture (event type data flows, pause/resume
 timing, environment variables, and operational runbook) see
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
+**Document version:** 1.0.0 — see [Versioning & Review](#versioning--review).
+
+---
+
+## System Context & Trust-Boundary Map
+
+This section is the maintained, versioned view of every trust boundary in the
+system. Each boundary names the components on either side, the owning code, and
+the data flows that cross it. When you change a boundary, update this map and
+bump the document version (see [Versioning & Review](#versioning--review)).
+
+### Components
+
+| Component | Description | Owning code |
+|-----------|-------------|-------------|
+| **Browser** | Untrusted frontend SPA running in the user's browser. | `frontend/` |
+| **Wallet** | User-controlled signer (e.g. Freighter). Holds user keys; never shares them. | `frontend/` wallet integration |
+| **API** | Backend HTTP/SSE server. Authenticates requests, enforces authorization. | `backend/src/index.ts`, `backend/src/routes/`, `backend/src/controllers/` |
+| **Worker** | Background indexer polling Soroban RPC and persisting events. | `backend/src/workers/soroban-event-worker.ts`, `backend/src/workers/index.ts` |
+| **Database** | PostgreSQL via Prisma. Canonical persistence for streams and events. | `backend/prisma/schema.prisma` |
+| **RPC** | Soroban RPC endpoint used to read chain state and submit transactions. | `backend/src/services/sorobanService.ts` |
+| **External provider** | Third-party services (Redis Pub/Sub, notification/email providers). | `backend/src/services/sse.service.ts`, notification services |
+
+### Trust Boundaries
+
+Each boundary is a place where data crosses from a less-trusted to a
+more-trusted domain (or vice versa). Authorization and validation MUST be
+enforced at the boundary, not assumed from the caller.
+
+| ID | Boundary | Trusted side | Untrusted side | Owning code | Data flows |
+|----|----------|--------------|----------------|-------------|------------|
+| **TB-1** | Browser → API | API | Browser | `backend/src/middleware/`, `backend/src/routes/` | HTTP requests (auth tokens, stream IDs, amounts). API MUST authenticate and authorize every mutating request. |
+| **TB-2** | Wallet → RPC | RPC / chain | Wallet | `frontend/` wallet integration, `backend/src/services/sorobanService.ts` | Wallet-signed transactions (create, withdraw, pause, resume). Backend never holds user keys. |
+| **TB-3** | API → RPC (custodial) | RPC / chain | API | `backend/src/services/sorobanService.ts` (`topUpStream`) | Server-signed top-up transactions using `KEEPER_SECRET_KEY`. Only top-up is custodial. |
+| **TB-4** | Worker → RPC | RPC / chain | Worker | `backend/src/workers/soroban-event-worker.ts` | Read-only polling of contract events; XDR decoded and validated before persistence. |
+| **TB-5** | Worker → Database | Database | Worker | `backend/src/workers/soroban-event-worker.ts`, `backend/prisma/schema.prisma` | Upserts of `Stream` / `StreamEvent`, cursor advance on `IndexerState`. |
+| **TB-6** | API → Database | Database | API | `backend/src/controllers/`, `backend/src/services/indexerService.ts` | Reads/writes of stream state and indexer control-plane operations. |
+| **TB-7** | API → External provider (Redis) | External provider | API | `backend/src/services/sse.service.ts` | SSE fanout via Redis Pub/Sub (`sse:stream:*`, `sse:user:*`). |
+| **TB-8** | API → Browser (SSE) | Browser | API | `backend/src/services/sse.service.ts` | Server-Sent Events pushed to subscribed clients. Clients receive only events they are authorized to see. |
+
+### Data Flow Overview
+
+```
+[Browser] --TB-1--> [API] --TB-6--> [Database]
+   |                  |  \--TB-3--> [RPC] <--TB-2-- [Wallet]
+   |                  |  \--TB-7--> [External provider: Redis]
+   |<----TB-8---------|
+                      |
+[Worker] --TB-4--> [RPC]
+[Worker] --TB-5--> [Database]
+```
+
+### Boundary Rules
+
+1. **TB-1 (Browser → API):** Never trust client-supplied identity or amounts;
+   re-derive authorization from the authenticated session.
+2. **TB-2 (Wallet → RPC):** User keys never leave the wallet. The backend must
+   not request or store them.
+3. **TB-3 (API → RPC custodial):** `KEEPER_SECRET_KEY` is used only by
+   `topUpStream`. Do not wire other mutating actions to a server-side submit
+   path (see [Keeper-Key Authorization Model](#keeper-key-authorization-model)).
+4. **TB-4/TB-5 (Worker):** Validate decoded XDR before persisting; dedup via
+   `@@unique([transactionHash, eventType])`.
+5. **TB-7/TB-8 (SSE):** Broadcast only to authorized subscribers; admin events
+   are scoped to `ADMIN_PUBLIC_KEY`.
+
+---
+
+## Versioning & Review
+
+This document is versioned. The version is declared at the top of the file
+(`**Document version:**`) and MUST be bumped whenever a trust boundary, owning
+code path, or data flow changes.
+
+**Lightweight review process:**
+
+1. Any PR that adds, removes, or moves a trust boundary, or changes the owning
+   code path of an existing boundary, MUST update this document in the same PR.
+2. Reviewers verify that every boundary row links to a real owning code path and
+   that the data-flow diagram matches the table.
+3. Bump the document version (semver: major for boundary removal/trust-model
+   change, minor for new boundary, patch for path/link fixes).
+4. The `backend/docs/ARCHITECTURE.md` file is the single maintained view; do not
+   duplicate the boundary map elsewhere.
+
 ---
 
 ## Indexer Ownership Model
@@ -166,26 +251,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow

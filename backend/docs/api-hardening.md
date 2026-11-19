@@ -178,35 +178,47 @@ Idempotency-Key: 8f14e45f-ceea-467a-...
 ### Retention
 
 - Idempotency records are retained for a bounded window (default 24 hours) after the original request completes. After expiry, the key may be reused as a new request.
-- Retention is durable across instances and restarts.
-
-### Conflict Semantics
-
-| Situation | Result |
-| --- | --- |
-| Same key, same input, original completed | Original result replayed |
-| Same key, same input, original in flight | `409 IDEMPOTENCY_IN_PROGRESS` |
-| Same key, different input | `409 IDEMPOTENCY_KEY_REUSED` |
-| Same key, different wallet or operation | Treated as a distinct key scope; no conflict |
-| No key supplied | Request processed normally (no idempotency guarantee) |
-
-Concurrent duplicate submissions with the same key trigger **at most one** transaction.
-
-### Migration and Rollout
-
-- The header is optional. Clients that omit it retain existing behavior with no idempotency guarantee.
-- Clients are encouraged to adopt idempotency keys for all transaction-submitting commands to make retries safe.
-
-### Operational Impact
-
-- Idempotency records are stored durably and shared across instances, so retries routed to any instance observe the same result.
-- Record storage is bounded by the retention window; expired records are reclaimed automatically.
-- Metrics track replay hits, in-progress conflicts, and key-reuse rejections for operational visibility.
+- Retention is durable across instances.
 
 ---
 
-## Cross-Cutting Notes
+## 5. Signed Action Permits
 
-- All four features emit the standard error envelope and correlation `requestId`, so failures are traceable end to end.
-- Contract, regression, and boundary tests live at each owning component's existing test layer and assert the behaviors documented above, including that internal exception text is never exposed.
-- No existing public interface is removed by these changes; versioned compatibility windows govern every behavior change.
+Wallet and delegated action flows may be authorized by a **signed action permit**: a signed artifact that scopes a delegated action to a specific network, contract, and action scope, with a bounded validity window and optional revocation.
+
+### Permit Semantics
+
+- **Scope** — a permit is bound to a network (chain ID), a target contract address, and an action scope (e.g. the permitted action type and parameters). A permit is only valid for the exact scope it was signed for.
+- **Expiry** — a permit carries an `expiresAt` timestamp. It is valid strictly before `expiresAt` and rejected at or after it.
+- **Revocation** — a permit may be revoked before expiry; a revoked permit is rejected even if otherwise valid.
+- **Single use** — where a permit is marked single-use, a successful use consumes it; replaying the same permit is rejected.
+
+### Stable Error Codes
+
+Permit validation failures use the standard error envelope with the following stable codes:
+
+| Condition | Code | HTTP |
+| --- | --- | --- |
+| Permit signature invalid or malformed | `PERMIT_INVALID` | `400` |
+| Permit network / chain ID mismatch | `PERMIT_WRONG_NETWORK` | `400` |
+| Permit target contract mismatch | `PERMIT_WRONG_CONTRACT` | `400` |
+| Permit action scope altered / mismatch | `PERMIT_SCOPE_MISMATCH` | `400` |
+| Permit expired (at or after `expiresAt`) | `PERMIT_EXPIRED` | `400` |
+| Permit revoked | `PERMIT_REVOKED` | `403` |
+| Permit already used (replay) | `PERMIT_REPLAYED` | `409` |
+
+These codes are part of the public contract and will not change meaning within a major API version.
+
+### Regression Coverage
+
+Automated tests assert each of the above conditions with its stable expected code, including boundary cases:
+
+- A permit used just before `expiresAt` succeeds; the same permit used at or just after `expiresAt` fails with `PERMIT_EXPIRED`.
+- A single-use permit succeeds once and is rejected with `PERMIT_REPLAYED` on reuse.
+- A revoked permit is rejected with `PERMIT_REVOKED` even when unexpired and correctly scoped.
+- Wrong network, wrong contract, and altered scope each fail with their respective codes.
+
+### Operational Impact
+
+- Permit validation failures are logged with the request `requestId` and the stable code, without logging the raw permit signature.
+- Revocation state is checked at validation time; revocation does not require reissuing outstanding permits.

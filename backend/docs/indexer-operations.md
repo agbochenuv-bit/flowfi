@@ -3,10 +3,11 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
-written for operators and on-call engineers. All public interfaces described
-here are additive; existing endpoints and configuration keys keep working
-unless noted.
+graceful shutdown and poll cancellation, the indexer metrics, the
+repeatable dependency-outage game days, and the long-running memory/queue
+soak test. It is written for operators and on-call engineers. All public
+interfaces described here are additive; existing endpoints and configuration
+keys keep working unless noted.
 
 ---
 
@@ -167,37 +168,79 @@ backend instances**.
   concurrently, the resulting event state for a given starting state and
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
-- **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+- **Fencing still applies.** A r
 
 ---
 
-## 4. Metrics
+## 4. Long-running memory and queue stability (soak test)
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+The indexer ships a repeatable soak test that drives event polling, SSE
+fanout, webhook dispatch, and replay under sustained representative traffic
+and asserts that memory and queue depths stay bounded. It guards against
+slow resource growth (leaks, unbounded buffers, queue backlogs) that short
+unit tests miss.
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+### What it exercises
+
+- **Event polling** — a continuous stream of synthetic ledgers/events at a
+  representative rate for the full soak window.
+- **SSE fanout** — a fixed set of subscribers, including at least one **slow
+  consumer** that reads below the production rate, to exercise backpressure.
+- **Webhook dispatch** — deliveries to a mix of fast and slow/failing
+  endpoints to exercise retry and queue bounds.
+- **Replay** — a large backlog replay (including a boundary-sized range) run
+  alongside live traffic to exercise the replay queue and cursor
+  serialization.
+
+### Published thresholds
+
+The soak test fails if any of the following bounds are exceeded over the
+window. Thresholds are intentionally generous to avoid flakiness on shared CI
+runners while still catching unbounded growth.
+
+| Metric | Bound | Rationale |
+| --- | --- | --- |
+| Heap growth (post-warmup) | ≤ 25% of baseline, and ≤ 64 MiB absolute | Catches leaks without penalizing GC jitter |
+| Polling backlog depth | ≤ 1 batch (never grows across iterations) | Polling must drain each batch |
+| SSE subscriber buffer depth | ≤ configured per-subscriber cap | Slow consumers are dropped/backpressured, not buffered unboundedly |
+| Webhook dispatch queue depth | ≤ configured max queue size | Dispatch queue must stay bounded under slow/failing endpoints |
+| Replay queue depth | ≤ 1 in-flight replay | Replay is serialized against polling |
+| Dropped/evicted SSE subscribers | counted, not unbounded | Slow consumers are evicted rather than accumulating |
+
+### Failure and boundary cases covered
+
+- **Queue saturation** — traffic is driven above the drain rate to confirm
+  queues cap out and shed load instead of growing without bound.
+- **Slow consumers** — a subscriber that reads slowly must be backpressured
+  or evicted; its buffer must not grow past the cap.
+- **Large backlog replay** — replaying a boundary-sized ledger range must
+  complete with bounded memory and must not advance the live cursor past the
+  last applied ledger on failure.
+
+### Reproduction
+
+Run the soak test from the backend package. It is opt-in (not part of the
+fast unit suite) so it does not slow normal CI:
+
+```bash
+cd backend
+# Default soak window (short, CI-friendly)
+npm run test:soak
+
+# Longer local soak window (e.g. 5 minutes)
+SOAK_DURATION_MS=300000 npm run test:soak
+```
+
+Environment knobs:
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `SOAK_DURATION_MS` | Soak window length | Short CI-friendly default |
+| `SOAK_EVENT_RATE` | Synthetic events per second | Representative production rate |
+| `SOAK_SSE_SUBSCRIBERS` | Number of SSE subscribers | Small fixed set |
+| `SOAK_WEBHOOK_ENDPOINTS` | Number of webhook endpoints | Small fixed set |
+
+If a threshold is exceeded, the test reports the offending metric, its
+observed value, and the bound so the regression can be triaged. Thresholds
+and reproduction steps above are the published contract for this test; update
+them here if the bounds change.
