@@ -53,4 +53,92 @@ export function transactionSuccessToast(
   return options ? toast.success(message, options) : toast.success(message);
 }
 
+/**
+ * Finality states a transaction can be in. Success feedback is only emitted on
+ * `confirmed`; submission and confirmation-in-progress states must stay silent
+ * so users never see a premature or duplicate success message.
+ */
+export type TransactionFinality =
+  | "submitted"
+  | "confirming"
+  | "confirmed"
+  | "failed"
+  | "user-action-required";
+
+export function isTransactionConfirmed(
+  finality: TransactionFinality | null | undefined
+): boolean {
+  return finality === "confirmed";
+}
+
+/**
+ * Emit a success toast only when the transaction has reached the `confirmed`
+ * finality transition. Returns the toast id, or `null` when nothing was shown.
+ */
+export function transactionFinalitySuccessToast(
+  finality: TransactionFinality | null | undefined,
+  message: string,
+  options?: ToastOptions
+): string | null {
+  if (!isTransactionConfirmed(finality)) return null;
+  return transactionSuccessToast(message, options);
+}
+
+export interface TransactionCenterToastOptions {
+  /** Optional deep link to the transaction center entry for this action. */
+  href?: string;
+  /** Optional callback used instead of a link (e.g. router navigation). */
+  onOpen?: () => void;
+  /** Label for the action button. Defaults to "View in transaction center". */
+  actionLabel?: string;
+  /** Extra toast options; `duration` defaults to a longer value for errors. */
+  toastOptions?: ToastOptions;
+}
+
+function buildTransactionCenterAction(
+  options?: TransactionCenterToastOptions
+): ToastOptions {
+  const action = options?.onOpen
+    ? { label: options.actionLabel ?? "View in transaction center", onClick: options.onOpen }
+    : options?.href
+      ? {
+          label: options.actionLabel ?? "View in transaction center",
+          onClick: () => {
+            if (typeof window !== "undefined") window.location.assign(options.href!);
+          },
+        }
+      : undefined;
+
+  return {
+    duration: 8000,
+    ...options?.toastOptions,
+    ...(action ? { action } : {}),
+  };
+}
+
+/**
+ * Surface a transaction that needs the user to act (e.g. a wallet signature or
+ * a recovery step) before it can progress, with a path back to the center.
+ */
+export function transactionUserActionRequiredToast(
+  message: string,
+  options?: TransactionCenterToastOptions
+): string {
+  return toast(message, {
+    icon: "⚠️",
+    ...buildTransactionCenterAction(options),
+  });
+}
+
+/**
+ * Surface a failed transaction with a path back to the transaction center so
+ * the user can inspect or resume it.
+ */
+export function transactionFailedToast(
+  message: string,
+  options?: TransactionCenterToastOptions
+): string {
+  return toast.error(message, buildTransactionCenterAction(options));
+}
+
 export { SOUND_STORAGE_KEY };

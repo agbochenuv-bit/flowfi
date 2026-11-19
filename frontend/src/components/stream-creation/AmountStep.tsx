@@ -1,7 +1,16 @@
 "use client";
 import React, { useRef, useEffect } from "react";
 import { getSpendableBalanceExact, XLM_BASE_RESERVE } from "@/lib/stream-validation";
-import { parseAmountExact } from "@/utils/amount";
+import { formatAmount, parseAmountExact } from "@/utils/amount";
+
+export interface RecipientPreview {
+  /** Recipient address (or identifier) shown in the preview row. */
+  address: string;
+  /** Integer weight used to compute this recipient's share. */
+  weight: number;
+  /** Exact amount in the token's smallest unit, as a decimal string. */
+  amount: string;
+}
 
 interface AmountStepProps {
   value: string;
@@ -14,7 +23,16 @@ interface AmountStepProps {
   balanceError?: string | null;
   onSetMax?: () => void;
   decimals?: number;
+  /** Per-recipient preview rows; rendered only when more than one recipient. */
+  recipients?: RecipientPreview[];
+  /** Remainder (in smallest units) left over after rounding, if any. */
+  roundingRemainder?: string | null;
+  /** Human-readable explanation of how the rounding remainder was distributed. */
+  roundingNote?: string | null;
 }
+
+const truncateAddress = (address: string): string =>
+  address.length > 16 ? `${address.slice(0, 8)}…${address.slice(-6)}` : address;
 
 export const AmountStep: React.FC<AmountStepProps> = ({
   value,
@@ -27,7 +45,11 @@ export const AmountStep: React.FC<AmountStepProps> = ({
   balanceError,
   onSetMax,
   decimals = 7,
+  recipients,
+  roundingRemainder,
+  roundingNote,
 }) => {
+=======
   const handleAmountChange = (newValue: string) => {
     onChange(newValue);
   };
@@ -156,8 +178,66 @@ export const AmountStep: React.FC<AmountStepProps> = ({
       })() && (
         <div className="mt-4 p-4 rounded-lg bg-accent/5 border border-accent/20">
           <p className="text-sm text-slate-300">
-            You will stream <strong className="text-accent">{value} {token || ""}</strong> to the recipient.
+            You will stream <strong className="text-accent">{value} {token || ""}</strong> to{" "}
+            {recipients && recipients.length > 1
+              ? `${recipients.length} recipients`
+              : "the recipient"}.
           </p>
+        </div>
+      )}
+
+      {recipients && recipients.length > 1 && (
+        <div className="mt-4">
+          <p id="recipient-preview-description" className="text-sm text-slate-400 mb-2">
+            Per-recipient amounts are computed from each recipient&apos;s weight and rounded
+            to the token&apos;s smallest unit.
+          </p>
+          <div className="overflow-x-auto rounded-lg border border-glass-border">
+            <table
+              className="w-full text-sm text-left"
+              aria-describedby="recipient-preview-description"
+            >
+              <caption className="sr-only">
+                Per-recipient payment preview for {value} {token || ""}
+              </caption>
+              <thead className="bg-glass">
+                <tr>
+                  <th scope="col" className="px-3 py-2 font-medium text-slate-300">
+                    Recipient
+                  </th>
+                  <th scope="col" className="px-3 py-2 font-medium text-slate-300 text-right">
+                    Weight
+                  </th>
+                  <th scope="col" className="px-3 py-2 font-medium text-slate-300 text-right">
+                    Amount {token ? `(${token})` : ""}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {recipients.map((recipient, index) => (
+                  <tr
+                    key={`${recipient.address}-${index}`}
+                    className="border-t border-glass-border"
+                  >
+                    <td className="px-3 py-2 font-mono text-slate-200">
+                      <span title={recipient.address}>{truncateAddress(recipient.address)}</span>
+                    </td>
+                    <td className="px-3 py-2 text-right text-slate-300">{recipient.weight}</td>
+                    <td className="px-3 py-2 text-right text-accent font-medium">
+                      {formatAmount(recipient.amount, decimals)}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {roundingRemainder && roundingRemainder !== "0" && (
+            <p className="mt-2 text-sm text-amber-400" role="status">
+              Rounding left a remainder of {formatAmount(roundingRemainder, decimals)}{" "}
+              {token || ""}
+              {roundingNote ? ` — ${roundingNote}` : "."}
+            </p>
+          )}
         </div>
       )}
     </div>

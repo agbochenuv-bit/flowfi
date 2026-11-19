@@ -43,6 +43,18 @@ export interface WriteCursorResult {
 }
 
 /**
+ * Per-contract cursor snapshot. Each `IndexerContractConfig` row owns its own
+ * cursor so advancing one deployment never moves another's cursor, and the
+ * same contract address on different networks maps to distinct rows (the
+ * config key encodes network identity).
+ */
+export interface ContractCursor {
+  configKey: string;
+  lastLedger: number;
+  lastCursor: string | null;
+}
+
+/**
  * Error thrown when a cursor write is attempted with a fencing token that is
  * no longer the current lease token (e.g. the lease expired and another
  * replica took over). Callers should stop polling and re-acquire.
@@ -69,6 +81,12 @@ function isUniqueViolation(err: unknown): boolean {
     'code' in err &&
     (err as { code: string }).code === 'P2002'
   );
+}
+
+function assertConfigKey(configKey: string): void {
+  if (!configKey || typeof configKey !== 'string' || configKey.trim() === '') {
+    throw new Error('[IndexerState] configKey is required.');
+  }
 }
 
 /**
@@ -367,6 +385,131 @@ export async function ensureIndexerState(
     }
     throw err;
   }
+}
+
+/**
+ * Ensure a per-contract indexer configuration row exists for `configKey`.
+ *
+ * Each `IndexerContractConfig` row owns an isolated cursor, so two
+ * deployments on the same network (different config keys) and the same
+ * contract address on separate networks (different config keys) never share
+ * cursor state. `configKey` must uniquely encode network identity plus the
+ * deployment identity; it is the primary key of the row.
+ *
+ * Uses the same catch-and-retry pattern as `ensureIndexerState` to handle the
+ * race where two concurrent callers attempt the first insert simultaneously.
+ */
+export async function ensureContractIndexerState(
+  configKey: string,
+  startLedger: number,
+): Promise<ContractCursor> {
+  assertConfigKey(configKey);
+
+  const existing = await prisma.indexerContractConfig.findUnique({
+    where: { configKey },
+  });
+  if (existing) {
+    return {
+      configKey: existing.configKey,
+      lastLedger: existing.lastLedger,
+      lastCursor: existing.lastCursor ?? null,
+    };
+  }
+
+  try {
+    const created = await prisma.indexerContractConfig.create({
+      data: {
+        configKey,
+        lastLedger: startLedger,
+        lastCursor: null,
+      },
+    });
+    return {
+      configKey: created.configKey,
+      lastLedger: created.lastLedger,
+      lastCursor: created.lastCursor ?? null,
+    };
+  } catch (err: unknown) {
+    if (isUniqueViolation(err)) {
+      logger.warn(
+        '[IndexerState] Concurrent first-insert for contract config detected; re-reading existing row.',
+        { configKey },
+      );
+      const existingAfterRace = await prisma.indexerContractConfig.findUnique({
+        where: { configKey },
+      });
+      if (!existingAfterRace) {
+        throw new Error(
+          '[IndexerState] Unique-constraint violation but contract config row not found after race.',
+        );
+      }
+      return {
+        configKey: existingAfterRace.configKey,
+        lastLedger: existingAfterRace.lastLedger,
+        lastCursor: existingAfterRace.lastCursor ?? null,
+      };
+    }
+    throw err;
+  }
+}
+
+/**
+ * Read the persisted cursor for a single contract configuration.
+ *
+ * Returns `null` when no configuration row exists for `configKey`. Cursors
+ * are strictly isolated per row, so reading one deployment never observes
+ * another deployment's progress.
+ */
+export async function readContractCursor(
+  configKey: string,
+): Promise<ContractCursor | null> {
+  assertConfigKey(configKey);
+
+  const row = await prisma.indexerContractConfig.findUnique({
+    where: { configKey },
+  });
+  if (!row) return null;
+  return {
+    configKey: row.configKey,
+    lastLedger: row.lastLedger,
+    lastCursor: row.lastCursor ?? null,
+  };
+}
+
+/**
+ * Advance the cursor for a single contract configuration, but only if
+ * `fencingToken` is still the current lease token.
+ *
+ * The fence check and the write happen in a single conditional UPDATE scoped
+ * to `configKey`, so:
+ *  - a takeover between check and write cannot let a stale writer through,
+ *  - advancing one deployment's cursor never moves another deployment's
+ *    cursor (the WHERE clause is keyed on `configKey`).
+ *
+ * Returns `written: false` (without throwing) when the fence is stale or the
+ * configuration row does not exist.
+ */
+export async function writeContractCursorWithFence(
+  configKey: string,
+  fencingToken: number,
+  lastLedger: number,
+  lastCursor: string | null,
+): Promise<WriteCursorResult> {
+  assertConfigKey(configKey);
+
+  const updated = await prisma.$executeRaw`
+    UPDATE "indexer_contract_config"
+    SET "last_ledger" = ${lastLedger},
+        "last_cursor" = ${lastCursor}
+    WHERE "config_key" = ${configKey}
+      AND "lease_token" = ${fencingToken}
+  `;
+
+  if (updated === 1) {
+    return { written: true, lastLedger, lastCursor };
+  }
+
+  return { written: false, lastLedger: null, lastCursor: null };
 }
 
 /**

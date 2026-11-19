@@ -819,6 +819,189 @@ describe('indexer metrics instrumentation', () => {
   });
 });
 
+describe('per-contract indexing configuration', () => {
+  const CONTRACT_A = 'CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC';
+  const CONTRACT_B = 'CA3D5KRYM6CB7OWQ6TWYRR3Z4T7GNZLKERYNZGGA5SOAOPIFY6YQGAXE';
+  const NETWORK_PUBLIC = 'Public Global Stellar Network ; September 2015';
+  const NETWORK_TESTNET = 'Test SDF Network ; September 2015';
+
+  const baseConfig = (overrides: Record<string, unknown> = {}) => ({
+    id: 'cfg-1',
+    contractId: CONTRACT_A,
+    networkPassphrase: NETWORK_TESTNET,
+    startLedger: 100,
+    schemaVersion: 1,
+    enabled: true,
+    ...overrides,
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('validateIndexingConfig', () => {
+    it('accepts a well-formed configuration', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig()),
+      ).not.toThrow();
+    });
+
+    it('rejects a malformed contract address', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ contractId: 'not-a-contract' })),
+      ).toThrow(/contract/i);
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ contractId: '' })),
+      ).toThrow(/contract/i);
+    });
+
+    it('rejects an empty network passphrase', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ networkPassphrase: '' })),
+      ).toThrow(/network/i);
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ networkPassphrase: '   ' })),
+      ).toThrow(/network/i);
+    });
+
+    it('rejects a negative start ledger', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ startLedger: -1 })),
+      ).toThrow(/ledger/i);
+    });
+
+    it('accepts a zero start ledger as the boundary case', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ startLedger: 0 })),
+      ).not.toThrow();
+    });
+
+    it('rejects an unsupported schema version', () => {
+      expect(() =>
+        indexerService.validateIndexingConfig(baseConfig({ schemaVersion: 99 })),
+      ).toThrow(/schema/i);
+    });
+  });
+
+  describe('cursor isolation', () => {
+    it('keeps independent cursors for two deployments on the same network', async () => {
+      const configs = [
+        baseConfig({ id: 'cfg-a', contractId: CONTRACT_A }),
+        baseConfig({ id: 'cfg-b', contractId: CONTRACT_B }),
+      ];
+      const cursors: Record<string, string | null> = {
+        'cfg-a': 'cursor-a',
+        'cfg-b': 'cursor-b',
+      };
+
+      mockedPrisma.indexerState.findUnique.mockImplementation(
+        async ({ where }: { where: { id: string } }) => ({
+          id: where.id,
+          lastLedger: 200,
+          lastCursor: cursors[where.id] ?? null,
+          updatedAt: new Date(),
+        }),
+      );
+
+      const statuses = await Promise.all(
+        configs.map((cfg) => indexerService.getIndexerStatus(cfg.id)),
+      );
+
+      expect(statuses[0]!.lastCursor).toBe('cursor-a');
+      expect(statuses[1]!.lastCursor).toBe('cursor-b');
+      expect(mockedPrisma.indexerState.findUnique).toHaveBeenCalledWith({
+        where: { id: 'cfg-a' },
+      });
+      expect(mockedPrisma.indexerState.findUnique).toHaveBeenCalledWith({
+        where: { id: 'cfg-b' },
+      });
+    });
+
+    it('produces distinct config rows and cursors for the same address on two networks', async () => {
+      const mainnet = baseConfig({
+        id: 'cfg-mainnet',
+        networkPassphrase: NETWORK_PUBLIC,
+      });
+      const testnet = baseConfig({
+        id: 'cfg-testnet',
+        networkPassphrase: NETWORK_TESTNET,
+      });
+
+      const keyOf = (cfg: typeof mainnet) =>
+        indexerService.indexingConfigKey(cfg.contractId, cfg.networkPassphrase);
+
+      expect(keyOf(mainnet)).not.toBe(keyOf(testnet));
+
+      mockedPrisma.indexerState.findUnique.mockImplementation(
+        async ({ where }: { where: { id: string } }) => ({
+          id: where.id,
+          lastLedger: 300,
+          lastCursor: where.id === 'cfg-mainnet' ? 'cursor-mainnet' : 'cursor-testnet',
+          updatedAt: new Date(),
+        }),
+      );
+
+      const mainnetStatus = await indexerService.getIndexerStatus(mainnet.id);
+      const testnetStatus = await indexerService.getIndexerStatus(testnet.id);
+
+      expect(mainnetStatus.lastCursor).toBe('cursor-mainnet');
+      expect(testnetStatus.lastCursor).toBe('cursor-testnet');
+      expect(mainnetStatus.lastCursor).not.toBe(testnetStatus.lastCursor);
+    });
+  });
+
+  describe('enabled flag', () => {
+    it('stops polling a disabled config without affecting enabled ones', async () => {
+      const configs = [
+        baseConfig({ id: 'cfg-on', enabled: true }),
+        baseConfig({ id: 'cfg-off', contractId: CONTRACT_B, enabled: false }),
+      ];
+
+      const polled = await indexerService.pollEnabledConfigs(configs, async (cfg) => {
+        await mockedWorker.triggerPoll(cfg.id);
+      });
+
+      expect(polled).toEqual(['cfg-on']);
+      expect(mockedWorker.triggerPoll).toHaveBeenCalledTimes(1);
+      expect(mockedWorker.triggerPoll).toHaveBeenCalledWith('cfg-on');
+    });
+  });
+
+  describe('operator status', () => {
+    it('reports network identity and lag per config', async () => {
+      const configs = [
+        baseConfig({ id: 'cfg-a', networkPassphrase: NETWORK_PUBLIC }),
+        baseConfig({ id: 'cfg-b', contractId: CONTRACT_B, networkPassphrase: NETWORK_TESTNET }),
+      ];
+
+      mockedPrisma.indexerState.findUnique.mockImplementation(
+        async ({ where }: { where: { id: string } }) => ({
+          id: where.id,
+          lastLedger: where.id === 'cfg-a' ? 100 : 250,
+          lastCursor: `cursor-${where.id}`,
+          updatedAt: new Date(Date.now() - 5_000),
+        }),
+      );
+
+      const statuses = await indexerService.getIndexerStatuses(configs);
+
+      expect(statuses).toHaveLength(2);
+      expect(statuses[0]).toMatchObject({
+        id: 'cfg-a',
+        networkPassphrase: NETWORK_PUBLIC,
+        lastLedger: 100,
+      });
+      expect(statuses[1]).toMatchObject({
+        id: 'cfg-b',
+        networkPassphrase: NETWORK_TESTNET,
+        lastLedger: 250,
+      });
+      expect(statuses[0]!.lagSeconds).toBeGreaterThanOrEqual(5);
+      expect(statuses[1]!.lagSeconds).toBeGreaterThanOrEqual(5);
+    });
+  });
+});
+
 describe('discardDeadLetterEvent', () => {
   beforeEach(() => {
     vi.clearAllMocks();

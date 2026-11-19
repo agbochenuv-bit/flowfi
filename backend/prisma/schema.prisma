@@ -75,6 +75,34 @@ model IndexerState {
   updatedAt   DateTime @updatedAt
 }
 
+// IndexerContractConfig model - per-contract indexing configuration (issue #247).
+//
+// Each row describes one contract deployment the indexer should follow. The
+// network passphrase is part of the identity, so the same contract address
+// deployed on testnet and mainnet are two distinct configurations with fully
+// isolated cursors, event schemas, and network identity. The legacy singleton
+// `IndexerState` row is retained for backward compatibility; when no
+// configuration exists the worker falls back to it.
+model IndexerContractConfig {
+  id                 String   @id @default(uuid())
+  contractAddress    String   // Soroban contract address (C...)
+  networkPassphrase  String   // Stellar network passphrase identifying the network
+  startLedger        Int      @default(0) // Inclusive ledger to begin indexing from
+  lastLedger         Int      @default(0) // Last ledger successfully processed
+  lastCursor         String?  // Paging token of the last processed event for this deployment
+  eventSchemaVersion Int      @default(1) // Version of the event schema this deployment emits
+  enabled            Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  // Relations
+  events             StreamEvent[]
+
+  @@unique([contractAddress, networkPassphrase])
+  @@index([contractAddress, networkPassphrase])
+  @@index([enabled])
+}
+
 // LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
 // signature, and event count the indexer ingested. Written on every ingestion
 // cycle so the worker can (a) prove the canonical chain still contains what it
@@ -101,12 +129,15 @@ model StreamEvent {
   ledgerSequence  Int      // Ledger sequence number
   timestamp       BigInt   // Unix timestamp
   metadata        String?  // JSON string for additional event data
+  configId        String?  // IndexerContractConfig this event was ingested under (issue #247)
   createdAt       DateTime @default(now())
 
   // Relations
   stream          Stream   @relation(fields: [streamId], references: [streamId])
+  config          IndexerContractConfig? @relation(fields: [configId], references: [id], onDelete: SetNull)
 
   @@unique([transactionHash, eventType])
+  @@index([configId])
   @@index([streamId])
   @@index([eventType])
   @@index([streamId, eventType])

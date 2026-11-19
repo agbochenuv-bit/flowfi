@@ -3,6 +3,12 @@ import { prisma } from '../lib/prisma.js';
 import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
 import logger, { requestContext } from '../logger.js';
+import {
+  buildContractConfigKey,
+  validateContractIndexerConfig,
+  type ContractIndexerConfigInput,
+  type ContractIndexerValidationError,
+} from '../lib/indexer-contract-config.js';
 
 export interface IndexerStatus {
   lastLedger: number;
@@ -213,4 +219,203 @@ export async function executeReplay(
 export async function replayFromLedger(fromLedger: number, customRequestId?: string): Promise<string> {
   const report = await executeReplay(fromLedger, customRequestId);
   return report.requestId;
+}
+
+/**
+ * A single per-contract indexing configuration as persisted.
+ *
+ * Each config is keyed by `configKey`, which is derived from the network
+ * identity plus the contract address. This isolates cursors and event
+ * schemas so that:
+ *   - two deployments on the same network (different addresses) get
+ *     distinct configs, and
+ *   - the same contract address on separate networks (different network
+ *     identities) also gets distinct configs.
+ */
+export interface ContractIndexerConfig {
+  configKey: string;
+  network: string;
+  networkPassphrase: string;
+  contractAddress: string;
+  label: string | null;
+  enabled: boolean;
+  startLedger: number;
+  lastLedger: number;
+  lastCursor: string | null;
+  updatedAt: Date;
+}
+
+/**
+ * Operator-facing status for a single per-contract config.
+ *
+ * `validationErrors` surfaces configuration problems (e.g. malformed
+ * address, mismatched network identity) so operators can see why a config
+ * is not being indexed. `lagSeconds` is -1 when the config has never been
+ * polled.
+ */
+export interface ContractIndexerStatus {
+  configKey: string;
+  network: string;
+  networkPassphrase: string;
+  contractAddress: string;
+  label: string | null;
+  enabled: boolean;
+  lastLedger: number;
+  lastCursor: string | null;
+  updatedAt: Date;
+  lagSeconds: number;
+  validationErrors: ContractIndexerValidationError[];
+}
+
+export interface ContractIndexerStatusReport {
+  generatedAt: Date;
+  configs: ContractIndexerStatus[];
+}
+
+function toContractIndexerConfig(row: {
+  configKey: string;
+  network: string;
+  networkPassphrase: string;
+  contractAddress: string;
+  label: string | null;
+  enabled: boolean;
+  startLedger: number;
+  lastLedger: number;
+  lastCursor: string | null;
+  updatedAt: Date;
+}): ContractIndexerConfig {
+  return {
+    configKey: row.configKey,
+    network: row.network,
+    networkPassphrase: row.networkPassphrase,
+    contractAddress: row.contractAddress,
+    label: row.label,
+    enabled: row.enabled,
+    startLedger: row.startLedger,
+    lastLedger: row.lastLedger,
+    lastCursor: row.lastCursor,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/**
+ * List all persisted per-contract indexing configs, ordered by network then
+ * contract address for stable operator output.
+ */
+export async function listContractIndexerConfigs(): Promise<ContractIndexerConfig[]> {
+  const rows = await prisma.contractIndexerConfig.findMany({
+    orderBy: [{ network: 'asc' }, { contractAddress: 'asc' }],
+  });
+  return rows.map(toContractIndexerConfig);
+}
+
+/**
+ * Create or update a per-contract indexing config.
+ *
+ * Validation is delegated to the `indexer-contract-config` module. Invalid
+ * input is rejected (thrown) before any write so that a bad config can never
+ * clobber a working cursor. The `configKey` is derived from the network
+ * identity and contract address, so re-submitting the same deployment is an
+ * idempotent update while a different deployment or network yields a new row.
+ */
+export async function upsertContractIndexerConfig(
+  input: ContractIndexerConfigInput,
+): Promise<ContractIndexerConfig> {
+  const validation = validateContractIndexerConfig(input);
+  if (!validation.valid) {
+    const summary = validation.errors.map((e) => `${e.field}: ${e.message}`).join('; ');
+    throw new Error(`Invalid contract indexer config: ${summary}`);
+  }
+
+  const configKey = buildContractConfigKey(input);
+  const startLedger = input.startLedger ?? 0;
+
+  const row = await prisma.contractIndexerConfig.upsert({
+    where: { configKey },
+    create: {
+      configKey,
+      network: input.network,
+      networkPassphrase: input.networkPassphrase,
+      contractAddress: input.contractAddress,
+      label: input.label ?? null,
+      enabled: input.enabled ?? true,
+      startLedger,
+      lastLedger: startLedger,
+      lastCursor: null,
+    },
+    update: {
+      label: input.label ?? null,
+      enabled: input.enabled ?? true,
+      // Only advance the start ledger forward; never rewind an existing cursor.
+      startLedger,
+    },
+  });
+
+  logger.info(
+    `[IndexerService] Upserted contract indexer config ${configKey} (network=${input.network}, contract=${input.contractAddress})`,
+  );
+  return toContractIndexerConfig(row);
+}
+
+/**
+ * Disable a per-contract indexing config without deleting its cursor.
+ *
+ * Returns the updated config, or `null` if no config exists for `configKey`.
+ * Disabling preserves `lastLedger`/`lastCursor` so re-enabling resumes from
+ * the same position.
+ */
+export async function disableContractIndexerConfig(
+  configKey: string,
+): Promise<ContractIndexerConfig | null> {
+  const existing = await prisma.contractIndexerConfig.findUnique({ where: { configKey } });
+  if (!existing) {
+    return null;
+  }
+  const row = await prisma.contractIndexerConfig.update({
+    where: { configKey },
+    data: { enabled: false },
+  });
+  logger.info(`[IndexerService] Disabled contract indexer config ${configKey}`);
+  return toContractIndexerConfig(row);
+}
+
+/**
+ * Build the operator-facing status report for all per-contract configs.
+ *
+ * Each entry carries its own network identity and cursor so that two
+ * deployments on one network and the same address on separate networks are
+ * clearly distinguishable. Validation errors are recomputed on read so that
+ * configs persisted before a validation rule tightened are still surfaced.
+ */
+export async function getContractIndexerStatus(): Promise<ContractIndexerStatusReport> {
+  const configs = await listContractIndexerConfigs();
+  const now = Date.now();
+
+  const statuses: ContractIndexerStatus[] = configs.map((config) => {
+    const validation = validateContractIndexerConfig({
+      network: config.network,
+      networkPassphrase: config.networkPassphrase,
+      contractAddress: config.contractAddress,
+      label: config.label ?? undefined,
+      enabled: config.enabled,
+      startLedger: config.startLedger,
+    });
+    const lagSeconds =
+      config.lastLedger > 0 ? Math.floor((now - config.updatedAt.getTime()) / 1000) : -1;
+    return {
+      configKey: config.configKey,
+      network: config.network,
+      networkPassphrase: config.networkPassphrase,
+      contractAddress: config.contractAddress,
+      label: config.label,
+      enabled: config.enabled,
+      lastLedger: config.lastLedger,
+      lastCursor: config.lastCursor,
+      updatedAt: config.updatedAt,
+      lagSeconds,
+      validationErrors: validation.errors,
+    };
+  });
+
+  return { generatedAt: new Date(now), configs: statuses };
 }

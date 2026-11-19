@@ -13,6 +13,31 @@ import React, { useState } from "react";
 import { Button } from "@/components/ui/Button";
 import { useModalDialog } from "@/hooks/useModalDialog";
 
+/** A single weighted recipient row shown in the optional review summary. */
+export interface ConfirmModalRecipient {
+  /** Human-readable recipient identifier (address or label). */
+  label: string;
+  /** Relative weight used to split the stream. */
+  weight: number;
+  /** Exact amount this recipient will receive, already formatted. */
+  amount: string;
+}
+
+/** Optional structured summary rendered as an accessible table. */
+export interface ConfirmModalSummary {
+  /** Column header for the recipient column. Defaults to "Recipient". */
+  recipientHeader?: string;
+  /** Column header for the weight column. Defaults to "Weight". */
+  weightHeader?: string;
+  /** Column header for the amount column. Defaults to "Amount". */
+  amountHeader?: string;
+  /** Caption describing the table for assistive technology. */
+  caption?: string;
+  recipients: ConfirmModalRecipient[];
+  /** Optional footer row, e.g. the total amount. */
+  total?: { label: string; amount: string };
+}
+
 interface ConfirmModalProps {
   title: string;
   message: string;
@@ -22,6 +47,8 @@ interface ConfirmModalProps {
   cancelLabel?: string;
   /** Visual variant controls the confirm button colour. Defaults to "danger". */
   variant?: "danger" | "warning" | "info";
+  /** Optional per-recipient breakdown shown before confirming. */
+  summary?: ConfirmModalSummary;
   onConfirm: () => void | Promise<void>;
   onClose: () => void;
 }
@@ -44,6 +71,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
   confirmLabel = "Confirm",
   cancelLabel = "Cancel",
   variant = "danger",
+  summary,
   onConfirm,
   onClose,
 }) => {
@@ -131,9 +159,71 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
           </button>
         </div>
 
+        {/* Optional structured review summary */}
+        {summary && summary.recipients.length > 0 && (
+          <div className="mb-6 overflow-x-auto rounded-xl border border-glass-border">
+            <table className="w-full text-left text-sm">
+              {summary.caption && (
+                <caption className="px-4 pt-3 pb-2 text-left text-xs text-slate-400">
+                  {summary.caption}
+                </caption>
+              )}
+              <thead>
+                <tr className="border-b border-glass-border text-xs uppercase tracking-wide text-slate-400">
+                  <th scope="col" className="px-4 py-2 font-medium">
+                    {summary.recipientHeader ?? "Recipient"}
+                  </th>
+                  <th scope="col" className="px-4 py-2 font-medium text-right">
+                    {summary.weightHeader ?? "Weight"}
+                  </th>
+                  <th scope="col" className="px-4 py-2 font-medium text-right">
+                    {summary.amountHeader ?? "Amount"}
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                {summary.recipients.map((recipient, index) => (
+                  <tr
+                    key={`${recipient.label}-${index}`}
+                    className="border-b border-glass-border/50 last:border-b-0"
+                  >
+                    <td className="px-4 py-2 font-mono text-xs break-all">
+                      {recipient.label}
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">
+                      {recipient.weight}
+                    </td>
+                    <td className="px-4 py-2 text-right tabular-nums">
+                      {recipient.amount}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+              {summary.total && (
+                <tfoot>
+                  <tr className="border-t border-glass-border font-semibold">
+                    <th scope="row" className="px-4 py-2 text-left">
+                      {summary.total.label}
+                    </th>
+                    <td aria-hidden="true" />
+                    <td className="px-4 py-2 text-right tabular-nums">
+                      {summary.total.amount}
+                    </td>
+                  </tr>
+                </tfoot>
+              )}
+            </table>
+          </div>
+        )}
+
         {/* Actions */}
         <div className="flex justify-end gap-3">
-          <Button variant="outline" onClick={onClose} disabled={isSubmitting}>
+          <Button
+            variant="outline"
+            onClick={onClose}
+            disabled={isSubmitting}
+            autoFocus
+          >
             {cancelLabel}
           </Button>
           <button

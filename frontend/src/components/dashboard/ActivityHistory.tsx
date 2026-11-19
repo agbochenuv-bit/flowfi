@@ -4,7 +4,11 @@ import React, { useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { BackendStreamEvent } from "@/lib/api-types";
-import { formatAmount } from "@/utils/amount";
+import {
+  formatTokenAmount,
+  formatUnixTimestamp,
+  formatEventCount,
+} from "@/utils/localeFormat";
 import { downloadCSV } from "@/utils/csvExport";
 import TransactionTracker from "@/components/TransactionTracker";
 import { eventTypeToAction } from "@/utils/eventTypeToAction";
@@ -38,11 +42,14 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
 
   const exportToCSV = useCallback(() => {
     setExportStatus("exporting");
+    // Exports keep canonical raw values (smallest-unit amount, Unix timestamp)
+    // so downstream tooling is never affected by locale formatting.
     const rows = events.map((event) => ({
       "Stream ID": event.streamId,
       "Event Type": event.eventType,
-      "Amount": event.amount ? formatAmount(BigInt(event.amount), 7) : "0",
-      "Timestamp": new Date(event.timestamp * 1000).toISOString(),
+      "Amount (raw)": event.amount ?? "0",
+      "Timestamp (unix)": event.timestamp,
+      "Timestamp (ISO)": new Date(event.timestamp * 1000).toISOString(),
       "Tx Hash": event.transactionHash || "",
     }));
 
@@ -53,7 +60,8 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
   }, [events]);
 
   const renderEventMessage = (event: BackendStreamEvent): React.ReactNode => {
-    const amount = event.amount ? formatAmount(BigInt(event.amount), 7) : "0";
+    const rawAmount = event.amount ?? "0";
+    const amount = formatTokenAmount(rawAmount, 7);
     const link = (
       <Link
         href={`/streams/${event.streamId}`}
@@ -137,7 +145,10 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
         {exportStatus === "complete" && "Export complete."}
       </div>
 
-      <div className="flex justify-end">
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-xs text-slate-400">
+          {formatEventCount(events.length)}
+        </p>
         <Button
           onClick={exportToCSV}
           variant="outline"
@@ -194,8 +205,12 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
                         <p className="text-white font-medium text-sm sm:text-base">
                           {renderEventMessage(event)}
                         </p>
-                        <time className="text-xs text-slate-400 flex items-center gap-1 mt-1">
-                          {new Date(event.timestamp * 1000).toLocaleString()}
+                        <time
+                          dateTime={new Date(event.timestamp * 1000).toISOString()}
+                          title={`Unix timestamp: ${event.timestamp}`}
+                          className="text-xs text-slate-400 flex items-center gap-1 mt-1"
+                        >
+                          {formatUnixTimestamp(event.timestamp)}
                         </time>
                       </div>
                       <span className="text-[10px] uppercase tracking-wider px-2 py-1 rounded bg-accent/10 text-accent font-bold border border-accent/20">
@@ -250,8 +265,12 @@ export const ActivityHistory: React.FC<ActivityHistoryProps> = ({
                     <p className="text-white font-medium text-sm sm:text-base">
                       {renderEventMessage(event)}
                     </p>
-                    <time className="text-xs text-slate-400 flex items-center gap-1 mt-1">
-                      {new Date(event.timestamp * 1000).toLocaleString()}
+                    <time
+                      dateTime={new Date(event.timestamp * 1000).toISOString()}
+                      title={`Unix timestamp: ${event.timestamp}`}
+                      className="text-xs text-slate-400 flex items-center gap-1 mt-1"
+                    >
+                      {formatUnixTimestamp(event.timestamp)}
                     </time>
                   </div>
                   <span className="text-[10px] uppercase tracking-wider px-2 py-1 rounded bg-accent/10 text-accent font-bold border border-accent/20">

@@ -10,6 +10,14 @@ import { getApiBaseUrl } from "@/lib/api/_shared";
 import { logger } from "@/lib/logger";
 import { authenticatedFetch } from "@/lib/auth";
 import { useWallet } from "@/context/wallet-context";
+import {
+  registerTransaction,
+  updateTransactionStatus,
+  removeTransaction,
+  loadTransactions,
+  findDuplicate,
+  type TransactionCenterEntry,
+} from "@/lib/transaction-center";
 
 /**
  * TransactionTracker - Shared component for tracking on-chain transaction lifecycle
@@ -516,6 +524,7 @@ export function useTransactionTracker() {
   const [error, setError] = useState<string>();
   const [errorCode, setErrorCode] = useState<string>();
   const [ownerIdentity, setOwnerIdentity] = useState(identity);
+  const [centerEntry, setCenterEntry] = useState<TransactionCenterEntry | null>(null);
   const stateIsCurrent = ownerIdentity === identity;
 
   const reset = useCallback(() => {
@@ -524,6 +533,23 @@ export function useTransactionTracker() {
     setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
+    setCenterEntry(null);
+  }, [identity]);
+
+  // Rehydrate persisted entries on mount and resume polling for non-final states.
+  useEffect(() => {
+    if (!identity) return;
+    const entries = loadTransactions(identity);
+    const resumable = entries.find((entry) =>
+      ["submitted", "confirming", "user_action_required"].includes(entry.status)
+    );
+    if (!resumable) return;
+    setOwnerIdentity(identity);
+    setStatus(resumable.status as TransactionStatus);
+    setTxHash(resumable.txHash);
+    setError(resumable.error);
+    setErrorCode(resumable.errorCode);
+    setCenterEntry(resumable);
   }, [identity]);
 
   useEffect(() => {
@@ -538,6 +564,7 @@ export function useTransactionTracker() {
     setTxHash(undefined);
     setError(undefined);
     setErrorCode(undefined);
+    setCenterEntry(null);
   }, [identity]);
 
   const stage = useCallback((next: "simulating" | "awaiting_approval" | "submitted" | "confirming", hash?: string) => {
@@ -545,38 +572,110 @@ export function useTransactionTracker() {
     setStatus(next);
   }, []);
 
-  const submit = useCallback((hash: string) => {
-    setTxHash(hash);
-    setStatus("submitted");
-  }, []);
+  /**
+   * Register a submitted transaction with the transaction center.
+   * Returns false (and refuses to submit) when a matching pending entry exists,
+   * preventing duplicate submission.
+   */
+  const submit = useCallback(
+    (
+      hash: string,
+      meta?: { action?: TransactionAction; streamId?: string; idempotencyKey?: string }
+    ): boolean => {
+      if (!identity) return false;
+      const idempotencyKey = meta?.idempotencyKey ?? hash;
+      const duplicate = findDuplicate(identity, {
+        idempotencyKey,
+        txHash: hash,
+        action: meta?.action,
+        streamId: meta?.streamId,
+      });
+      if (duplicate) {
+        setCenterEntry(duplicate);
+        return false;
+      }
+      const entry = registerTransaction(identity, {
+        txHash: hash,
+        action: meta?.action,
+        streamId: meta?.streamId,
+        idempotencyKey,
+        status: "submitted",
+      });
+      setCenterEntry(entry);
+      setTxHash(hash);
+      setStatus("submitted");
+      return true;
+    },
+    [identity]
+  );
 
   const confirm = useCallback(() => {
     setStatus("confirming");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "confirming"));
+    }
+  }, [centerEntry]);
 
   const succeed = useCallback(() => {
     setStatus("confirmed");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "confirmed"));
+    }
+  }, [centerEntry]);
 
-  const fail = useCallback((err: string, code?: string) => {
-    setStatus("failed");
-    setError(err);
-    setErrorCode(code);
-  }, []);
+  const fail = useCallback(
+    (err: string, code?: string) => {
+      setStatus("failed");
+      setError(err);
+      setErrorCode(code);
+      if (centerEntry) {
+        setCenterEntry(updateTransactionStatus(centerEntry.id, "failed", { error: err, errorCode: code }));
+      }
+    },
+    [centerEntry]
+  );
+
+  const requireAction = useCallback(
+    (message: string) => {
+      setStatus("failed");
+      setError(message);
+      if (centerEntry) {
+        setCenterEntry(
+          updateTransactionStatus(centerEntry.id, "user_action_required", { error: message })
+        );
+      }
+    },
+    [centerEntry]
+  );
 
   const cancel = useCallback(() => {
     setStatus("cancelled");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "cancelled"));
+    }
+  }, [centerEntry]);
 
   const timeout = useCallback(() => {
     setStatus("timeout");
-  }, []);
+    if (centerEntry) {
+      setCenterEntry(updateTransactionStatus(centerEntry.id, "user_action_required"));
+    }
+  }, [centerEntry]);
+
+  /** Dismiss a finalized entry from the transaction center. */
+  const dismiss = useCallback(() => {
+    if (centerEntry) {
+      removeTransaction(centerEntry.id);
+    }
+    reset();
+  }, [centerEntry, reset]);
 
   return {
     status: stateIsCurrent ? status : "idle",
     txHash: stateIsCurrent ? txHash : undefined,
     error: stateIsCurrent ? error : undefined,
     errorCode: stateIsCurrent ? errorCode : undefined,
+    centerEntry: stateIsCurrent ? centerEntry : null,
     reset,
     start,
     stage,
@@ -584,7 +683,9 @@ export function useTransactionTracker() {
     confirm,
     succeed,
     fail,
+    requireAction,
     cancel,
     timeout,
+    dismiss,
   };
 }

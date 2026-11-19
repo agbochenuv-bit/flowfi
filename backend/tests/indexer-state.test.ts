@@ -31,6 +31,8 @@ import {
   releaseLease,
   writeCursorWithFence,
   checkIndexerHealth,
+  ensureContractIndexerState,
+  writeContractCursorWithFence,
 } from '../src/lib/indexer-state.js';
 
 describe('ensureIndexerState', () => {
@@ -303,5 +305,189 @@ describe('checkIndexerHealth', () => {
     expect(evaluate).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('per-contract indexer state', () => {
+  const configA = {
+    key: 'testnet:CDAAA...',
+    contractId: 'CDAAA...',
+    networkPassphrase: 'Test SDF Network ; September 2015',
+  };
+  const configB = {
+    key: 'testnet:CDBBB...',
+    contractId: 'CDBBB...',
+    networkPassphrase: 'Test SDF Network ; September 2015',
+  };
+  const configSameAddressOtherNetwork = {
+    key: 'mainnet:CDAAA...',
+    contractId: 'CDAAA...',
+    networkPassphrase: 'Public Global Stellar Network ; September 2015',
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe('ensureContractIndexerState', () => {
+    it('returns the existing row for the given config key', async () => {
+      const existing = {
+        id: configA.key,
+        lastLedger: 42,
+        lastCursor: 'cur',
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      mocks.mockFindUnique.mockResolvedValueOnce(existing);
+
+      const result = await ensureContractIndexerState(configA, 0);
+
+      expect(result).toEqual(existing);
+      expect(mocks.mockFindUnique).toHaveBeenCalledWith({
+        where: { id: configA.key },
+      });
+      expect(mocks.mockCreate).not.toHaveBeenCalled();
+    });
+
+    it('creates a row keyed by the config key when none exists', async () => {
+      const created = {
+        id: configA.key,
+        lastLedger: 10,
+        lastCursor: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+      mocks.mockFindUnique.mockResolvedValueOnce(null);
+      mocks.mockCreate.mockResolvedValueOnce(created);
+
+      const result = await ensureContractIndexerState(configA, 10);
+
+      expect(result).toEqual(created);
+      expect(mocks.mockCreate).toHaveBeenCalledWith({
+        data: { id: configA.key, lastLedger: 10, lastCursor: null },
+      });
+    });
+
+    it('creates independent rows for two deployments on the same network', async () => {
+      mocks.mockFindUnique.mockResolvedValue(null);
+      mocks.mockCreate
+        .mockResolvedValueOnce({ id: configA.key, lastLedger: 0, lastCursor: null })
+        .mockResolvedValueOnce({ id: configB.key, lastLedger: 0, lastCursor: null });
+
+      await ensureContractIndexerState(configA, 0);
+      await ensureContractIndexerState(configB, 0);
+
+      expect(mocks.mockCreate).toHaveBeenCalledTimes(2);
+      expect(mocks.mockCreate.mock.calls[0][0].data.id).toBe(configA.key);
+      expect(mocks.mockCreate.mock.calls[1][0].data.id).toBe(configB.key);
+      expect(configA.key).not.toBe(configB.key);
+    });
+
+    it('keeps the same contract address isolated across network passphrases', async () => {
+      mocks.mockFindUnique.mockResolvedValue(null);
+      mocks.mockCreate
+        .mockResolvedValueOnce({ id: configA.key, lastLedger: 0, lastCursor: null })
+        .mockResolvedValueOnce({
+          id: configSameAddressOtherNetwork.key,
+          lastLedger: 0,
+          lastCursor: null,
+        });
+
+      await ensureContractIndexerState(configA, 0);
+      await ensureContractIndexerState(configSameAddressOtherNetwork, 0);
+
+      expect(configA.contractId).toBe(configSameAddressOtherNetwork.contractId);
+      expect(configA.key).not.toBe(configSameAddressOtherNetwork.key);
+      expect(mocks.mockCreate).toHaveBeenCalledTimes(2);
+      expect(mocks.mockCreate.mock.calls[0][0].data.id).toBe(configA.key);
+      expect(mocks.mockCreate.mock.calls[1][0].data.id).toBe(
+        configSameAddressOtherNetwork.key,
+      );
+    });
+
+    it('re-reads the row on unique-constraint violation (P2002)', async () => {
+      const existingRow = { id: configA.key, lastLedger: 5, lastCursor: null };
+      mocks.mockFindUnique.mockResolvedValueOnce(null);
+      mocks.mockCreate.mockRejectedValueOnce(
+        Object.assign(new Error('Unique constraint failed'), { code: 'P2002' }),
+      );
+      mocks.mockFindUnique.mockResolvedValueOnce(existingRow);
+
+      const result = await ensureContractIndexerState(configA, 0);
+
+      expect(result).toEqual(existingRow);
+      expect(mocks.mockFindUnique).toHaveBeenCalledTimes(2);
+      expect(mocks.mockFindUnique).toHaveBeenLastCalledWith({
+        where: { id: configA.key },
+      });
+    });
+
+    it('re-throws non-P2002 errors', async () => {
+      mocks.mockFindUnique.mockResolvedValueOnce(null);
+      mocks.mockCreate.mockRejectedValueOnce(new Error('connection refused'));
+
+      await expect(ensureContractIndexerState(configA, 0)).rejects.toThrow(
+        'connection refused',
+      );
+    });
+  });
+
+  describe('writeContractCursorWithFence', () => {
+    it('writes the cursor scoped to the config key when the token is current', async () => {
+      mocks.mockUpdateMany.mockResolvedValueOnce({ count: 1 });
+
+      const result = await writeContractCursorWithFence(configA, 7, 100, 'cursor-100');
+
+      expect(result).toBe(true);
+      const call = mocks.mockUpdateMany.mock.calls[0][0];
+      expect(call.where).toEqual({ id: configA.key, fencingToken: 7 });
+      expect(call.data).toEqual({ lastLedger: 100, lastCursor: 'cursor-100' });
+    });
+
+    it('rejects a stale fencing token for the config', async () => {
+      mocks.mockUpdateMany.mockResolvedValueOnce({ count: 0 });
+
+      const result = await writeContractCursorWithFence(configA, 6, 100, 'cursor-100');
+
+      expect(result).toBe(false);
+      expect(mocks.mockUpdateMany).toHaveBeenCalledTimes(1);
+      expect(mocks.mockUpdateMany.mock.calls[0][0].where).toEqual({
+        id: configA.key,
+        fencingToken: 6,
+      });
+    });
+
+    it('does not let cursors for different config keys interfere', async () => {
+      mocks.mockUpdateMany.mockResolvedValue({ count: 1 });
+
+      await writeContractCursorWithFence(configA, 7, 100, 'cursor-a-100');
+      await writeContractCursorWithFence(configB, 7, 200, 'cursor-b-200');
+
+      expect(mocks.mockUpdateMany).toHaveBeenCalledTimes(2);
+      const [callA, callB] = mocks.mockUpdateMany.mock.calls.map((c) => c[0]);
+      expect(callA.where.id).toBe(configA.key);
+      expect(callA.data).toEqual({ lastLedger: 100, lastCursor: 'cursor-a-100' });
+      expect(callB.where.id).toBe(configB.key);
+      expect(callB.data).toEqual({ lastLedger: 200, lastCursor: 'cursor-b-200' });
+    });
+
+    it('scopes writes by network for the same contract address', async () => {
+      mocks.mockUpdateMany.mockResolvedValue({ count: 1 });
+
+      await writeContractCursorWithFence(configA, 3, 50, 'cursor-testnet-50');
+      await writeContractCursorWithFence(
+        configSameAddressOtherNetwork,
+        3,
+        900,
+        'cursor-mainnet-900',
+      );
+
+      const [callTestnet, callMainnet] = mocks.mockUpdateMany.mock.calls.map(
+        (c) => c[0],
+      );
+      expect(callTestnet.where.id).toBe(configA.key);
+      expect(callMainnet.where.id).toBe(configSameAddressOtherNetwork.key);
+      expect(callTestnet.where.id).not.toBe(callMainnet.where.id);
+      expect(callTestnet.data.lastLedger).toBe(50);
+      expect(callMainnet.data.lastLedger).toBe(900);
+    });
   });
 });

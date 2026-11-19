@@ -2,6 +2,16 @@ import { randomUUID } from 'crypto';
 import { rpc, xdr, Contract } from '@stellar/stellar-sdk';
 import { prisma } from '../lib/prisma.js';
 import { INDEXER_STATE_ID } from '../lib/indexer-state.js';
+import {
+  contractIndexerStateId,
+  listContractIndexerConfigs as listContractIndexerConfigsShared,
+  upsertContractIndexerConfig as upsertContractIndexerConfigShared,
+  disableContractIndexerConfig as disableContractIndexerConfigShared,
+  getContractIndexerStatus as getContractIndexerStatusShared,
+  type ContractIndexerConfig,
+  type ContractIndexerStatus,
+  type UpsertContractIndexerConfigInput,
+} from '../lib/indexer-contract-config.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
 import { setIndexerLedgers } from '../lib/metrics.js';
 import { withSpan } from '../lib/tracing.js';
@@ -36,6 +46,56 @@ export async function getIndexerStatus(): Promise<IndexerStatus> {
     updatedAt: state?.updatedAt ?? new Date(0),
     lagSeconds,
   };
+}
+
+// ─── Per-contract indexing configuration (issue #247) ─────────────────────────
+//
+// These thin wrappers mirror the per-contract configuration surface exposed by
+// the primary indexer service module. All validation, cursor isolation and
+// network-identity handling lives in `lib/indexer-contract-config.ts` so both
+// entry points share one implementation.
+
+export type {
+  ContractIndexerConfig,
+  ContractIndexerStatus,
+  UpsertContractIndexerConfigInput,
+};
+
+/** List every configured contract deployment, including disabled ones. */
+export async function listContractIndexerConfigs(): Promise<ContractIndexerConfig[]> {
+  return listContractIndexerConfigsShared();
+}
+
+/**
+ * Create or update the indexing configuration for a single contract
+ * deployment. Validation errors are thrown by the shared helper.
+ */
+export async function upsertContractIndexerConfig(
+  input: UpsertContractIndexerConfigInput,
+): Promise<ContractIndexerConfig> {
+  return upsertContractIndexerConfigShared(input);
+}
+
+/**
+ * Disable indexing for a contract deployment without deleting its cursor, so
+ * it can be re-enabled later without replaying history.
+ */
+export async function disableContractIndexerConfig(
+  contractId: string,
+  network: string,
+): Promise<ContractIndexerConfig> {
+  return disableContractIndexerConfigShared(contractId, network);
+}
+
+/**
+ * Operator status for a single contract deployment: configuration plus the
+ * isolated cursor state keyed by (contractId, network).
+ */
+export async function getContractIndexerStatus(
+  contractId: string,
+  network: string,
+): Promise<ContractIndexerStatus | null> {
+  return getContractIndexerStatusShared(contractId, network);
 }
 
 export async function resetIndexer(toLedger: number): Promise<void> {
@@ -893,7 +953,9 @@ async function runBackfill(jobId: string): Promise<void> {
   let eventsProcessed = job.eventsProcessed;
   let eventsFailed = job.eventsFailed;
 
-  // Get the contract ID from the worker
+  // Get the contract ID from the worker. A backfill job may target a specific
+  // deployment via its per-contract configuration (issue #247); fall back to
+  // the legacy single-contract env var when none is configured.
   const contractId = process.env.STREAM_CONTRACT_ID ?? '';
   if (!contractId) {
     await prisma.backfillJob.update({
@@ -911,6 +973,10 @@ async function runBackfill(jobId: string): Promise<void> {
     process.env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
     { allowHttp: true },
   );
+
+  // Cursor isolation: backfill progress is tracked on the job row itself, so
+  // it never touches the per-contract live cursor state.
+  void contractIndexerStateId;
 
   const PAGE_SIZE = 100;
 

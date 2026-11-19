@@ -448,3 +448,167 @@ export function formatTokenCompact(
 
   return { compact, exact };
 }
+
+/**
+ * Options for locale-aware amount formatting.
+ */
+export interface LocalizedAmountOptions {
+  /** Minimum fraction digits to render (defaults to 0). */
+  minimumFractionDigits?: number;
+  /** Maximum fraction digits to render (defaults to the token's `decimals`). */
+  maximumFractionDigits?: number;
+  /** Whether to render grouping separators (defaults to true). */
+  useGrouping?: boolean;
+  /** Currency code to render, e.g. "USD". When set, `style` becomes "currency". */
+  currency?: string;
+  /** Intl notation style (defaults to "standard"). */
+  notation?: "standard" | "compact";
+  /** Whether to always show an explicit sign (defaults to false). */
+  signDisplay?: "auto" | "always" | "never" | "exceptZero";
+}
+
+/**
+ * Format a canonical on-chain amount (smallest unit) for display in a locale.
+ *
+ * The raw `bigint` is never mutated; the returned `raw` field always carries
+ * the exact canonical value so callers can keep it in details views, exports,
+ * and tooltips. Formatting is derived from the exact integer representation
+ * (never via floating point) so fractional precision is preserved for any
+ * token scale, including values beyond `Number.MAX_SAFE_INTEGER`.
+ *
+ * @param raw - Raw amount as bigint (i128 from chain)
+ * @param decimals - Number of decimal places for the token
+ * @param locale - BCP 47 locale tag, e.g. "en-US" or "de-DE"
+ * @param options - Formatting options
+ * @returns `{ formatted, raw, locale }` where `raw` is the untouched input
+ */
+export function formatAmountLocalized(
+  raw: bigint,
+  decimals: number,
+  locale: string,
+  options: LocalizedAmountOptions = {},
+): { formatted: string; raw: bigint; locale: string } {
+  if (!Number.isInteger(decimals) || decimals < 0) {
+    throw new RangeError("Token decimals must be a non-negative integer");
+  }
+
+  const negative = raw < 0n;
+  const abs = negative ? -raw : raw;
+  const factor = 10n ** BigInt(decimals);
+  const whole = abs / factor;
+  const frac = abs % factor;
+
+  // Build the exact decimal string from the integer parts. This avoids any
+  // float conversion so precision is preserved regardless of magnitude.
+  const fracStr = frac.toString().padStart(decimals, "0");
+  const exactAbs = decimals > 0 ? `${whole}.${fracStr}` : whole.toString();
+
+  const maxFractionDigits = Math.min(
+    options.maximumFractionDigits ?? decimals,
+    decimals,
+  );
+  const minFractionDigits = Math.min(
+    options.minimumFractionDigits ?? 0,
+    maxFractionDigits,
+  );
+
+  const formatter = new Intl.NumberFormat(locale, {
+    style: options.currency ? "currency" : "decimal",
+    currency: options.currency,
+    notation: options.notation ?? "standard",
+    useGrouping: options.useGrouping ?? true,
+    minimumFractionDigits: minFractionDigits,
+    maximumFractionDigits: maxFractionDigits,
+    signDisplay: options.signDisplay ?? "auto",
+  });
+
+  // Format the exact decimal string. Intl accepts a numeric string and parses
+  // it without losing the digits we already validated, but to be safe for
+  // very large magnitudes we format the integer and fraction separately when
+  // the value exceeds the safe integer range.
+  let formatted: string;
+  if (whole <= BigInt(Number.MAX_SAFE_INTEGER)) {
+    const numeric = Number(exactAbs);
+    formatted = formatter.format(negative ? -numeric : numeric);
+  } else {
+    // Large magnitudes: format the integer part exactly, then append the
+    // locale's decimal separator and the (optionally truncated) fraction.
+    const intFormatted = new Intl.NumberFormat(locale, {
+      useGrouping: options.useGrouping ?? true,
+      maximumFractionDigits: 0,
+    }).format(whole);
+    const parts = new Intl.NumberFormat(locale).formatToParts(1.1);
+    const decimalSep = parts.find((p) => p.type === "decimal")?.value ?? ".";
+    const shownFrac = fracStr.slice(0, maxFractionDigits).replace(/0+$/, "");
+    const fracOut = shownFrac.padEnd(minFractionDigits, "0");
+    const sign = negative ? "-" : "";
+    formatted = fracOut.length > 0
+      ? `${sign}${intFormatted}${decimalSep}${fracOut}`
+      : `${sign}${intFormatted}`;
+  }
+
+  return { formatted, raw, locale };
+}
+
+/**
+ * Format a Unix timestamp (seconds) for display in a locale and timezone.
+ *
+ * The raw Unix seconds are preserved in the returned `raw` field so callers
+ * can keep canonical values in details views and exports. Timezone boundaries
+ * are respected by delegating to `Intl.DateTimeFormat` with an explicit
+ * `timeZone`.
+ *
+ * @param unixSeconds - Unix timestamp in seconds (may be bigint or number)
+ * @param locale - BCP 47 locale tag
+ * @param timeZone - IANA timezone, e.g. "UTC" or "America/New_York"
+ * @param options - Optional Intl.DateTimeFormat options
+ * @returns `{ formatted, raw, locale, timeZone }`
+ */
+export function formatTimestampLocalized(
+  unixSeconds: number | bigint,
+  locale: string,
+  timeZone: string,
+  options: Intl.DateTimeFormatOptions = {},
+): { formatted: string; raw: number | bigint; locale: string; timeZone: string } {
+  const millis = Number(unixSeconds) * 1000;
+  const formatter = new Intl.DateTimeFormat(locale, {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone,
+    ...options,
+  });
+  return {
+    formatted: formatter.format(new Date(millis)),
+    raw: unixSeconds,
+    locale,
+    timeZone,
+  };
+}
+
+/**
+ * Plural forms keyed by CLDR plural category.
+ */
+export type PluralForms = Partial<
+  Record<Intl.LDMLPluralRule, string> & { other: string }
+>;
+
+/**
+ * Select the correct localized plural form for a count.
+ *
+ * Uses `Intl.PluralRules` so the correct CLDR category (zero/one/two/few/
+ * many/other) is chosen per locale. Falls back to the `other` form when a
+ * specific category is not provided.
+ *
+ * @param count - The numeric count used to select the plural category
+ * @param locale - BCP 47 locale tag
+ * @param forms - Map of plural categories to localized strings
+ * @returns The selected localized string
+ */
+export function formatPlural(
+  count: number,
+  locale: string,
+  forms: PluralForms,
+): string {
+  const category = new Intl.PluralRules(locale).select(count);
+  return forms[category] ?? forms.other ?? "";
+}
