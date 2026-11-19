@@ -59,3 +59,18 @@ describe("webhook subscription deletion", () => {
     });
   });
 });
+
+describe("retention failure and boundary behavior", () => {
+  it("returns zero when no deliveries are strictly older than the cutoff", async () => {
+    vi.mocked(prisma.webhookDelivery.deleteMany).mockResolvedValueOnce({ count: 0 });
+    await expect(purgeExpiredWebhookDeliveries(new Date("2026-10-18T12:00:00.001Z"))).resolves.toBe(0);
+    expect(prisma.webhookDelivery.deleteMany).toHaveBeenLastCalledWith({
+      where: { createdAt: { lt: new Date("2026-09-18T12:00:00.001Z") } },
+    });
+  });
+
+  it("surfaces a database failure so the worker can report failed cleanup", async () => {
+    vi.mocked(prisma.alertHistory.deleteMany).mockRejectedValueOnce(new Error("database unavailable"));
+    await expect(purgeExpiredAlertHistory()).rejects.toThrow("database unavailable");
+  });
+});
