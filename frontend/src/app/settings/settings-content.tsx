@@ -13,6 +13,17 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { DisconnectConfirmModal } from "@/components/wallet/DisconnectConfirmModal";
 import { useUnsavedChangesGuard } from "@/hooks/useUnsavedChangesGuard";
 import { SOUND_STORAGE_KEY } from "@/lib/transaction-feedback";
+import {
+  NOTIFICATION_EVENT_TYPES,
+  NOTIFICATION_EVENT_LABELS,
+  type NotificationEventType,
+  type NotificationPreferences,
+  loadNotificationPreferences,
+  saveNotificationPreferences,
+  getBrowserPermission,
+  requestBrowserPermission,
+  type BrowserPermission,
+} from "@/lib/notification-preferences";
 
 type DisplayCurrency = "USD" | "EUR" | "GBP" | "XLM" | "USDC";
 type AmountFormat = "full" | "compact";
@@ -88,11 +99,13 @@ export default function SettingsContent() {
   const router = useRouter();
   const { session, disconnect, isHydrated } = useWallet();
 
-  const [browserPush, setBrowserPush] = useState(false);
   const [draft, setDraft] = useState<Settings>(() => loadSavedSettings());
   const [saved, setSaved] = useState<Settings>(() => loadSavedSettings());
   const [lastLedger, setLastLedger] = useState<string>("Loading...");
   const [copied, setCopied] = useState(false);
+  const [notificationDraft, setNotificationDraft] = useState<NotificationPreferences | null>(null);
+  const [notificationSaved, setNotificationSaved] = useState<NotificationPreferences | null>(null);
+  const [permission, setPermission] = useState<BrowserPermission>("default");
 
   const isDirty = useMemo(
     () =>
@@ -100,8 +113,11 @@ export default function SettingsContent() {
       draft.displayCurrency !== saved.displayCurrency ||
       draft.amountFormat !== saved.amountFormat ||
       draft.decimalPlaces !== saved.decimalPlaces ||
-      draft.transactionSounds !== saved.transactionSounds,
-    [draft, saved]
+      draft.transactionSounds !== saved.transactionSounds ||
+      (notificationDraft !== null &&
+        notificationSaved !== null &&
+        JSON.stringify(notificationDraft) !== JSON.stringify(notificationSaved)),
+    [draft, saved, notificationDraft, notificationSaved]
   );
 
   // Covers tab close/refresh, internal link navigation, and back/forward
@@ -121,6 +137,10 @@ export default function SettingsContent() {
   const handleSave = () => {
     persistSettings(draft);
     setSaved(draft);
+    if (notificationDraft && session?.publicKey) {
+      saveNotificationPreferences(session.publicKey, notificationDraft);
+      setNotificationSaved(notificationDraft);
+    }
     toast.success("Settings saved");
   };
 
@@ -149,20 +169,41 @@ export default function SettingsContent() {
     }
   };
 
-  const handleBrowserPushToggle = async () => {
-    if (!browserPush) {
-      try {
-        await Notification.requestPermission();
-        setBrowserPush(Notification.permission === "granted");
-        if (Notification.permission === "granted") {
-          toast.success("Browser notifications enabled");
-        }
-      } catch {
-        toast.error("Failed to enable notifications");
-      }
-    } else {
-      setBrowserPush(false);
-      toast("Browser notifications disabled");
+  // Load wallet-scoped notification preferences whenever the wallet changes.
+  useEffect(() => {
+    if (!session?.publicKey) {
+      setNotificationDraft(null);
+      setNotificationSaved(null);
+      return;
+    }
+    const prefs = loadNotificationPreferences(session.publicKey);
+    setNotificationDraft(prefs);
+    setNotificationSaved(prefs);
+    setPermission(getBrowserPermission());
+  }, [session?.publicKey]);
+
+  const toggleNotification = (
+    eventType: NotificationEventType,
+    channel: "inApp" | "browser"
+  ) => {
+    setNotificationDraft((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        [eventType]: { ...prev[eventType], [channel]: !prev[eventType][channel] },
+      };
+    });
+  };
+
+  const handleRequestPermission = async () => {
+    const result = await requestBrowserPermission();
+    setPermission(result);
+    if (result === "granted") {
+      toast.success("Browser notifications enabled");
+    } else if (result === "denied") {
+      toast.error("Browser notifications blocked. Update your browser settings to allow them.");
+    } else if (result === "unsupported") {
+      toast.error("Browser notifications are not supported on this device");
     }
   };
 
@@ -214,40 +255,109 @@ export default function SettingsContent() {
             </p>
           </div>
 
-          {/* Browser Push Notifications */}
-          <div className="flex items-center justify-between group">
+          {/* Notifications */}
+          <div className="space-y-4">
             <div className="flex items-center gap-3">
               <div className="p-2 rounded-lg bg-purple-500/20 text-purple-400">
                 <Bell size={18} />
               </div>
               <div>
-                <p className="font-medium text-white dark:text-black">
-                  Browser Notifications
-                </p>
+                <p className="font-medium text-white dark:text-black">Notifications</p>
                 <p className="text-sm opacity-60">
-                  Get notified about stream activity
+                  Choose which stream events notify you, per channel
                 </p>
               </div>
             </div>
 
-            <button
-              onClick={handleBrowserPushToggle}
-              aria-label="Toggle browser notifications"
-              aria-pressed={browserPush}
-              className={`relative w-14 h-7 rounded-full transition-all duration-300 ${
-                browserPush
-                  ? "bg-gradient-to-r from-purple-500 to-blue-500"
-                  : "bg-zinc-600"
-              }`}
-            >
-              <span
-                className={`absolute top-1 left-1 w-5 h-5 bg-white rounded-full shadow-md transform transition duration-300 ${
-                  browserPush
-                    ? "translate-x-7"
-                    : "translate-x-0"
-                }`}
-              />
-            </button>
+            {!session ? (
+              <p className="pl-12 text-sm opacity-60 text-white dark:text-black">
+                Connect a wallet to configure notifications. Preferences are stored per wallet.
+              </p>
+            ) : notificationDraft ? (
+              <div className="space-y-4 pl-12">
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-xs uppercase tracking-wide text-white/50 dark:text-black/50">
+                    <span>Event</span>
+                    <span className="flex gap-6">
+                      <span>In-app</span>
+                      <span>Browser</span>
+                    </span>
+                  </div>
+                  {NOTIFICATION_EVENT_TYPES.map((eventType) => (
+                    <div
+                      key={eventType}
+                      className="flex items-center justify-between gap-4 py-1"
+                    >
+                      <span className="text-sm text-white dark:text-black">
+                        {NOTIFICATION_EVENT_LABELS[eventType]}
+                      </span>
+                      <span className="flex gap-6">
+                        <button
+                          type="button"
+                          onClick={() => toggleNotification(eventType, "inApp")}
+                          aria-label={`Toggle in-app notifications for ${NOTIFICATION_EVENT_LABELS[eventType]}`}
+                          aria-pressed={notificationDraft[eventType].inApp}
+                          className={`relative w-12 h-6 rounded-full transition-colors ${
+                            notificationDraft[eventType].inApp ? "bg-purple-600" : "bg-zinc-600"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-1 left-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                              notificationDraft[eventType].inApp ? "translate-x-6" : "translate-x-0"
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => toggleNotification(eventType, "browser")}
+                          aria-label={`Toggle browser notifications for ${NOTIFICATION_EVENT_LABELS[eventType]}`}
+                          aria-pressed={notificationDraft[eventType].browser}
+                          className={`relative w-12 h-6 rounded-full transition-colors ${
+                            notificationDraft[eventType].browser ? "bg-blue-600" : "bg-zinc-600"
+                          }`}
+                        >
+                          <span
+                            className={`absolute top-1 left-1 h-4 w-4 rounded-full bg-white shadow transition-transform ${
+                              notificationDraft[eventType].browser ? "translate-x-6" : "translate-x-0"
+                            }`}
+                          />
+                        </button>
+                      </span>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between gap-3 rounded-xl border border-white/10 dark:border-black/10 bg-black/30 dark:bg-white/30 px-4 py-3">
+                  <div>
+                    <p className="text-sm text-white dark:text-black">Browser permission</p>
+                    <p className="text-xs opacity-60" data-testid="notification-permission-status">
+                      {permission === "granted"
+                        ? "Granted"
+                        : permission === "denied"
+                          ? "Denied — browser notifications will not be delivered"
+                          : permission === "unsupported"
+                            ? "Not supported on this device"
+                            : "Not requested yet"}
+                    </p>
+                  </div>
+                  {permission !== "granted" && permission !== "unsupported" && (
+                    <button
+                      type="button"
+                      onClick={handleRequestPermission}
+                      className="px-3 py-1.5 text-xs rounded-lg border border-purple-500/50 text-purple-300 hover:bg-purple-500/10 transition"
+                    >
+                      {permission === "denied" ? "Re-request" : "Enable"}
+                    </button>
+                  )}
+                </div>
+
+                <p className="text-xs opacity-60 text-white dark:text-black">
+                  Preferences are stored locally on this device and scoped to your connected
+                  wallet address. They are never sent to our servers. You can opt out of any
+                  event at any time; disabling a channel stops all notifications for it.
+                </p>
+              </div>
+            ) : null}
           </div>
 
           {/* Transaction Sound Effects */}

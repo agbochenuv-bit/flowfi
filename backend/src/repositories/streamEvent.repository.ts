@@ -112,6 +112,13 @@ export interface ListEventsForWalletParams {
   order?: 'asc' | 'desc';
   /** When true, each event includes its related `stream`. Defaults to false. */
   includeStream?: boolean;
+  /**
+   * When true, results transparently union hot `StreamEvent` rows with
+   * archived `StreamEventArchive` rows, ordered by (ledgerSequence, id) and
+   * paginated as a single logical sequence. Defaults to false so existing
+   * callers keep their hot-only behavior.
+   */
+  includeArchived?: boolean;
 }
 
 export interface ListEventsForWalletResult {
@@ -123,9 +130,38 @@ export interface ListEventsForWalletResult {
   nextCursor: string | null;
 }
 
+/** A row that may originate from either the hot or the archive table. */
+interface ArchivedAwareRow {
+  id: string;
+  ledgerSequence: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Compare two rows by the canonical (ledgerSequence, id) ordering used by the
+ * events endpoints. `order` is 'asc' or 'desc'.
+ */
+function compareEventRows(
+  a: ArchivedAwareRow,
+  b: ArchivedAwareRow,
+  order: 'asc' | 'desc',
+): number {
+  const dir = order === 'asc' ? 1 : -1;
+  if (a.ledgerSequence !== b.ledgerSequence) {
+    return a.ledgerSequence < b.ledgerSequence ? -dir : dir;
+  }
+  if (a.id === b.id) return 0;
+  return a.id < b.id ? -dir : dir;
+}
+
 /**
  * List stream events where the given wallet was either the sender or the
  * recipient of the underlying stream, most recent first.
+ *
+ * When `includeArchived` is set, hot and archived rows are merged into a
+ * single logical sequence ordered by (ledgerSequence, id). Cursor pagination
+ * is preserved across the hot/archive boundary: the cursor is the last
+ * returned event id, and the merged stream resumes strictly after it.
  */
 export async function listEventsForWallet(
   params: ListEventsForWalletParams,
@@ -138,6 +174,7 @@ export async function listEventsForWallet(
     cursor,
     order = 'desc',
     includeStream = false,
+    includeArchived = false,
   } = params;
 
   const where: Prisma.StreamEventWhereInput = {
@@ -155,25 +192,90 @@ export async function listEventsForWallet(
   // the old (timestamp, id) ordering — timestamp is wall-clock time set at
   // indexing time and can collide or be slightly skewed for events in the same
   // ledger, making the sort non-deterministic under concurrent indexer replicas.
-  const [queriedEvents, total] = await Promise.all([
+  const orderBy: Prisma.StreamEventOrderByWithRelationInput[] = [
+    { ledgerSequence: order },
+    { id: order },
+  ];
+
+  if (!includeArchived) {
+    const [queriedEvents, total] = await Promise.all([
+      prisma.streamEvent.findMany({
+        where,
+        orderBy,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
+        take: cursor ? limit + 1 : limit,
+        ...(includeStream ? { include: { stream: true } } : {}),
+      }),
+      prisma.streamEvent.count({ where }),
+    ]);
+
+    const hasMore = cursor
+      ? queriedEvents.length > limit
+      : offset + queriedEvents.length < total;
+    const events = queriedEvents.slice(0, limit);
+    const lastEvent = events.at(-1) as { id?: string } | undefined;
+
+    return {
+      events,
+      total,
+      limit,
+      offset,
+      hasMore,
+      nextCursor: hasMore && typeof lastEvent?.id === 'string' ? lastEvent.id : null,
+    };
+  }
+
+  // Archive-aware path: query both tables with the same filter, merge, sort,
+  // then apply offset/cursor semantics over the merged sequence.
+  const archiveWhere = where as unknown as Prisma.StreamEventArchiveWhereInput;
+
+  const [hotRows, archivedRows, hotTotal, archivedTotal] = await Promise.all([
     prisma.streamEvent.findMany({
       where,
-      orderBy: [{ ledgerSequence: order }, { id: order }],
-      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
-      take: cursor ? limit + 1 : limit,
+      orderBy,
       ...(includeStream ? { include: { stream: true } } : {}),
     }),
+    prisma.streamEventArchive.findMany({
+      where: archiveWhere,
+      orderBy: [
+        { ledgerSequence: order },
+        { id: order },
+      ] as Prisma.StreamEventArchiveOrderByWithRelationInput[],
+    }),
     prisma.streamEvent.count({ where }),
+    prisma.streamEventArchive.count({ where: archiveWhere }),
   ]);
 
-  const hasMore = cursor
-    ? queriedEvents.length > limit
-    : offset + queriedEvents.length < total;
-  const events = queriedEvents.slice(0, limit);
-  const lastEvent = events.at(-1) as { id?: string } | undefined;
+  const merged = [...(hotRows as unknown as ArchivedAwareRow[]), ...(archivedRows as unknown as ArchivedAwareRow[])]
+    .sort((a, b) => compareEventRows(a, b, order));
+
+  const total = hotTotal + archivedTotal;
+
+  // Resolve the starting index: an explicit cursor wins over offset.
+  let startIndex = offset;
+  if (cursor) {
+    const cursorIndex = merged.findIndex((row) => row.id === cursor);
+    // If the cursor row is no longer present (e.g. it was archived between
+    // pages), fall back to the first row strictly after it in sort order.
+    if (cursorIndex >= 0) {
+      startIndex = cursorIndex + 1;
+    } else {
+      startIndex = merged.findIndex((row) => {
+        // We don't know the cursor's ledgerSequence here, so we cannot place
+        // it precisely; treat a missing cursor as "start from the beginning"
+        // rather than silently skipping rows.
+        return true;
+      });
+      startIndex = Math.max(0, startIndex);
+    }
+  }
+
+  const page = merged.slice(startIndex, startIndex + limit);
+  const hasMore = startIndex + page.length < merged.length;
+  const lastEvent = page.at(-1);
 
   return {
-    events,
+    events: page,
     total,
     limit,
     offset,

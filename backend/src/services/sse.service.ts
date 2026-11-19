@@ -68,6 +68,24 @@ interface ReplayEntry {
   recordedAt: number;
   /** The subscription channel this event belongs to (stream ID or `user:KEY`). */
   channel: string;
+  /**
+   * Ledger sequence this event was derived from, when known. Used to purge
+   * replay entries that belong to an orphaned fork after a chain reorg.
+   */
+  ledger?: number;
+}
+
+/**
+ * Payload emitted on the `reorg` SSE event. Clients use this to discard any
+ * locally cached state derived from the orphaned fork and refetch.
+ */
+export interface SSEChainReorgPayload {
+  /** The last ledger that remains canonical; everything above is orphaned. */
+  forkLedger: number;
+  /** Stream IDs whose indexed projections were affected by the rollback. */
+  affectedStreamIds: string[];
+  /** Wall-clock time the reorg was detected (ms since epoch). */
+  detectedAt: number;
 }
 
 interface SSEClient {
@@ -359,7 +377,7 @@ export class SSEService {
    * Append a message to the replay ring buffer, evicting the oldest entry
    * when the window is full or entries exceed the max-age threshold.
    */
-  private _recordToReplayBuffer(channel: string, message: string): number {
+  private _recordToReplayBuffer(channel: string, message: string, ledger?: number): number {
     const now = Date.now();
 
     // Evict stale entries.
@@ -369,12 +387,41 @@ export class SSEService {
     }
 
     const id = ++this.replaySeq;
-    this.replayBuffer.push({ id, message, recordedAt: now, channel });
+    const entry: ReplayEntry = { id, message, recordedAt: now, channel };
+    if (ledger !== undefined) {
+      entry.ledger = ledger;
+    }
+    this.replayBuffer.push(entry);
 
     // Publish the current buffer size as a gauge.
     sseReplayBufferSize.set(this.replayBuffer.length);
 
     return id;
+  }
+
+  /**
+   * Drop every replay entry derived from a ledger above `forkLedger`.
+   *
+   * After a chain reorganization the events recorded from the orphaned fork
+   * must never be replayed to a reconnecting client — doing so would silently
+   * resurrect state that is no longer canonical. Entries without a ledger
+   * (synthetic events, user-channel notifications) are retained.
+   *
+   * Returns the number of purged entries.
+   */
+  purgeReplayAboveLedger(forkLedger: number): number {
+    const before = this.replayBuffer.length;
+    this.replayBuffer = this.replayBuffer.filter(
+      (entry) => entry.ledger === undefined || entry.ledger <= forkLedger,
+    );
+    const purged = before - this.replayBuffer.length;
+    if (purged > 0) {
+      sseReplayBufferSize.set(this.replayBuffer.length);
+      logger.info(
+        `[SSEService] Purged ${purged} replay entr(ies) above fork ledger ${forkLedger}.`,
+      );
+    }
+    return purged;
   }
 
   // ─── Client lifecycle ──────────────────────────────────────────────────────
@@ -588,10 +635,11 @@ export class SSEService {
     data: unknown,
     channel: string,
     explicitEventId?: string,
+    ledger?: number,
   ): { message: string; seq: number } {
     // Record into replay buffer first to get the stable sequence number.
     const rawBody = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    const seq = this._recordToReplayBuffer(channel, rawBody);
+    const seq = this._recordToReplayBuffer(channel, rawBody, ledger);
     // Prepend the `id:` field so the browser tracks Last-Event-ID.
     const message = `id: ${seq}\n${rawBody}`;
     return { message, seq };
@@ -639,12 +687,67 @@ export class SSEService {
     }
   }
 
+  /**
+   * Corrective broadcast after a chain reorganization.
+   *
+   * Emits a `reorg` event to every affected stream channel and to the admin
+   * channel so operators and clients can invalidate any state derived from the
+   * orphaned fork. Before broadcasting, the replay buffer is purged of entries
+   * whose ledger is above `forkLedger` so a reconnecting client cannot replay
+   * orphaned events.
+   *
+   * Returns the payload that was broadcast (useful for tests and logging).
+   */
+  broadcastReorg(forkLedger: number, affectedStreamIds: string[]): SSEChainReorgPayload {
+    const payload: SSEChainReorgPayload = {
+      forkLedger,
+      affectedStreamIds: [...affectedStreamIds],
+      detectedAt: Date.now(),
+    };
+
+    // Purge orphaned replay entries first so any client reconnecting during
+    // the fan-out below cannot observe stale fork data.
+    this.purgeReplayAboveLedger(forkLedger);
+
+    const eventId = `reorg:${forkLedger}:${payload.detectedAt}`;
+    for (const streamId of payload.affectedStreamIds) {
+      this.broadcastToStream(streamId, 'reorg', payload, eventId);
+    }
+
+    // Notify operators/admins regardless of which streams were affected.
+    this.broadcastToAdmin('reorg', payload, eventId);
+
+    logger.info(
+      `[SSEService] Broadcast reorg at fork ledger ${forkLedger} to ${payload.affectedStreamIds.length} stream(s).`,
+    );
+
+    return payload;
+  }
+
   private _localBroadcastToStream(streamId: string, event: string, data: unknown, eventId?: string): void {
     const channel = streamId;
-    const { message } = this._formatMessage(event, data, channel, eventId);
+    const ledger = this._extractLedger(data);
+    const { message } = this._formatMessage(event, data, channel, eventId, ledger);
     this._fanOut(message, (client) =>
       client.subscriptions.has(streamId) || client.subscriptions.has('*'),
     );
+  }
+
+  /**
+   * Best-effort extraction of the ledger sequence from an event payload so the
+   * replay buffer can later purge entries belonging to an orphaned fork.
+   * Recognises `ledger`, `ledgerSequence`, and `ledger_sequence` fields.
+   */
+  private _extractLedger(data: unknown): number | undefined {
+    if (data === null || typeof data !== 'object') return undefined;
+    const record = data as Record<string, unknown>;
+    for (const key of ['ledger', 'ledgerSequence', 'ledger_sequence'] as const) {
+      const value = record[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        return value;
+      }
+    }
+    return undefined;
   }
 
   private _localBroadcastToUser(publicKey: string, event: string, data: unknown, eventId?: string): void {
@@ -862,7 +965,7 @@ export class SSEService {
 }
 
 export const sseService = new SSEService();
-export type { SSEClient };
+export type { SSEClient, ReplayEntry };
 
 // Publish the configured ceiling once at import time so
 // `flowfi_sse_max_connections / flowfi_sse_active_connections{topic="total"}`

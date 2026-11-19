@@ -5,7 +5,11 @@ import { prisma } from "../lib/prisma.js";
 import { recordAuditEvent } from "../services/audit.service.js";
 import { INDEXER_STATE_ID, ensureIndexerState } from "../lib/indexer-state.js";
 import { sseService } from "../services/sse.service.js";
-import { publishIndexerLag, quarantineEvent } from "../services/indexerService.js";
+import {
+  publishIndexerLag,
+  quarantineEvent,
+  detectAndRepairReorg,
+} from "../services/indexerService.js";
 import {
   indexerEventsProcessedTotal,
   indexerPollsTotal,
@@ -680,6 +684,35 @@ export class SorobanEventWorker {
       }
     }
 
+    // Chain-block reorg classification (issue #246): compare the canonical
+    // ledger hashes we are about to ingest against the ChainBlock rows we have
+    // already stored. A mismatch means the RPC is serving a fork that diverges
+    // from previously observed data; repair the affected projections and
+    // resume from the repaired cursor instead of persisting orphaned events.
+    if (this.checkpointsEnabled) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Chain reorg classified (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); repaired projections and ` +
+              `resuming from repaired cursor.`,
+          );
+          // Re-read state so the cursor reflects the repaired position and no
+          // orphaned events are re-fetched from the stale fork.
+          state = await ensureIndexerState(this.startLedger);
+        }
+      } catch (err) {
+        // A verification failure is not a reorg: keep indexing forward rather
+        // than halting the pipeline on a transient RPC/DB error.
+        logger.error("[SorobanWorker] Chain reorg detection failed:", err);
+      }
+    }
+
     const baseFilter = {
       filters: [
         {
@@ -714,6 +747,39 @@ export class SorobanEventWorker {
     // The network tip is reported alongside every batch, so lag is observable
     // even on cycles that return no events.
     const networkLedger = response.latestLedger ?? 0;
+
+    // Post-fetch reorg guard (issue #246): the fetched events may belong to a
+    // fork that diverged from the canonical chain after the pre-ingestion
+    // check. Re-verify the ledgers we are about to persist against stored
+    // ChainBlock rows; if a reorg is detected, repair projections and skip
+    // persisting this batch entirely so no orphaned events are written.
+    if (this.checkpointsEnabled && response.events.length > 0) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg detected mid-cycle (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); discarding fetched batch and ` +
+              `resuming from repaired cursor.`,
+          );
+          indexerPollsTotal.inc({ outcome: "reorg" });
+          // Do not persist the orphaned batch. The next poll re-reads the
+          // repaired cursor and re-fetches canonical events from there.
+          return;
+        }
+      } catch (err) {
+        logger.error(
+          "[SorobanWorker] Mid-cycle reorg detection failed; skipping batch to avoid persisting potentially orphaned events:",
+          err,
+        );
+        indexerPollsTotal.inc({ outcome: "reorg_check_error" });
+        return;
+      }
+    }
 
     // Lag in ledgers between the last indexed ledger and the network tip.
     // Bounded labels only (no tx hashes / addresses).
@@ -870,6 +936,33 @@ export class SorobanEventWorker {
       // Ownership was lost mid-cycle; do not report success or advance lag.
       this.handleLeaseLoss("fenced cursor write rejected");
       return;
+    }
+
+    // Post-persist reorg guard (issue #246): if a reorg was classified while
+    // this batch was being persisted, the repair path has already rolled back
+    // the affected projections and reset the cursor. Re-read state so the next
+    // poll resumes from the repaired cursor rather than the stale fork.
+    if (this.checkpointsEnabled) {
+      try {
+        const reorg = await detectAndRepairReorg({
+          fetchLedgerHeader: (sequence) => this.fetchLedgerHeader(sequence),
+          alertThreshold: this.reorgAlertThreshold,
+          ownerId: this.ownerId,
+        });
+        if (reorg.detected) {
+          logger.warn(
+            `[SorobanWorker] Reorg classified after persist (depth=${reorg.depth}, ` +
+              `safeLedger=${reorg.safeLedger}); cursor reset to repaired position.`,
+          );
+          indexerPollsTotal.inc({ outcome: "reorg" });
+          return;
+        }
+      } catch (err) {
+        logger.error(
+          "[SorobanWorker] Post-persist reorg detection failed:",
+          err,
+        );
+      }
     }
 
     indexerPollsTotal.inc({ outcome: "processed" });

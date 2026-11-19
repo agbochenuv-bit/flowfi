@@ -17,6 +17,7 @@ import React, { useEffect } from "react";
 import { type WalletId } from "@/lib/wallet";
 import { useWallet } from "@/context/wallet-context";
 import { useModalDialog } from "@/hooks/useModalDialog";
+import { WalletRecoveryPanel } from "@/components/wallet/WalletRecoveryPanel";
 
 import { isConnected } from "@stellar/freighter-api";
 
@@ -32,10 +33,22 @@ export function WalletModal({ onClose }: WalletModalProps) {
     errorMessage,
     connect,
     clearError,
+    recoveryReason,
+    openRecovery,
   } = useWallet();
 
   const isConnecting = status === "connecting";
   const [freighterInstalled, setFreighterInstalled] = React.useState(true);
+  const [showRecovery, setShowRecovery] = React.useState(false);
+
+  // Surface the recovery journey automatically when the session was revoked or
+  // the previously selected wallet is no longer available. First-time users
+  // (no recovery reason) keep the plain connect flow.
+  useEffect(() => {
+    if (recoveryReason) {
+      setShowRecovery(true);
+    }
+  }, [recoveryReason]);
 
   // Escape-to-close, focus trapping, focus restoration and body-scroll
   // locking. Closing stays disabled while a connection is in flight, matching
@@ -71,6 +84,11 @@ export function WalletModal({ onClose }: WalletModalProps) {
   const handleConnect = async (walletId: WalletId) => {
     clearError();
     await connect(walletId);
+  };
+
+  const handleOpenRecovery = () => {
+    openRecovery();
+    setShowRecovery(true);
   };
 
   const handleBackdropClick = (e: React.MouseEvent<HTMLDivElement>) => {
@@ -120,8 +138,29 @@ export function WalletModal({ onClose }: WalletModalProps) {
           </div>
         )}
 
-        {/* Wallet cards */}
-        <div className="wallet-grid">
+        {/* Recovery journey */}
+        {showRecovery ? (
+          <WalletRecoveryPanel onClose={() => setShowRecovery(false)} />
+        ) : (
+          <>
+            {recoveryReason && (
+              <div className="wallet-recovery-entry" role="status">
+                <p>
+                  Your wallet session needs attention. Reconnect or switch
+                  wallets to continue.
+                </p>
+                <button
+                  type="button"
+                  className="inline-link"
+                  onClick={handleOpenRecovery}
+                >
+                  Open recovery steps →
+                </button>
+              </div>
+            )}
+
+            {/* Wallet cards */}
+            <div className="wallet-grid">
           {wallets.map((wallet, index) => {
             const isActiveWallet = selectedWalletId === wallet.id;
             const isConnectingThis = isConnecting && isActiveWallet;
@@ -169,20 +208,22 @@ export function WalletModal({ onClose }: WalletModalProps) {
                 )}
               </article>
             );
-          })}
-        </div>
+              })}
+            </div>
 
-        <p
-          className="wallet-status"
-          data-busy={isConnecting ? "true" : undefined}
-          role="status"
-          aria-live="polite"
-          aria-atomic="true"
-        >
-          {isConnecting
-            ? "Waiting for wallet approval…"
-            : `Supported wallets: ${wallets.map((wallet) => wallet.name).join(", ")}`}
-        </p>
+            <p
+              className="wallet-status"
+              data-busy={isConnecting ? "true" : undefined}
+              role="status"
+              aria-live="polite"
+              aria-atomic="true"
+            >
+              {isConnecting
+                ? "Waiting for wallet approval…"
+                : `Supported wallets: ${wallets.map((wallet) => wallet.name).join(", ")}`}
+            </p>
+          </>
+        )}
       </div>
     </div>
   );

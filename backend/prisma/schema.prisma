@@ -221,3 +221,119 @@ enum BackfillStatus {
   FAILED
   CANCELLED
 }
+
+// ArchiveBatch model - one row per archival run that moved a contiguous ledger
+// range of StreamEvent rows out of the hot table and into StreamEventArchive.
+// The batch is the explicit archive boundary: any event whose ledgerSequence is
+// <= the highest archived toLedger of a COMPLETED batch may live in the archive
+// table instead of the hot table. `integrityHash` is a deterministic digest over
+// the archived rows (streamId, eventType, transactionHash, ledgerSequence) so a
+// restore can verify the archive was not tampered with before re-inserting.
+model ArchiveBatch {
+  id            String    @id @default(uuid())
+  fromLedger    Int       // Inclusive start ledger of the archived range
+  toLedger      Int       // Inclusive end ledger of the archived range
+  eventCount    Int       @default(0)
+  integrityHash String    // Digest over archived rows; verified on restore
+  createdAt     DateTime  @default(now())
+  restoredAt    DateTime? // Set when the batch has been restored back to hot storage
+
+  events        StreamEventArchive[]
+
+  @@index([fromLedger, toLedger])
+  @@index([toLedger])
+  @@index([createdAt])
+  @@index([restoredAt])
+}
+
+// StreamEventArchive model - cold storage mirror of StreamEvent. Rows are moved
+// here by the archival job and are never mutated afterwards. The shape mirrors
+// StreamEvent (same columns, same canonical ordering) plus archival metadata so
+// historical reads can be served transparently across the hot/archive boundary.
+model StreamEventArchive {
+  id              String   @id @default(uuid())
+  streamId        BigInt
+  eventType       String
+  amount          String?
+  transactionHash String
+  ledgerSequence  Int
+  timestamp       BigInt
+  metadata        String?
+  createdAt       DateTime @default(now())
+  archiveBatchId  String
+  integrityHash   String   // Per-row digest, recomputed and compared on restore
+  archivedAt      DateTime @default(now())
+
+  batch           ArchiveBatch @relation(fields: [archiveBatchId], references: [id], onDelete: Restrict)
+
+  @@unique([transactionHash, eventType])
+  @@index([streamId])
+  @@index([eventType])
+  @@index([streamId, eventType])
+  @@index([timestamp])
+  @@index([transactionHash])
+  @@index([ledgerSequence])
+  @@index([archivedAt])
+  @@index([streamId, ledgerSequence])
+  @@index([archiveBatchId])
+}
+
+// ChainBlock model - canonical ledger hash chain observed by the indexer. Each
+// row records the block hash and its parent hash so a fork can be detected by
+// walking back until the stored hash matches the canonical chain again.
+// `finalizedAt` is set once the ledger is buried under the configured finality
+// depth; finalized ledgers are never reorged and are safe to archive.
+model ChainBlock {
+  ledgerSequence Int       @id
+  blockHash      String
+  parentHash     String
+  finalizedAt    DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([blockHash])
+  @@index([finalizedAt])
+}
+
+enum ReorgStatus {
+  DETECTED
+  REPAIRING
+  REPAIRED
+  FAILED
+}
+
+// ReorgRecord model - audit trail of detected chain reorganizations. A record is
+// opened when a previously observed ledger hash no longer matches the canonical
+// chain, and closed once affected projections (events, streams, cursors, SSE
+// state) have been repaired. `forkLedger` is the first non-canonical ledger and
+// `depth` is how many ledgers were rolled back.
+model ReorgRecord {
+  id                  String      @id @default(uuid())
+  detectedAt          DateTime    @default(now())
+  forkLedger          Int
+  depth               Int
+  orphanedEventCount  Int         @default(0)
+  repairedAt          DateTime?
+  status              ReorgStatus @default(DETECTED)
+
+  @@index([detectedAt])
+  @@index([forkLedger])
+  @@index([status])
+}
+
+// NotificationPreference model - per-wallet notification settings (issue #257).
+// Preferences are keyed by wallet address so they survive across sessions and
+// devices. `eventTypes` is a JSON object mapping stream lifecycle event names
+// (e.g. {"CREATED": true, "WITHDRAWN": false}) to opt-in flags; missing keys
+// fall back to the application default. Browser notifications additionally
+// require the user to grant the Notification permission at runtime.
+model NotificationPreference {
+  id             String   @id @default(uuid())
+  walletAddress  String   @unique // Stellar public key of the owner
+  eventTypes     String   @default("{}") // JSON map of eventType -> enabled
+  browserEnabled Boolean  @default(false)
+  inAppEnabled   Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([walletAddress])
+}
