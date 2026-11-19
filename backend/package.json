@@ -4,6 +4,9 @@
   "description": "",
   "type": "module",
   "main": "index.js",
+  "bin": {
+    "flowfi": "dist/cli/index.js"
+  },
   "scripts": {
     "prebuild": "prisma generate",
     "pretest": "prisma generate",
@@ -15,12 +18,15 @@
     "dev": "nodemon",
     "build": "tsc",
     "start": "node dist/index.js",
+    "cli": "tsx src/cli/index.ts",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
     "prisma:deploy": "prisma migrate deploy",
     "prisma:seed": "prisma db seed",
     "prisma:studio": "prisma studio",
     "codegen:openapi": "tsx scripts/export-openapi.mts",
+    "codegen:bindings": "tsx scripts/generate-contract-bindings.ts",
+    "check:bindings-drift": "tsx scripts/generate-contract-bindings.ts --check",
     "check:api-compat": "tsx scripts/check-api-compatibility.ts",
     "check:schema-compat": "tsx scripts/check-schema-compat.ts"
   },

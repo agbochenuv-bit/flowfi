@@ -3,10 +3,67 @@
 This document describes the externally observable behavior of the indexer's
 lease coordination, the database indexes backing stream/event reads, the
 admin replay preview/execute contract, the Soroban RPC retry/backoff policy,
-graceful shutdown and poll cancellation, and the indexer metrics. It is
+graceful shutdown and poll cancellation, the indexer metrics, and the
+operator CLI for deployment validation and read-only inspection. It is
 written for operators and on-call engineers. All public interfaces described
 here are additive; existing endpoints and configuration keys keep working
 unless noted.
+
+---
+
+## 0. Operator CLI: deployment validation and read-only inspection
+
+The FlowFi operator CLI lets contributors and operators validate deployment
+configuration and inspect public contract and indexer metadata **without
+secret-bearing defaults**. It never ships with credentials baked in and never
+prints secret values.
+
+### Commands
+
+| Command | Writes? | Purpose |
+| --- | --- | --- |
+| `flowfi-cli config validate` | No | Validate deployment configuration (required keys, network, contract IDs) |
+| `flowfi-cli contract inspect` | No | Print public contract metadata (address, network, version) |
+| `flowfi-cli indexer inspect` | No | Print public indexer metadata (cursor, lease owner, health) |
+| `flowfi-cli deploy` | **Yes** | Deploy/upgrade contracts; requires explicit confirmation |
+
+### Secret handling
+
+- **No secret-bearing defaults.** The CLI reads secrets only from the
+  environment or an explicit `--config` file supplied by the operator. There
+  are no hardcoded keys, tokens, or credentials.
+- **Redaction.** Any value whose key matches a secret pattern (e.g.
+  `*_SECRET`, `*_KEY`, `*_TOKEN`, `*_PASSWORD`, `DATABASE_URL`) is redacted in
+  all output as `***`. Redaction applies to `config validate`, inspection
+  commands, and error messages.
+- **Read-only by default.** Inspection and validation commands perform no
+  writes and are safe to run against production.
+
+### Explicit confirmation for writes
+
+Write commands (`deploy`) require explicit confirmation before mutating
+state:
+
+- Interactive runs prompt for confirmation and abort on anything other than
+  an explicit `yes`.
+- Non-interactive runs must pass `--yes`; without it the command exits
+  non-zero without writing.
+
+### Execution paths
+
+- **Offline.** `config validate` and inspection commands run fully offline
+  against local config; they do not require network access.
+- **Wrong network.** If the configured network does not match the target
+  contract's network, validation fails with a clear error and no writes occur.
+- **Read-only.** Inspection commands never write and never require write
+  credentials.
+
+### Failure and boundary cases
+
+- Missing required configuration keys fail validation with a non-zero exit
+  code and a redacted report.
+- A network mismatch fails validation before any write command proceeds.
+- A write command without confirmation exits non-zero and performs no writes.
 
 ---
 
@@ -168,36 +225,4 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
-
----
-
-## 4. Metrics
-
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
-
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+  the lease is rejected by the same fencing check that guards cursor writes.
