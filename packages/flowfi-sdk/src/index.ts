@@ -50,3 +50,4 @@ export {
   PollRetryExhaustedError,
 } from './retry.js';
 export type { PollRetryOptions } from './retry.js';
+export * from './stream-store.js';

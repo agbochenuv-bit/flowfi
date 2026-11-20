@@ -168,3 +168,19 @@ three signers, and every `FlowFiClient` method with mocked RPC/signer shims
 (no network I/O).
 
 [openapi-generator]: https://openapi-generator.tech/
+### React stream lifecycle
+
+Import `useStream` from `@flowfi/sdk/react` inside a component. Pass a stable
+transport whose load method reads current state and whose subscribe method
+registers a change listener and returns its cleanup function.
+
+```tsx
+const state = useStream(transport, streamId, walletAddress);
+if (state.status === 'loading') return <p>Loading stream…</p>;
+if (state.status === 'error') return <p>Stream unavailable</p>;
+return <p>{state.value.status}</p>;
+```
+
+Server rendering returns loading without opening a connection. Changing the
+wallet or stream starts a fresh store. Other frameworks can subscribe to
+`createStreamStore(transport, streamId, walletAddress)` from the core package.
