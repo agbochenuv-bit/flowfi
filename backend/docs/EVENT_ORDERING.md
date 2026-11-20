@@ -164,6 +164,37 @@ idempotent because:
    through the same `processEvent` path, which checks for duplicates before
    mutating stream state.
 
+## Financial Language and Risk-Disclosure Glossary
+
+This glossary standardizes how the product explains monetary and lifecycle
+values. Every UI label, API field description, and support article should use
+these terms with the stated meaning. Where a value is derived rather than
+observed on-chain, the caveat column is mandatory disclosure.
+
+| Term          | Definition                                                                 | Authoritative source                                                                 | Caveats / risk disclosure                                                                                       |
+|---------------|----------------------------------------------------------------------------|--------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------------|
+| **Streamed**  | The portion of a stream's total amount that has accrued to the recipient over elapsed time, whether or not it has been withdrawn. | Contract accrual formula evaluated against `ledgerSequence` (see Canonical Ordering Key). | Accrual is time-based and continuous; it is not a settled balance. A paused stream stops accruing. Displayed streamed values are estimates until the stream is finalized. |
+| **Claimable** | The amount the recipient can withdraw right now: streamed minus already-withdrawn, bounded by the stream's remaining balance. | Contract `withdrawable`/claimable view, derived from the latest indexed `WITHDRAWN` and `TOPPED_UP` events. | Depends on the most recent indexed ledger; a lagging indexer can under-report. Claimable is never negative and never exceeds the stream's funded balance. |
+| **Deposited** | Funds the sender has actually placed into the stream (initial creation plus every `TOPPED_UP`). | `CREATED` and `TOPPED_UP` events, keyed by `(transactionHash, eventType)`. | Reflects on-chain deposits only; pending or failed transactions are excluded. Deposited is not the same as streamed — deposited funds may not yet have accrued. |
+| **Withdrawn** | Funds the recipient has actually claimed out of the stream. | `WITHDRAWN` events (repeatable) in canonical `(ledgerSequence, id)` order. | Withdrawn is cumulative and irreversible on-chain. A withdrawal that is broadcast but not yet indexed will not appear until the event is observed. |
+| **Estimated** | Any value computed from time-based accrual or from a not-yet-finalized ledger, presented before on-chain finality. | Client/API accrual computation over the latest indexed `ledgerSequence`. | Estimates can change as new ledgers arrive and must be labeled as estimates in the UI. Never present an estimated value as a settled or finalized amount. |
+| **Finalized** | A value backed by an event that has reached Stellar finality and is persisted in canonical order. | Persisted `StreamEvent` rows ordered by `(ledgerSequence, id)`; terminal `CANCELLED`/`COMPLETED` events close the lifecycle. | Finalized values are authoritative for accounting. Once a stream is `CANCELLED` or `COMPLETED`, no further lifecycle events are valid and totals must not change. |
+| **Stale**   | A displayed value whose backing data is older than the latest known ledger, or whose stream has received no update within the freshness window. | Comparison of the value's `ledgerSequence` against the indexer's current cursor / SSE `_ordering.ledgerSequence`. | Stale values must be visibly flagged and must not be treated as claimable or finalized. A stale value can be superseded by a later event; clients should re-fetch or resume SSE from their last `_ordering.eventId`. |
+
+### Consistency rules across UI and API surfaces
+
+- **UI**: monetary labels must use exactly these terms (`Streamed`, `Claimable`,
+  `Deposited`, `Withdrawn`) and must mark derived values as `Estimated` until
+  finalized. Stale values must carry a visible stale indicator.
+- **API**: response fields and their descriptions must map to these terms; any
+  field derived from accrual rather than a persisted event must be documented
+  as an estimate. Event-listing responses remain ordered by
+  `(ledgerSequence, id)` so consumers can distinguish finalized from stale data.
+- **Transitions**: `Estimated → Finalized` happens when the backing event is
+  indexed and finalized; `Finalized → Stale` must never occur for terminal
+  streams. A value may move `Estimated → Stale` if the indexer cursor advances
+  past the value's `ledgerSequence` without a confirming event.
+
 ## Summary of Guarantees
 
 | Layer       | Guarantee                                                                 |
@@ -173,3 +204,4 @@ idempotent because:
 | API queries | All event-listing responses are sorted by `(ledgerSequence ASC, id ASC)`. |
 | Indexer     | Batch events are processed in ledger+paging-token order.                  |
 | SSE         | Every broadcast includes `_ordering.{ledgerSequence, eventId, eventType}` for client-side gap detection. |
+| Financial   | Streamed/claimable/deposited/withdrawn/estimated/finalized/stale terms are defined with sources and caveats above. |

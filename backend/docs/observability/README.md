@@ -126,3 +126,97 @@ process continues untraced.
 | `SOROBAN_RPC_TIMEOUT_MS` | `10000` | Per-call RPC deadline (drives breaker trips) |
 | `SOROBAN_RPC_MAX_RETRIES` | `2` | Retry budget (drives failover counts) |
 | `SIMULATION_VALIDITY_LEDGERS` | `10` | Ledgers a `/simulate` footprint stays fresh for |
+
+## Incident evidence and post-incident review
+
+Use this template to record evidence during a production incident and to drive
+the post-incident review (PIR). Copy it into the incident ticket; do not store
+it in this repository. Keep the record factual and minimal — capture only what
+is needed to reconstruct impact and recovery.
+
+**Privacy:** record roles and on-call handles, not personal names, emails, or
+customer identifiers. Reference streams/transactions by internal ID or hash,
+never by wallet owner identity. Redact secrets, bearer tokens, and full RPC
+payloads before pasting logs.
+
+### 1. Summary
+
+| Field | Value |
+| --- | --- |
+| Incident ID | |
+| Severity | SEV1 / SEV2 / SEV3 |
+| Status | investigating / mitigating / monitoring / resolved |
+| Detected (UTC) | |
+| Resolved (UTC) | |
+| Incident commander (role) | |
+| Comms lead (role) | |
+| Affected environment | staging / production |
+| Affected network | testnet / mainnet |
+
+### 2. Impact
+
+- User-visible symptoms and the surface affected (API, SSE stream, indexer,
+  webhooks).
+- Blast radius: number of streams/transactions affected, expressed as counts or
+  ranges — no per-user breakdowns.
+- Data integrity: was any ledger, event, or accounting record lost, duplicated,
+  or mis-ordered? State yes/no and the evidence.
+- Financial invariants: confirm whether balances, escrow, or settlement totals
+  remained consistent. If not, link the reconciliation evidence.
+
+### 3. Timeline (UTC)
+
+| Time | Event | Evidence link |
+| --- | --- | --- |
+| | First signal / alert fired | |
+| | Incident declared | |
+| | Mitigation started | |
+| | Service restored | |
+| | Incident closed | |
+
+### 4. Chain state
+
+- Indexer `current_ledger` vs `network_ledger` at detection and at recovery
+  (`flowfi_indexer_current_ledger`, `flowfi_indexer_network_ledger`,
+  `flowfi_indexer_lag_ledgers`).
+- Quarantined or dead-lettered events during the window
+  (`flowfi_indexer_events_processed_total{result="quarantined"}`); list event
+  IDs and replay status.
+- RPC health: circuit-breaker trips and failovers per endpoint
+  (`flowfi_rpc_circuit_breaker_trips_total`, `flowfi_rpc_failovers_total`).
+- Any manual ledger rewind, replay, or backfill performed, with the exact
+  command and the operator role that ran it.
+
+### 5. Recovery steps
+
+Record the ordered actions that restored service, each with the operator role
+and the verification that confirmed it worked:
+
+| # | Action | Owner (role) | Verification |
+| --- | --- | --- | --- |
+| 1 | | | |
+| 2 | | | |
+
+Verification must be observable (metric back in range, alert cleared, replay
+count zero, smoke test green) — not "looks fine".
+
+### 6. Follow-up work
+
+Every follow-up item needs an owner role, a due date, and a verification
+criterion so it can be closed objectively.
+
+| # | Action item | Owner (role) | Due | Verification criterion |
+| --- | --- | --- | --- | --- |
+| 1 | | | | |
+| 2 | | | | |
+
+### 7. Runbooks and references
+
+Link to the existing runbooks instead of duplicating their steps:
+
+- Indexer operations and dead-letter replay: [`../indexer-operations.md`](../indexer-operations.md)
+- Metrics, alerting, and tracing: this document (see *Alerting starting points*
+  and *Tracing* above)
+- Grafana dashboard: `grafana-dashboard.json` in this directory
+- Architecture and event ordering: [`../ARCHITECTURE.md`](../ARCHITECTURE.md),
+  [`../EVENT_ORDERING.md`](../EVENT_ORDERING.md)

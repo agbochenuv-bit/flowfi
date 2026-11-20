@@ -168,36 +168,84 @@ backend instances**.
   inputs is deterministic regardless of which replica handled the poll or the
   replay.
 - **Fencing still applies.** A replay executed by a replica that does not hold
-  the poll lease still writes through the same fenced cursor path; a stale
-  lease owner cannot use replay to bypass fencing.
-- **Lock timeout.** If the lock cannot be acquired within the configured
-  timeout, the operation fails fast with `status: failed` rather than blocking
-  indefinitely; retry is safe.
-
-### Operational notes
-
-- Preview before execute to confirm the affected range and expected changes.
-- On `status: failed` or `partial`, inspect `failurePosition` and `counts`
-  before retrying.
-- No existing admin endpoints were removed; the report is additive to the
-  replay response.
-- Replay briefly pauses live polling while it holds the lock; expect a small,
-  bounded lag increase during a replay window.
+  the lease is rejected by the same fencing check that guards cursor writes.
 
 ---
 
-## 4. Metrics
+## 4. Incident evidence and post-incident review
 
-All metrics are emitted per worker instance and are safe with multiple
-replicas. **No high-cardinality labels** (transaction hashes, wallet
-addresses) are used.
+Use this template to record impact, timeline, chain state, recovery steps, and
+follow-up work after a production incident. Keep it factual and minimal: record
+**roles and system identifiers**, not personal data (no names, emails, IPs, or
+wallet addresses beyond what is strictly required to describe impact).
 
-| Metric | Type | Unit | Labels | Meaning |
-| --- | --- | --- | --- | --- |
-| `indexer_ledger_lag` | gauge | ledgers | `worker` | Chain head ledger minus last indexed ledger |
-| `indexer_events_per_ledger` | histogram | events | `worker` | Events decoded per ledger |
-| `indexer_decode_latency_seconds` | histogram | seconds | `worker` | Time to decode a ledger's events |
-| `indexer_persist_latency_seconds` | histogram | seconds | `worker` | Time to persist a ledger's events |
-| `indexer_retries_total` | counter | count | `worker`, `reason` | Retry attempts (bounded `reason` set) |
-| `indexer_last_success_timestamp_seconds` | gauge | unix seconds | `worker` | Time of last successful ledger advance |
-| `indexer_lease_owner` | gauge | 0/1 | `worker` | Whether this worker currently holds the lease |
+### 4.1 Incident summary
+
+| Field | Value |
+| --- | --- |
+| Incident ID | |
+| Severity | SEV1 / SEV2 / SEV3 |
+| Status | ongoing / mitigated / resolved |
+| Detected at (UTC) | |
+| Resolved at (UTC) | |
+| Incident commander (role) | |
+| Responders (roles) | |
+| Affected components | indexer / API / DB / RPC / other |
+
+### 4.2 Impact
+
+- **User-visible impact:** what was degraded or unavailable, and for how long.
+- **Scope:** affected networks/environments and ledger range (if known).
+- **Data integrity:** any suspected cursor regression, skipped ledgers, or
+  duplicate events. State explicitly if none observed.
+- **Financial invariants:** confirm whether stream balances/accounting were
+  affected. Do not include amounts tied to identifiable parties.
+
+### 4.3 Timeline (UTC)
+
+| Time | Event | Evidence link |
+| --- | --- | --- |
+| | Detection (alert / report) | |
+| | Triage started | |
+| | Mitigation applied | |
+| | Recovery verified | |
+| | Incident closed | |
+
+Link to dashboards, logs, and traces rather than pasting raw payloads. Redact
+secrets and personal data from any attached evidence.
+
+### 4.4 Chain state
+
+| Field | Value |
+| --- | --- |
+| Network | |
+| Live cursor at detection | |
+| Live cursor at recovery | |
+| Lease owner / fencing token | |
+| Replay or reset performed | yes / no (requestId) |
+| RPC endpoint health | |
+
+### 4.5 Recovery steps
+
+1. Describe each action taken, in order, with the role that performed it.
+2. Note the verification performed after each step (e.g., cursor advanced,
+   metrics returned to baseline, replay report `status: succeeded`).
+3. Reference the relevant runbook section instead of duplicating procedures.
+
+### 4.6 Follow-up work
+
+| Action | Owner (role) | Verification criteria | Due |
+| --- | --- | --- | --- |
+| | | | |
+
+Each follow-up must have a single owning role and an objective, checkable
+verification criterion (e.g., "alert fires in staging within 5 min of induced
+lease loss").
+
+### 4.7 Related runbooks
+
+- Lease, replay, and cursor procedures: this document (sections 1–3).
+- Observability, metrics, and alerting: see the observability documentation
+  referenced from the operations index.
+- Architecture and event ordering: `backend/docs/ARCHITECTURE.md` and
+  `backend/docs/EVENT_ORDERING.md`.

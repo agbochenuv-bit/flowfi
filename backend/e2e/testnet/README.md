@@ -48,3 +48,52 @@ tests are skipped when `DATABASE_URL` is unset.
 | `E2E_MAX_P90_INCLUSION_FEE` | `100000` stroops |
 | `E2E_TX_TIMEOUT_MS` | `90000` |
 | `E2E_INDEXER_TIMEOUT_MS` | `120000` |
+
+## Supported compatibility matrix
+
+This matrix defines the tested boundaries for wallet and transaction
+workflows. Each entry is tied to concrete evidence so contributors can tell
+what is actually verified versus assumed. Anything not listed here is
+**unsupported** and must be treated as best-effort.
+
+### Browsers
+
+| Browser | Minimum version | Evidence |
+| --- | --- | --- |
+| Chrome / Edge (Chromium) | last 2 stable majors | Manual: wallet connect + `create_stream`/`withdraw`/`cancel_stream` on Testnet per release checklist |
+| Firefox | last 2 stable majors | Manual: same release checklist |
+| Safari | last 2 stable majors | Manual: same release checklist |
+| Mobile browsers | _unsupported_ | — |
+
+Boundary rule: a browser one major below the minimum is **unsupported**; the
+release checklist must record the exact versions exercised so the matrix stays
+current.
+
+### Wallets
+
+| Wallet | Status | Evidence |
+| --- | --- | --- |
+| Freighter | Supported | Manual: connect + sign `create_stream`/`withdraw`/`cancel_stream` on Testnet |
+| WalletConnect-based wallets | Supported | Manual: connect + sign on Testnet |
+| Hardware wallets | _unsupported_ | — |
+| Custodial / exchange wallets | _unsupported_ | — |
+
+### Networks
+
+| Network | Status | Evidence |
+| --- | --- | --- |
+| Stellar Testnet | Supported | Automated: `network-health.e2e.test.ts`, `stream-lifecycle.e2e.test.ts` (scheduled every 6h) |
+| Stellar Mainnet | Supported (manual sign-off) | Manual: release checklist transaction on Mainnet |
+| Futurenet / custom networks | _unsupported_ | — |
+
+### Communicating unsupported combinations
+
+- **Users:** the app must surface an explicit, non-blocking message naming the
+  unsupported browser, wallet, or network and refuse to submit the transaction
+  rather than silently failing. Wallet authorization and chain/network
+  validation must never be bypassed to make an unsupported combination work.
+- **Contributors:** any change that widens or narrows this matrix must update
+  this table and its evidence in the same PR. A combination without an evidence
+  entry is unsupported by default.
+- **Failures:** a scheduled `testnet-e2e-failure` issue means the Testnet row
+  is no longer verified; treat Testnet as degraded until the run is green.
