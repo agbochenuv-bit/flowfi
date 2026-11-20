@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useState, useCallback, useMemo, useRef } from "react";
+import { preparePause } from "@/lib/prepared-pause";
+import { getNetworkConfig } from "@/lib/stellar-config";
 import Link from "next/link";
 import { getApiBaseUrl } from "@/lib/api/_shared";
 import { logger } from "@/lib/logger";
@@ -305,14 +307,38 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
     }
   };
 
+  const [prepared, setPrepared] = useState<ReturnType<typeof preparePause> | null>(null);
+  const pausePending = useRef(false);
   const handlePause = async () => {
     if (!session) {
       toast.error("Please connect your wallet");
       return;
     }
+    if (!stream || pausePending.current) return;
+    const context = { account: session.publicKey, network: networkId, streamId, revision: stream.updatedAt };
+    if (navigator.onLine === false) {
+      setPrepared(preparePause(context));
+      return;
+    }
+    pausePending.current = true;
     tracker.start();
     try {
-      const result = await pauseStream(session, { streamId: BigInt(streamId) });
+      prepared?.claim(context);
+      const beforeSign = async (signingNetwork: typeof networkId) => {
+        if (!prepared) return;
+        const response = await fetch(`${API_BASE_URL}/streams/${streamId}`, { cache: "no-store" });
+        if (!response.ok) throw new Error("Could not revalidate stream");
+        const fresh: StreamDetail = await response.json();
+        const wallet = await import("@stellar/freighter-api");
+        const [address, network] = await Promise.all([wallet.getAddress(), wallet.getNetwork()]);
+        if (signingNetwork !== context.network || address.error || network.error || !fresh.isActive || fresh.isPaused || fresh.sender !== session.publicKey ||
+            fresh.streamId !== stream.streamId || network.networkPassphrase !== getNetworkConfig(networkId).passphrase)
+          throw new Error("Stream or wallet network changed");
+        prepared.validate({ ...context, account: address.address, revision: fresh.updatedAt });
+      };
+      const result = await pauseStream(session, prepared
+        ? { streamId: BigInt(streamId), beforeSign }
+        : { streamId: BigInt(streamId) });
       tracker.submit(result.txHash);
       tracker.confirm();
       transactionSuccessToast("Stream paused");
@@ -322,6 +348,9 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
       const message = toSorobanErrorMessage(err);
       tracker.fail(message);
       toast.error(message);
+    } finally {
+      pausePending.current = false;
+      setPrepared(null);
     }
   };
 
@@ -617,6 +646,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                 </Button>
               )}
 
+              {prepared && <p role="status">Pause prepared locally. Reconnect and review before {new Date(prepared.expiresAt).toLocaleTimeString()} to sign.</p>}
               {isSender && (
                 <>
                   {!stream.isPaused ? (
@@ -627,7 +657,7 @@ export default function StreamDetailsContent({ streamId }: { streamId: string })
                       className="flex items-center gap-2"
                     >
                       <Pause className="h-4 w-4" />
-                      {tracker.status !== "idle" ? "Processing..." : "Pause"}
+                      {tracker.status !== "idle" ? "Processing..." : prepared ? "Review prepared pause" : "Pause"}
                     </Button>
                   ) : (
                     <Button

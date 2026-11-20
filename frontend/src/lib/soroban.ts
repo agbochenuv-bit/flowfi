@@ -33,6 +33,7 @@ export interface BatchWithdrawParams {
 }
 
 export interface PauseParams {
+  beforeSign?: (network: NetworkId) => Promise<void>;
   streamId: bigint;
 }
 
@@ -226,6 +227,7 @@ async function freighterCall(
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   args: any[],
   onStage?: TransactionStageCallback,
+  beforeSign?: (network: NetworkId) => Promise<void>,
 ): Promise<SorobanResult> {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const sdk: any = await import("@stellar/stellar-sdk");
@@ -259,10 +261,14 @@ async function freighterCall(
 
   const preparedTx = (rpc.assembleTransaction ?? sdk.assembleTransaction)(tx, simResult).build();
 
+  if (beforeSign) {
+    await beforeSign(config.id);
+    if (activeNetworkConfig().passphrase !== config.passphrase) throw new Error("Network changed");
+  }
   onStage?.("awaiting_approval");
-  const { signedTxXdr, error: signError } = await signTransaction(
+  const { signedTxXdr, signerAddress, error: signError } = await signTransaction(
     preparedTx.toXDR(),
-    { networkPassphrase: config.passphrase },
+    { networkPassphrase: config.passphrase, ...(beforeSign ? { address: publicKey } : {}) },
   );
 
   if (signError) {
@@ -273,6 +279,7 @@ async function freighterCall(
     throw new SorobanCallError(msg, "Unknown");
   }
 
+  if (beforeSign && signerAddress !== publicKey) throw new Error("Signing account changed");
   const signedTx = TransactionBuilder.fromXDR(signedTxXdr, config.passphrase);
   const sendResult = await server.sendTransaction(signedTx);
 
@@ -388,7 +395,7 @@ export async function pauseStream(
   return freighterCall(session.publicKey, "pause_stream", [
     new Address(session.publicKey).toScVal(),
     nativeToScVal(params.streamId, { type: "u64" }),
-  ], onStage);
+  ], onStage, params.beforeSign);
 }
 
 export async function resumeStream(

@@ -29,3 +29,8 @@ NEXT_PUBLIC_RPC_URL=https://soroban-testnet.stellar.org
 - `npm run build`: Builds the app for production.
 - `npm start`: Runs the production server.
 - `npm run lint`: Runs ESLint to check for code issues.
+
+On an already loaded stream details page, the sender can select Pause while
+offline. The unsigned intent stays in this tab for five minutes. Reconnect
+and choose Review prepared pause to simulate, recheck the indexed stream
+revision and wallet, then request a signature. Reloading discards the intent.

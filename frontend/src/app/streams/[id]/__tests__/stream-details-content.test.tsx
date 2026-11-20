@@ -478,6 +478,25 @@ describe("StreamDetailsContent handlePause", () => {
     } as ReturnType<typeof origUseWallet>);
   });
 
+  it("keeps an offline pause unsigned until explicit review after reconnect", async () => {
+    const online = vi.spyOn(navigator, "onLine", "get").mockReturnValue(false);
+    try {
+      const { user } = await renderLoaded();
+      await user.click(screen.getByRole("button", { name: /^pause$/i }));
+      expect(screen.getByText(/pause prepared locally/i)).toBeInTheDocument();
+      online.mockReturnValue(true);
+      window.dispatchEvent(new Event("online"));
+      expect(mockSoroban.pauseStream).not.toHaveBeenCalled();
+      mockSoroban.pauseStream.mockResolvedValueOnce({ txHash: "reviewed" });
+      await user.click(screen.getByRole("button", { name: /review prepared pause/i }));
+      expect(mockSoroban.pauseStream).toHaveBeenCalledWith(mockSession, {
+        streamId: 42n, beforeSign: expect.any(Function),
+      });
+    } finally {
+      online.mockRestore();
+    }
+  });
+
   it("calls pauseStream and shows success toast on success", async () => {
     mockSoroban.pauseStream.mockResolvedValueOnce({ txHash: "tx_hash_3" });
     const { user } = await renderLoaded();
