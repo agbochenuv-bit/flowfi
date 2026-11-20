@@ -44,10 +44,8 @@ export function useStreamingAmount({
       !isPaused &&
       ratePerSecond > 0 &&
       maxClaimable > 0;
-    const reduceMotion =
-      typeof window !== "undefined" &&
-      typeof window.matchMedia === "function" &&
-      window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const motion = window.matchMedia?.("(prefers-reduced-motion: reduce)");
+    let interval: number | undefined;
     let lastFrameTime = performance.now();
 
     const computeClaimable = () => {
@@ -101,18 +99,24 @@ export function useStreamingAmount({
       }
     };
 
-    if (reduceMotion && isStreaming) {
-      // #1198 — Respect prefers-reduced-motion: compute the accrued value once
-      // and skip the per-frame animation loop entirely.
-      claimableRef.current = computeClaimable();
-      setClaimable(claimableRef.current);
-    } else if (isStreaming) {
-      rafId = requestAnimationFrame(tick);
-    }
-
+    const schedule = () => {
+      if (rafId !== null) cancelAnimationFrame(rafId);
+      window.clearInterval(interval);
+      if (!isStreaming) return;
+      handleVisibilityChange();
+      if (motion?.matches) {
+        interval = window.setInterval(handleVisibilityChange, 1000);
+      } else {
+        rafId = requestAnimationFrame(tick);
+      }
+    };
+    schedule();
+    motion?.addEventListener?.("change", schedule);
     document.addEventListener("visibilitychange", handleVisibilityChange);
 
     return () => {
+      motion?.removeEventListener?.("change", schedule);
+      window.clearInterval(interval);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       if (rafId !== null) {
         cancelAnimationFrame(rafId);

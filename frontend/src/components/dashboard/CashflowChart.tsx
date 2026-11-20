@@ -155,7 +155,7 @@ export function CashflowChart({
   }, [dailyFlows, minCumulative, maxCumulative]);
 
   return (
-    <div className="glass-card rounded-2xl border-slate-800 p-6">
+    <div className="financial-view glass-card rounded-2xl border-slate-800 p-6">
       {/* Header */}
       <div className="flex items-center justify-between mb-6">
         <div>
@@ -168,6 +168,7 @@ export function CashflowChart({
           {[7, 30, 90].map((d) => (
             <button
               key={d}
+              aria-pressed={days === d}
               onClick={() => onDaysChange?.(d as 7 | 30 | 90)}
               className={`px-3 py-1.5 text-sm rounded-lg transition-colors ${
                 days === d
@@ -246,6 +247,8 @@ export function CashflowChart({
 
           {/* SVG Chart */}
           <svg
+            role="img"
+            aria-label={`Cumulative net cashflow over ${days} days: ${summary.totalNet.toFixed(2)}`}
             className="absolute inset-0 w-full h-full"
             viewBox="0 0 100 100"
             preserveAspectRatio="none"

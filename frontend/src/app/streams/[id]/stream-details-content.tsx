@@ -829,7 +829,7 @@ function StatCard({
 }) {
   return (
     <div
-      className={`relative glass-card p-4 ${highlight ? "border-accent/30 bg-accent/5" : ""}`}
+      className={`financial-view relative glass-card p-4 ${highlight ? "border-accent/30 bg-accent/5" : ""}`}
     >
       {pulseKey !== undefined && (
         // Re-keying the overlay restarts the one-shot flash on every pulse

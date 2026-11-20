@@ -1726,3 +1726,16 @@ body {
   color: var(--danger);
   margin: 0;
 }
+
+@media (prefers-contrast: more), (forced-colors: active) {
+  .financial-view { background: Canvas !important; }
+  .financial-view, .financial-view * {
+    color: CanvasText !important;
+    background-image: none !important;
+    border-color: CanvasText !important;
+  }
+  .financial-view :where(div, p, span, button, input) { background-color: transparent !important; }
+  .financial-view svg path[stroke] { stroke: CanvasText; stroke-width: 2; }
+  .financial-view button[aria-pressed="true"] { text-decoration: underline; }
+  .financial-view :focus-visible { outline: 3px solid Highlight; outline-offset: 2px; }
+}

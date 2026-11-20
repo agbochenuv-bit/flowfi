@@ -46,6 +46,7 @@ describe("useStreamingAmount", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    vi.unstubAllGlobals();
   });
 
   it("accrues over time while the stream is active", () => {
@@ -141,6 +142,22 @@ describe("useStreamingAmount", () => {
 
     // A non-active stream does not tick at all.
     expect(result.current).toBe(0);
+  });
+
+  it("refreshes in one-second steps when motion is reduced", () => {
+    vi.stubGlobal("matchMedia", () => ({ matches: true }));
+    const { result, unmount } = renderHook(() => useStreamingAmount({
+      deposited: 1000, withdrawn: 0, ratePerSecond: 1,
+      startTime: BASE_SECONDS - 100, isActive: true,
+    }));
+    act(() => vi.advanceTimersByTime(999));
+    nowMs += 1000;
+    expect(result.current).toBe(100);
+    act(() => vi.advanceTimersByTime(1));
+    expect(result.current).toBe(101);
+    expect(requestAnimationFrame).not.toHaveBeenCalled();
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("cleans up its animation frame on unmount", () => {
