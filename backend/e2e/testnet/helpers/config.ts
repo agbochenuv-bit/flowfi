@@ -1,29 +1,124 @@
-import { Networks } from '@stellar/stellar-sdk';
+import { existsSync, readFileSync } from 'fs';
+import { join } from 'path';
 
-/**
- * Runtime configuration for the Stellar Testnet E2E suite.
- * Every value can be overridden via env so the suite can also target a
- * local `stellar/quickstart` container or a futurenet deployment.
- */
-export const testnetConfig = {
-  rpcUrl: process.env.E2E_SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org',
-  horizonUrl: process.env.E2E_HORIZON_URL ?? 'https://horizon-testnet.stellar.org',
-  friendbotUrl: process.env.E2E_FRIENDBOT_URL ?? 'https://friendbot.stellar.org',
-  networkPassphrase: process.env.E2E_NETWORK_PASSPHRASE ?? Networks.TESTNET,
-  /** Deployed stream contract under test (C...). Required for contract/indexer suites. */
-  contractId: process.env.E2E_STREAM_CONTRACT_ID ?? '',
-  /** Upper bound on average ledger close time before we flag timing drift. */
-  maxLedgerCloseSeconds: Number(process.env.E2E_MAX_LEDGER_CLOSE_SECONDS ?? '15'),
-  /** Max time to wait for a submitted transaction to reach a final status. */
-  txTimeoutMs: Number(process.env.E2E_TX_TIMEOUT_MS ?? '90000'),
-  /** Max time to wait for the indexer to ingest on-chain events into Postgres. */
-  indexerTimeoutMs: Number(process.env.E2E_INDEXER_TIMEOUT_MS ?? '120000'),
-};
+export type Network = 'testnet' | 'production';
 
-export function hasContract(): boolean {
-  return testnetConfig.contractId.length > 0;
+export interface PartnerConfig {
+  network: Network;
+  apiBaseUrl: string;
+  apiKey: string;
+  apiSecret: string;
+  webhookSecret: string;
+  webhookUrl: string;
 }
 
-export function hasDatabase(): boolean {
-  return Boolean(process.env.DATABASE_URL);
+const REQUIRED_KEYS: Array<keyof PartnerConfig> = [
+  'network',
+  'apiBaseUrl',
+  'apiKey',
+  'apiSecret',
+  'webhookSecret',
+  'webhookUrl',
+];
+
+const TESTNET_HOST_MARKERS = ['testnet', 'sandbox', 'staging'];
+const PRODUCTION_HOST_MARKERS = ['api.', 'prod'];
+
+/**
+ * Loads partner onboarding configuration from a JSON file.
+ *
+ * Partners must keep testnet and production credentials in separate files
+ * (e.g. `partner.testnet.json` and `partner.production.json`). This helper
+ * enforces that separation so a clean-environment validation cannot silently
+ * run against the wrong network.
+ */
+export function loadPartnerConfig(path: string): PartnerConfig {
+  if (!existsSync(path)) {
+    throw new Error(`Partner config not found at ${path}`);
+  }
+
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (err) {
+    throw new Error(`Partner config at ${path} is not valid JSON: ${(err as Error).message}`);
+  }
+
+  if (typeof raw !== 'object' || raw === null) {
+    throw new Error(`Partner config at ${path} must be a JSON object`);
+  }
+
+  const config = raw as Partial<PartnerConfig>;
+  const missing = REQUIRED_KEYS.filter((key) => {
+    const value = config[key];
+    return value === undefined || value === null || String(value).trim() === '';
+  });
+
+  if (missing.length > 0) {
+    throw new Error(`Partner config at ${path} is missing required keys: ${missing.join(', ')}`);
+  }
+
+  if (config.network !== 'testnet' && config.network !== 'production') {
+    throw new Error(`Partner config at ${path} has invalid network "${config.network}" (expected testnet or production)`);
+  }
+
+  return config as PartnerConfig;
+}
+
+/**
+ * Validates that the configured endpoint matches the declared network.
+ * Prevents testnet credentials from being pointed at production endpoints
+ * (and vice versa) during onboarding and go-live checks.
+ */
+export function assertNetworkMatchesEndpoint(config: PartnerConfig): void {
+  const host = safeHost(config.apiBaseUrl);
+  const lower = host.toLowerCase();
+
+  if (config.network === 'testnet') {
+    const looksProduction = PRODUCTION_HOST_MARKERS.some((marker) => lower.includes(marker));
+    const looksTestnet = TESTNET_HOST_MARKERS.some((marker) => lower.includes(marker));
+    if (looksProduction && !looksTestnet) {
+      throw new Error(`Testnet config points at a production-looking endpoint: ${host}`);
+    }
+    return;
+  }
+
+  const looksTestnet = TESTNET_HOST_MARKERS.some((marker) => lower.includes(marker));
+  if (looksTestnet) {
+    throw new Error(`Production config points at a testnet-looking endpoint: ${host}`);
+  }
+}
+
+/**
+ * Ensures testnet and production configs never share secrets or endpoints.
+ */
+export function assertConfigsIsolated(testnet: PartnerConfig, production: PartnerConfig): void {
+  if (testnet.network !== 'testnet' || production.network !== 'production') {
+    throw new Error('assertConfigsIsolated expects a testnet config and a production config');
+  }
+
+  const shared: string[] = [];
+  if (testnet.apiKey === production.apiKey) shared.push('apiKey');
+  if (testnet.apiSecret === production.apiSecret) shared.push('apiSecret');
+  if (testnet.webhookSecret === production.webhookSecret) shared.push('webhookSecret');
+  if (testnet.apiBaseUrl === production.apiBaseUrl) shared.push('apiBaseUrl');
+
+  if (shared.length > 0) {
+    throw new Error(`Testnet and production configs must not share: ${shared.join(', ')}`);
+  }
+}
+
+/**
+ * Resolves the default config path for a network inside a given directory.
+ */
+export function defaultConfigPath(dir: string, network: Network): string {
+  return join(dir, `partner.${network}.json`);
+}
+
+function safeHost(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    throw new Error(`Invalid apiBaseUrl: ${url}`);
+  }
 }

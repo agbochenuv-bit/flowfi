@@ -64,6 +64,40 @@ This checklist helps repository administrators ensure that GitHub's security fea
 - [ ] Confirm that security checks appear in PR status checks
 - [ ] Review any security alerts in the Security tab
 
+## Wallet and Operator Key Lifecycle
+
+Use this decision matrix to determine key ownership, signer responsibilities, and the required lifecycle actions for each key class. It distinguishes non-custodial user wallet flows from explicitly custodial flows. Never record private keys, seed phrases, or operator credentials in this repository or in tickets — reference the secret store location only.
+
+| Key class | Custody model | Owner | Signer responsibility | Rotation trigger | Revocation trigger |
+| --- | --- | --- | --- | --- | --- |
+| User wallet (self-custody) | Non-custodial — keys never leave the user's device | End user | User signs all transactions locally; FlowFi never holds or transmits the key | User-initiated (e.g. device loss, suspected compromise) | User revokes by moving funds to a new wallet; FlowFi cannot revoke |
+| User wallet (custodial / managed) | Explicitly custodial — FlowFi or a designated custodian holds signing material | FlowFi operator (documented in the custody agreement) | Custodian signs on the user's behalf; user authorizes via authenticated session | Scheduled rotation per custody policy, or on suspected compromise | Custodian revokes the key and re-issues after user re-authentication |
+| Service / operator identity | Non-custodial to end users — internal service credential | FlowFi engineering owner of the service | Service signs its own requests; least-privilege scopes only | Scheduled rotation and on personnel or role change | Immediate revocation on offboarding, leak, or scope change |
+
+### Rotation procedure
+
+1. Confirm the key class in the matrix above and identify the owning party.
+2. Generate the replacement key in the approved secret store (never in the repo).
+3. Deploy the new key alongside the old one, verify signing works, then retire the old key.
+4. Record the rotation date and owner in the internal key inventory (not in this repository).
+
+### Revocation procedure
+
+1. Disable the key in the secret store / custodian console first, then remove it.
+2. For custodial user wallets, notify the affected user and require re-authentication before re-issuing.
+3. For service identities, revoke scopes and audit recent usage for anomalies.
+4. Update the internal key inventory and note the revocation reason.
+
+### Incident response
+
+1. Contain: revoke the affected key immediately using the procedure above.
+2. Assess: determine blast radius (which wallets, services, or scopes were reachable).
+3. Report: follow the private reporting process in [SECURITY.md](../SECURITY.md); do not disclose operational secrets in the advisory.
+4. Recover: rotate all keys in the affected class, verify signing, and monitor for replay.
+5. Review: update this matrix and the checklist if the incident revealed a gap.
+
+Related controls: [SECURITY.md](../SECURITY.md) (policy and reporting), [backend/docs/AUTHENTICATION.md](../backend/docs/AUTHENTICATION.md) (service authentication), and [CONTRIBUTING.md](../CONTRIBUTING.md) (contributor secret-handling rules).
+
 ## Maintenance Tasks
 
 ### Weekly
@@ -74,11 +108,13 @@ This checklist helps repository administrators ensure that GitHub's security fea
 - [ ] Review and update security policy if needed
 - [ ] Audit repository access permissions
 - [ ] Review security workflow results
+- [ ] Verify the key lifecycle matrix still matches the deployed custody model
 
 ### Before Major Releases
 - [ ] Run comprehensive security audit
 - [ ] Update supported versions in SECURITY.md
 - [ ] Review and test incident response procedures
+- [ ] Confirm scheduled key rotations are current
 
 ## Contact Information
 

@@ -38,6 +38,7 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Getting Help & Asking Questions](#getting-help--asking-questions)
 - [Project Overview](#project-overview)
 - [Local Development Setup](#local-development-setup)
+- [Clean-Clone Verification](#clean-clone-verification)
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
@@ -239,6 +240,81 @@ The compiled WASM files will be in `target/wasm32-unknown-unknown/release/`.
 
 ---
 
+## Clean-Clone Verification
+
+This section provides a fully scripted, reproducible path from a **clean clone** to a
+verified local stack: backend, frontend, contract tests, and an optional testnet smoke
+check. Every command below is validated by CI (see [CI/CD Workflows](#cicd-workflows));
+the testnet smoke step is validated by a documented periodic run.
+
+### Scripted entry point
+
+Run the verification script from the repository root:
+
+```bash
+./scripts/verify-clean-clone.sh
+```
+
+The script performs, in order:
+
+1. **Clone** — clones the repository into a fresh temporary directory (or uses the
+   current checkout when `--in-place` is passed).
+2. **Install** — installs backend and frontend dependencies (`npm ci`).
+3. **Backend** — generates the Prisma client, builds, and runs the backend test suite
+   against a throwaway PostgreSQL instance.
+4. **Frontend** — runs lint and build.
+5. **Contract tests** — builds the Soroban contract for `wasm32-unknown-unknown` and
+   runs `cargo test`.
+6. **Testnet smoke (optional)** — only runs when the required network credentials are
+   present; otherwise it is skipped with a clear message.
+
+### Local-only values vs. network credentials
+
+Keep these two categories strictly separate. **Never commit secrets.**
+
+**Local-only values** (safe defaults, no real funds, no secrets):
+
+| Variable | Purpose | Example |
+| --- | --- | --- |
+| `DATABASE_URL` | Local PostgreSQL connection | `postgresql://postgres:postgres@localhost:5433/flowfi` |
+| `PORT` | Backend listen port | `3001` |
+| `NEXT_PUBLIC_API_URL` | Frontend → local backend | `http://localhost:3001` |
+| `NEXT_PUBLIC_STELLAR_NETWORK` | Target network for the UI | `testnet` |
+
+These may live in a local `.env` / `.env.local` (git-ignored) and are documented in the
+respective `.env.example` files.
+
+**Network credentials** (testnet smoke only — never committed, never logged):
+
+| Variable | Purpose |
+| --- | --- |
+| `STELLAR_TESTNET_SECRET_KEY` | Funded testnet account secret used for the smoke check |
+| `STELLAR_TESTNET_RPC_URL` | Testnet Soroban RPC endpoint |
+| `STELLAR_TESTNET_CONTRACT_ID` | Deployed testnet contract to smoke-test |
+
+Provide these only via your shell environment or CI secrets. The script treats them as
+optional: if any are missing, the testnet smoke step is **skipped** (not failed), and the
+local verification still passes. The script never echoes secret values.
+
+### Running the testnet smoke manually
+
+```bash
+export STELLAR_TESTNET_SECRET_KEY=...   # from your secret store, never committed
+export STELLAR_TESTNET_RPC_URL=https://soroban-testnet.stellar.org
+export STELLAR_TESTNET_CONTRACT_ID=...
+./scripts/verify-clean-clone.sh --testnet-smoke
+```
+
+### CI validation
+
+The `clean-clone-verification` job in `.github/workflows/ci.yml` runs the script on every
+push and pull request, exercising steps 1–5. The optional testnet smoke step runs in a
+documented **periodic** workflow (weekly schedule) where the testnet credentials are
+provided as repository secrets; when secrets are absent the step is skipped, matching the
+local behavior.
+
+---
+
 ## Development Scripts & Tools
 
 ### Root-Level Scripts
@@ -248,6 +324,9 @@ From the repository root:
 ```bash
 # Verify security setup
 npm run verify-security
+
+# Fully scripted clean-clone verification
+./scripts/verify-clean-clone.sh
 ```
 
 ### Docker Compose Commands
@@ -263,6 +342,7 @@ docker compose up -d --build
 docker compose logs -f
 
 # Stop services
+
 docker compose down
 
 # Reset database (removes volumes)
@@ -291,6 +371,7 @@ This repository uses GitHub Actions for continuous integration. Workflows are lo
     - Backend: prisma generation, build, and tests
     - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
     - Soroban Contracts: build (wasm) and tests
+    - Clean-clone verification: runs `./scripts/verify-clean-clone.sh` (steps 1–5)
   - View workflow: [CI](.github/workflows/ci.yml)
 
 ### Running CI Checks Locally
@@ -334,6 +415,14 @@ npm run test:migrations   # replays migrations from the previous supported schem
 *Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
 The same check runs in CI as the `migration-replay` job.*
 
+#### 6. Clean-Clone Verification
+```bash
+# From the repository root
+./scripts/verify-clean-clone.sh
+```
+*Note: This is the same scripted flow described in [Clean-Clone Verification](#clean-clone-verification).
+It runs in CI as the `clean-clone-verification` job.*
+
 ---
 
 ## Database Migrations & Rollout
@@ -341,272 +430,4 @@ The same check runs in CI as the `migration-replay` job.*
 Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
 processes are rolled out independently, so for a window of time the *previous* and
 *new* application versions run against the *same* database. Every migration must
-therefore be backward-compatible with the previously deployed application version.
-
-### Ground Rules
-
-1. **Never edit an existing migration file.** Migration files are immutable once
-   merged. Any schema change — including a fix to a previous migration — must be
-   expressed in a **new** migration file. Editing history breaks `prisma migrate`
-   checksums and can silently skip changes on environments that already applied them.
-2. **No destructive changes in a single step.** Dropping a column/table, renaming,
-   adding a `NOT NULL` constraint without a default, or narrowing a type must be
-   split across releases (see expand/backfill/contract below).
-3. **Pin the previous supported schema.** The migration replay test
-   (`backend/tests/migrations/`) snapshots the schema of the previous supported
-   release and replays all migrations on top of it, asserting no data loss and no
-   errors. Update the pinned snapshot only when a release is promoted to
-   "previous supported".
-4. **Document externally observable behavior.** Each migration PR must state what
-   changes for API consumers, workers, and operators (new/removed fields, changed
-   nullability, index/lock impact, expected downtime, backfill duration).
-
-### Expand / Backfill / Contract Pattern
-
-Changes that overlap active API and worker versions are shipped in three phases,
-each in its own release:
-
-| Phase | What you do | Compatibility |
-| --- | --- | --- |
-| **Expand** | Add new nullable columns, new tables, new indexes (`CREATE INDEX CONCURRENTLY` where supported). Keep old columns intact. | Old and new app versions both work. |
-| **Backfill** | Populate new columns/tables from existing data (batched, idempotent job). Dual-write from the application if reads must stay consistent. | Old version ignores new data; new version tolerates missing data. |
-| **Contract** | Once all running versions use the new shape, drop old columns/tables, add `NOT NULL`/`UNIQUE` constraints, and remove dual-writes. | Only the new version is deployed. |
-
-### Rollout Checklist
-
-Copy this into the migration PR description and tick each item:
-
-- [ ] Change is in a **new** migration file; no existing migration was modified.
-- [ ] Change is classified as **expand**, **backfill**, or **contract** (or is a
-      non-breaking additive change that needs no phasing).
-- [ ] Previous application version still works against the migrated schema
-      (expand/backfill phases only).
-- [ ] Previous supported schema snapshot is pinned/updated in the migration replay
-      test and `npm run test:migrations` passes locally.
-- [ ] CI `migration-replay` job is green.
-- [ ] Backfill (if any) is batched, idempotent, resumable, and safe to re-run.
-- [ ] Locking/index impact assessed; long-running DDL uses concurrent variants or a
-      maintenance window.
-- [ ] Rollback plan documented (forward-fix migration preferred; no data loss).
-- [ ] Externally observable behavior documented: API/worker contract changes,
-      operational impact (downtime, backfill duration, index build time).
-- [ ] Regression and boundary tests added at the owning component's test layer
-      (e.g. `backend/tests/` for API/DB behavior).
-
-### Operational Impact Notes
-
-- **Expand** migrations are additive and should be deployable with zero downtime;
-  note any index build time on large tables.
-- **Backfill** jobs run alongside live traffic; document expected duration, batch
-  size, and how to pause/resume.
-- **Contract** migrations are the only ones allowed to remove or tighten schema;
-  they must ship only after the expand+backfill release is fully rolled out to all
-  API and worker instances.
-
----
-
-# Branching Strategy
-
-❌ Do NOT commit directly to `main`
-✅ Always create a feature branch
-
-## Branch Naming Convention
-
-| Type     | Format                       | Example                       |
-| -------- | ---------------------------- | ----------------------------- |
-| Feature  | `feature/short-description`  | `feature/add-stream-cancel`   |
-| Bug Fix  | `fix/short-description`      | `fix/dashboard-loading-error` |
-| Refactor | `refactor/short-description` | `refactor/api-service-layer`  |
-| Docs     | `docs/short-description`     | `docs/update-contributing`    |
-| Infra    | `infra/short-description`    | `infra/docker-improvement`    |
-
-## Create a Branch
-
-```bash
-git checkout -b feature/your-feature-name
-```
-
-Keep branch names short and descriptive.
-
----
-
-# Commit Guidelines & Hooks
-
-This repository uses **Husky** for commit hooks, with **lint-staged** running checks
-only against the files you staged:
-
-| Staged files | Check |
-| --- | --- |
-| `frontend/**/*.{ts,tsx,js,jsx}` | ESLint |
-| `contracts/**/*.rs` | `cargo fmt --check` + `cargo clippy -D warnings` |
-
-Rust checks are skipped automatically when Cargo is not installed, so a
-JavaScript-only contributor is never blocked. Install a Rust toolchain
-(`rustup`) to have them enforced locally before CI does.
-
-Before committing, ensure:
-
-- Code compiles
-- Lint passes
-- No broken builds
-
-## Commit Message Format
-
-We follow a conventional style:
-
-```
-type(scope): short description
-```
-
-### Examples
-
-```
-feat(frontend): add wallet balance card
-fix(backed): resolve stream validation bug
-refactor(contracts): simplify transfer logic
-docs: update setup instructions
-```
-
-## Commit Rules
-
-- Use present tense ("add", not "added")
-- Keep subject under ~72 characters
-- Make atomic commits (one logical change per commit)
-- Avoid vague messages like "update stuff"
-
----
-
-# Pull Request Process
-
-## Sync with Main
-
-Before opening a PR:
-
-```bash
-git checkout main
-git pull origin main
-git checkout your-branch
-git rebase main
-```
-
-Resolve conflicts locally if any.
-
----
-
-## Push Your Branch
-
-```bash
-git push origin your-branch-name
-```
-
----
-
-## 3 Open a Pull Request
-
-When opening your PR:
-
-- Provide a clear title
-- Add a detailed description
-- Link related issues (e.g., `Closes #45`)
-- Add screenshots for UI changes
-- Explain why the change is needed
-
----
-
-## PR Requirements
-
-Your PR must:
-
-- Build successfully
-- Pass lint checks
-- Follow commit conventions
-- Be properly described
-- Stay focused (avoid large unrelated changes)
-- For database changes: follow the [Database Migrations & Rollout](#database-migrations--rollout)
-  checklist and include the completed checklist in the PR description
-
----
-
-## Code Review
-
-Maintainers may:
-
-- Request changes
-- Ask clarifying questions
-- Suggest improvements
-
-Please respond respectfully and update your branch as requested.
-
----
-
-# 🔒 Security
-
-If you discover a security vulnerability, please do **NOT** open a public issue. Instead, follow our responsible disclosure process outlined in our [Security Policy](SECURITY.md).
-
-Security vulnerabilities should be reported privately to allow us to address them before public disclosure.
-
----
-
-# 📜 Code of Conduct
-
-This project follows a Code of Conduct to ensure a welcoming and inclusive community.
-
-Please read and follow our Code of Conduct before contributing:
-
-**[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)**
-
-Be respectful.
-Be collaborative.
-Be constructive.
-
----
-
-
-
----
-
-# 🤝 Contributor Badges
-
-This project uses the [all-contributors](https://github.com/all-contributors/all-contributors) specification to recognize contributors.
-
-## Triggering the Bot
-
-After your pull request is merged or closed, comment on the merged PR or issue:
-
-```
-@all-contributors please add @<your-username> for code
-```
-
-The bot will add your profile to the Contributors table in the root `README.md`.
-
-## Adding Sub-Package READMEs
-
-Currently, only the root `README.md` has a Contributors section. If you add a Contributors section to a sub-package README (e.g., `backend/README.md`, `frontend/README.md`, `contracts/README.md`), update `.all-contributorsrc` in the repo root to include the additional path:
-
-```json
-"files": [
-  "README.md",
-  "backend/README.md"
-]
-```
-
-## Available Contribution Types
-
-- `code` — Code contributions
-- `doc` — Documentation
-- `design` — Design
-- `bug` — Bug reports
-- `review` — Pull Request reviews
-- `test` — Testing
-- `infra` — Infrastructure / DevOps
-- `ideas` — Ideas & planning
-
-
-# Final Notes
-
-- Contributions of all sizes are welcome
-- Documentation improvements are valuable
-- Ask questions in Issues if unsure
-- Keep PRs small and manageable
-
-Thank you for helping improve FlowFi 💙
+remain backward compatible with the previous application version.

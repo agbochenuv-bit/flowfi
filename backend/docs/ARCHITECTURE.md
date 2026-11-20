@@ -9,6 +9,11 @@ For the full project-wide architecture (event type data flows, pause/resume
 timing, environment variables, and operational runbook) see
 [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
 
+For the field-level privacy and retention inventory (wallet-linked fields across
+logs, analytics, exports, webhooks, and backups) see
+[Field-Level Privacy & Retention Inventory](#field-level-privacy--retention-inventory)
+below.
+
 ---
 
 ## Indexer Ownership Model
@@ -166,26 +171,58 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Field-Level Privacy & Retention Inventory
 
-For a quick reference of the models involved in indexing:
+This inventory maps every wallet-linked field family to its data store, purpose,
+retention rule, deletion constraint, and accountable owner. It is the review
+baseline for product and operations changes: any change that adds, moves, or
+re-purposes a wallet-linked field must update this table in the same PR.
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+**Wallet-linked field families** (the identifiers this inventory governs):
 
----
+- `publicKey` / `sender` / `recipient` — Stellar account addresses (G…).
+- `transactionHash` — on-chain transaction identifier.
+- `streamId` — internal stream identifier that resolves to the above.
+- `keeperPublicKey` — server wallet address (never the secret).
 
-## Related Documentation
+### Inventory
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+| Field family | Data store | Purpose | Retention rule | Deletion constraint | Owner | Policy |
+|---|---|---|---|---|---|---|
+| `publicKey`, `sender`, `recipient` | PostgreSQL (`Stream`, `StreamEvent`, `User`) | Stream lifecycle, authorization, and user-facing history | Retained for the life of the stream plus the accounting retention window; no TTL purge | Cannot be deleted while the stream is active or referenced by financial accounting rows; anonymize only after archival | Backend / Data | [`SECURITY.md`](../../SECURITY.md), [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) |
+| `transactionHash`, `streamId` | PostgreSQL (`StreamEvent`) | Event dedup, replay, and audit trail | Retained with the parent stream; immutable once written | Immutable — never deleted independently of the parent stream | Backend / Indexer | [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) (Indexer Ownership Model) |
+| `publicKey` (request context) | Application logs | Debugging, incident response, abuse detection | Short-lived; rotated with log retention window | Purged with log rotation; must never be logged alongside secrets | Operations | [`SECURITY.md`](../../SECURITY.md) |
+| `publicKey`, `streamId` | Analytics events | Product usage metrics and funnel analysis | Aggregated/pseudonymized; raw identifiers dropped at aggregation | Raw identifiers must not be joined back to financial records; deletion via aggregation refresh | Product / Data | [`SECURITY.md`](../../SECURITY.md) |
+| `publicKey`, `sender`, `recipient`, `transactionHash` | User-initiated exports (CSV/JSON) | User data portability and reporting | Generated on demand; not persisted server-side beyond the request | User-scoped only — exports must be filtered by the requesting wallet; no cross-wallet leakage | Backend / API | [`backend/docs/AUTHENTICATION.md`](./AUTHENTICATION.md) |
+| `publicKey`, `streamId`, `transactionHash` | Outbound webhooks | Partner integrations and event delivery | Delivered payloads retained only in delivery retry buffer | Payloads must be scoped to the subscribed wallet; no bulk wallet enumeration | Integrations | [`SECURITY.md`](../../SECURITY.md) |
+| `publicKey`, `sender`, `recipient`, `transactionHash`, `streamId` | Database backups | Disaster recovery | Retained per backup rotation schedule | Cannot be selectively deleted from a backup; deletion is satisfied by expiry of the backup generation | Operations | [`SECURITY.md`](../../SECURITY.md), [`.github/SECURITY_SETUP_CHECKLIST.md`](../../.github/SECURITY_SETUP_CHECKLIST.md) |
+| `keeperPublicKey` | PostgreSQL (`Stream`), logs | Attributing custodial top-ups | Retained with the stream; public key only | Never store or log `KEEPER_SECRET_KEY`; only the public key is inventory-scoped | Backend / Security | [`SECURITY.md`](../../SECURITY.md) |
+
+### Review Rules
+
+1. **Every wallet-linked field family must have an owner and a linked policy.**
+   A row missing either is incomplete and blocks merge.
+2. **Every row must state a retention rule and a deletion constraint.** "No
+   retention" is not a valid entry — use an explicit window or "life of stream".
+3. **New stores require a new row.** Adding a log sink, analytics pipeline,
+   export format, webhook target, or backup destination that carries a
+   wallet-linked field requires updating this table in the same change.
+4. **Deletion constraints win over convenience.** If a field cannot be deleted
+   (e.g. immutable event rows, backup generations), document the constraint
+   rather than silently dropping the field.
+5. **Secrets are out of scope for this inventory.** Only public wallet
+   identifiers are mapped; `KEEPER_SECRET_KEY` and other secrets follow
+   [`SECURITY.md`](../../SECURITY.md) and are never logged or exported.
+
+### Change Checklist
+
+When a change touches a wallet-linked field, confirm:
+
+- [ ] The field family is listed in the inventory (or a new row was added).
+- [ ] The data store, purpose, retention rule, and deletion constraint are accurate.
+- [ ] An owner and a linked policy are present.
+- [ ] Exports and webhooks remain scoped to the requesting/subscribed wallet.
+- [ ] No secret material was introduced into logs, analytics, exports, or webhooks.

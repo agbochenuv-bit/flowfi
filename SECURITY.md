@@ -38,7 +38,7 @@ Please include the following information in your report:
 - **Reproduction**: Step-by-step instructions to reproduce the vulnerability
 - **Environment**: Affected versions, operating systems, or configurations
 - **Proof of Concept**: If applicable, include a minimal proof of concept
-- **Suggested Fix**: If you have ideas for how to fix the issue
+- **Suggested Fix**: If you have ideas about how to fix the issue
 
 ### Response Timeline
 
@@ -58,6 +58,50 @@ If you have not heard from us within 48 hours, please reach out through our [com
 - We will work with you to understand and resolve the issue before any public disclosure
 - We will credit you in our security advisory (unless you prefer to remain anonymous)
 - We ask that you do not publicly disclose the vulnerability until we have had a chance to address it
+
+## Key Lifecycle Decision Matrix
+
+This section documents who owns each key, who is responsible for signing, and how keys are rotated, revoked, and handled during incidents. It distinguishes **non-custodial** user wallet flows (FlowFi never holds user key material) from **explicitly custodial** flows (FlowFi holds key material on the user's behalf). It intentionally describes *controls and responsibilities only* — never operational secrets, key material, or environment-specific values.
+
+### Ownership and Signer Responsibilities
+
+| Flow | Key owner | Signer | FlowFi custody | FlowFi responsibilities |
+| ---- | --------- | ------ | -------------- | ----------------------- |
+| **Non-custodial user wallet** (default) | The user | The user's wallet (browser extension / hardware device) | None — FlowFi never receives private keys or seed phrases | Build unsigned transactions, validate chain/network and amounts, request a signature, verify the returned signature before submission |
+| **Explicitly custodial flow** (only where a product surface states it) | FlowFi service identity, on behalf of the user | FlowFi backend signer | Yes — key material lives in the deployment secret store | Isolate signer keys per environment, restrict access to the API service identity, log `kid`/identity only, and disclose custody in the product UI |
+| **Operator / service identity** (API, CI, deploy) | FlowFi maintainers | The service process or CI runner | N/A | Scope credentials to the minimum role, keep them in the secret store, rotate on schedule and on any suspected compromise |
+
+Rules that apply to every row:
+
+- Private keys and seed phrases are never committed to the repository, baked into images, or written to logs, error messages, or diagnostics.
+- Non-custodial flows must never be silently upgraded to custodial: a custodial flow requires an explicit product decision and user-facing disclosure.
+- Wallet authorization, chain/network validation, and financial accounting invariants are enforced regardless of which signer is used.
+
+### Rotation
+
+| Key type | Rotation trigger | Procedure |
+| -------- | ---------------- | --------- |
+| Non-custodial user wallet | User-initiated (suspected compromise, device loss) | The user rotates keys in their own wallet; FlowFi takes no action and holds nothing to rotate. |
+| Custodial signer key | Scheduled interval and on any suspected compromise | Overlap-and-retire: add the new key to the secret store, make it active for signing, keep the previous key available for verification until all artifacts it signed have expired, then retire it. |
+| JWT signing key | Scheduled interval and on any suspected compromise | Follow the [JWT Signing-Key Rotation](#jwt-signing-key-rotation) runbook above (`JWT_KEYS` / `JWT_ACTIVE_KID`). |
+| Operator / service identity | Scheduled interval and on role change or offboarding | Issue a new credential, roll it out, confirm the old credential is unused, then revoke it. |
+
+### Revocation
+
+- **Non-custodial user wallet:** revocation is the user's responsibility; FlowFi can only refuse to build or submit transactions for a wallet the user has flagged.
+- **Custodial signer key:** remove the key from the secret store and roll out; confirm no in-flight operation still depends on it before deletion.
+- **JWT signing key:** remove the `kid` from `JWT_KEYS` and roll out; tokens signed with it are rejected immediately (see [Externally Observable Behavior](#externally-observable-behavior)).
+- **Operator / service identity:** revoke the credential at the identity provider and audit recent activity for the affected identity.
+
+### Incident Response
+
+1. **Contain.** Revoke the affected credential (custodial signer key, JWT `kid`, or operator identity) using the revocation steps above. For non-custodial wallets, notify the user to rotate in their own wallet.
+2. **Assess.** Determine which flows used the credential and whether wallet authorization, chain/network validation, or accounting invariants were affected. Do not weaken those controls to restore service.
+3. **Rotate.** Issue replacement keys following the rotation procedures above and roll them out through the secret store.
+4. **Report.** File a private GitHub Security Advisory per [Reporting a Vulnerability](#reporting-a-vulnerability); never include key material in the advisory.
+5. **Review.** Update this matrix if the incident revealed a missing control, and confirm the [.github/SECURITY_SETUP_CHECKLIST.md](.github/SECURITY_SETUP_CHECKLIST.md) items still hold.
+
+Related controls: [SECURITY_IMPLEMENTATION_SUMMARY.md](SECURITY_IMPLEMENTATION_SUMMARY.md), [.github/SECURITY_SETUP_CHECKLIST.md](.github/SECURITY_SETUP_CHECKLIST.md), and the backend authentication documentation (`backend/docs/AUTHENTICATION.md`).
 
 ## Security Considerations
 
@@ -112,7 +156,6 @@ Startup fails fast if `JWT_ACTIVE_KID` is missing from `JWT_KEYS`, if `JWT_KEYS`
 - After step 4, only tokens signed by keys still in `JWT_KEYS` are accepted; tokens signed by retired or unknown keys are rejected.
 - Rotation requires no client-side changes and no versioned API change; the `kid` header is additive and ignored by clients.
 - No key material appears in responses, logs, or error diagnostics.
-=======
 
 ### Frontend Security
 
@@ -134,28 +177,4 @@ When using FlowFi, please follow these security guidelines:
 
 ## Bug Bounty Program
 
-Currently, FlowFi does not have a formal bug bounty program. However, we greatly appreciate security researchers who help improve our security posture and will acknowledge their contributions appropriately.
-
-## Security Updates
-
-Security updates and advisories will be published:
-
-- In this repository's [Security Advisories](https://github.com/LabsCrypt/flowfi/security/advisories)
-- In release notes for affected versions
-- Through our official communication channels
-
-## Contact
-
-For security-related questions or concerns that are not vulnerabilities, you can:
-
-- Open a public issue with the `security` label using the [security issue template](.github/ISSUE_TEMPLATE/security.md)
-- Reach out to the maintainers through GitHub
-- Join our community discussions
-
-## Acknowledgments
-
-We thank the security research community for helping keep FlowFi and our users safe. Contributors who responsibly disclose vulnerabilities will be acknowledged in our security advisories and release notes.
-
----
-
-*This security policy is subject to change. Please check back regularly for updates.*
+Currently, FlowFi does not have a formal bug bounty program. However, we greatly appreciate security researchers who help improve our security posture and will acknowledge their contributions in our security advisories.
