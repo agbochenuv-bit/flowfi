@@ -50,3 +50,5 @@ export {
   PollRetryExhaustedError,
 } from './retry.js';
 export type { PollRetryOptions } from './retry.js';
+
+export { MobileWalletSigner, type MobileWalletOptions } from './signers/mobile.js';

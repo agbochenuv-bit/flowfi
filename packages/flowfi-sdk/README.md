@@ -168,3 +168,17 @@ three signers, and every `FlowFiClient` method with mocked RPC/signer shims
 (no network I/O).
 
 [openapi-generator]: https://openapi-generator.tech/
+### Mobile wallet universal links
+
+Configure MobileWalletSigner with trusted HTTPS walletLink and returnLink
+endpoints, the connected publicKey, networkPassphrase and a platform handoff
+function. Use OS-verified app links on both ends. The handoff opens the request
+and resolves with the incoming callback URL. Remove callback listeners on
+return, timeout or abort. Avoid analytics and URL logging on both endpoints.
+
+Compatible wallets must accept envelope, account, network, state and returnLink
+query parameters, display the transaction for approval, and echo network and
+state on return. Return status=signed with the signed envelope, or
+status=cancelled. Wallets retain their keys and must never submit the envelope.
+This protocol requires explicit wallet support. Pass the matching networkPassphrase
+to signTransaction. AbortSignal and timeoutMs cancel the pending application request.
