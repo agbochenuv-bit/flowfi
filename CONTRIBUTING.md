@@ -38,6 +38,8 @@ See our [Discussions Guide](DISCUSSIONS.md) for more details.
 - [Getting Help & Asking Questions](#getting-help--asking-questions)
 - [Project Overview](#project-overview)
 - [Local Development Setup](#local-development-setup)
+- [Accessibility: Motion & Contrast](#accessibility-motion--contrast)
+- [Mobile Wallet Deep-Link Signer Adapter](#mobile-wallet-deep-link-signer-adapter)
 - [Branching Strategy](#branching-strategy)
 - [Commit Guidelines & Hooks](#commit-guidelines--hooks)
 - [Pull Request Process](#pull-request-process)
@@ -271,342 +273,182 @@ docker compose down -v
 
 ---
 
-## CI/CD Workflows
+## Accessibility: Motion & Contrast
 
-This repository uses GitHub Actions for continuous integration. Workflows are located in `.github/workflows/`.
+Financial views (live balance updates, charts, and transaction status indicators) must
+remain usable for people who disable motion or require stronger visual contrast.
 
-### Available Workflows
+### Motion expectations
 
-- **Security Checks** (`.github/workflows/security.yml`)
-  - Runs on: push to `main`/`develop`, pull requests, and weekly schedule
-  - Performs:
-    - Dependency vulnerability scanning (`npm audit`)
-    - CodeQL analysis for JavaScript/TypeScript
-  - View workflow: [Security Checks](.github/workflows/security.yml)
+- Respect the OS-level `prefers-reduced-motion` setting. When it is enabled, live
+  balance changes, chart transitions, and transaction status changes must not animate;
+  the updated value/state is applied immediately.
+- Motion must never be the *only* carrier of information. Every animated change must
+  also be conveyed by text, an icon, or an `aria-live` announcement so the same
+  information is available with motion disabled.
+- When reduced motion is off, animations are allowed but must stay short and must not
+  block interaction.
 
-- **CI** (`.github/workflows/ci.yml`)
-  - Runs on: push to `main`/`develop` and pull requests
-  - Performs:
-    - Frontend: lint and build
-    - Backend: prisma generation, build, and tests
-    - Backend: migration replay validation (see [Database Migrations & Rollout](#database-migrations--rollout))
-    - Soroban Contracts: build (wasm) and tests
-  - View workflow: [CI](.github/workflows/ci.yml)
+### Contrast expectations
 
-### Running CI Checks Locally
+- Text, status indicators, and chart elements must meet **WCAG 2.1 AA** contrast:
+  at least **4.5:1** for normal text and **3:1** for large text, icons, and graphical
+  chart elements, in both the default and high-contrast presentations.
+- High-contrast mode must not rely on color alone to distinguish statuses; pair color
+  with a label or icon.
+- Verify contrast with a contrast checker (e.g. browser devtools or the WebAIM
+  contrast checker) whenever financial colors or status styles change.
 
-Before pushing, ensure your changes pass all the same checks that run in GitHub Actions.
+### Automated checks
 
-#### 1. Frontend Checks
+- Add focused tests for the changed behavior, covering both reduced-motion enabled and
+  disabled, high-contrast toggling, and status boundary states (e.g. pending → success
+  → failure).
+- Run the frontend checks before pushing:
+
 ```bash
 cd frontend
-npm run lint    # Runs ESLint
-npm run build   # Verifies the build
+npm run lint
+npm run build
 ```
 
-#### 2. Backend Checks
-```bash
-cd backend
-npm run prisma:generate  # Ensure Prisma client is up to date
-npm run build           # Verifies TypeScript compilation
-npm run test            # Runs backend vitest suite
-```
-*Note: Backend tests require a running PostgreSQL instance and `DATABASE_URL` environment variable.*
+### Manual verification notes (critical flows)
 
-#### 3. Smart Contract Checks
-```bash
-cd contracts
-cargo build --target wasm32-unknown-unknown --release  # Verifies contract build
-cargo test                                            # Runs contract tests
-```
+Before opening a PR that touches financial views, verify the following manually and
+note the results in the PR description:
 
-#### 4. Security Verification
-```bash
-# From the repository root
-npm run verify-security
-```
-
-#### 5. Migration Replay Validation
-```bash
-cd backend
-npm run test:migrations   # replays migrations from the previous supported schema
-```
-*Note: This requires a running PostgreSQL instance and `DATABASE_URL` environment variable.
-The same check runs in CI as the `migration-replay` job.*
+1. **Keyboard only** — Tab through the balance, chart, and transaction status areas;
+   every interactive element is reachable and has a visible focus indicator.
+2. **Reduced motion** — Enable "reduce motion" in the OS/browser, then trigger a live
+   balance update and a transaction status change; confirm no animation plays and the
+   new value/state is still announced.
+3. **High contrast** — Toggle high-contrast mode and confirm text, status indicators,
+   and chart elements remain distinguishable and meet the contrast ratios above.
 
 ---
 
-## Database Migrations & Rollout
+## Mobile Wallet Deep-Link Signer Adapter
 
-Production PostgreSQL schema changes must be **deployment-safe**: the API and worker
-processes are rolled out independently, so for a window of time the *previous* and
-*new* application versions run against the *same* database. Every migration must
-therefore be backward-compatible with the previously deployed application version.
+FlowFi supports handing a prepared transaction off to a mobile wallet app via a
+deep link. The adapter is a **signer handoff only**: the application and backend
+never receive, store, or transmit secret keys or signed secret material. The wallet
+holds the keys and returns only the signed transaction envelope (or an error).
 
-### Ground Rules
+### Adapter contract
 
-1. **Never edit an existing migration file.** Migration files are immutable once
-   merged. Any schema change — including a fix to a previous migration — must be
-   expressed in a **new** migration file. Editing history breaks `prisma migrate`
-   checksums and can silently skip changes on environments that already applied them.
-2. **No destructive changes in a single step.** Dropping a column/table, renaming,
-   adding a `NOT NULL` constraint without a default, or narrowing a type must be
-   split across releases (see expand/backfill/contract below).
-3. **Pin the previous supported schema.** The migration replay test
-   (`backend/tests/migrations/`) snapshots the schema of the previous supported
-   release and replays all migrations on top of it, asserting no data loss and no
-   errors. Update the pinned snapshot only when a release is promoted to
-   "previous supported".
-4. **Document externally observable behavior.** Each migration PR must state what
-   changes for API consumers, workers, and operators (new/removed fields, changed
-   nullability, index/lock impact, expected downtime, backfill duration).
+Any mobile wallet integration must implement the deep-link signer adapter interface
+(`MobileWalletSignerAdapter`). The adapter is responsible for:
 
-### Expand / Backfill / Contract Pattern
+- Building the outbound deep link from a prepared, unsigned transaction XDR plus the
+  expected network passphrase.
+- Opening the wallet (or returning the deep link for the caller to open).
+- Validating the return link before the signed envelope is accepted.
+- Reporting cancellation distinctly from failure.
 
-Changes that overlap active API and worker versions are shipped in three phases,
-each in its own release:
+### Supported wallet capabilities
 
-| Phase | What you do | Compatibility |
-| --- | --- | --- |
-| **Expand** | Add new nullable columns, new tables, new indexes (`CREATE INDEX CONCURRENTLY` where supported). Keep old columns intact. | Old and new app versions both work. |
-| **Backfill** | Populate new columns/tables from existing data (batched, idempotent job). Dual-write from the application if reads must stay consistent. | Old version ignores new data; new version tolerates missing data. |
-| **Contract** | Once all running versions use the new shape, drop old columns/tables, add `NOT NULL`/`UNIQUE` constraints, and remove dual-writes. | Only the new version is deployed. |
+Document the capabilities of each supported wallet when adding it. At minimum record:
 
-### Rollout Checklist
-
-Copy this into the migration PR description and tick each item:
-
-- [ ] Change is in a **new** migration file; no existing migration was modified.
-- [ ] Change is classified as **expand**, **backfill**, or **contract** (or is a
-      non-breaking additive change that needs no phasing).
-- [ ] Previous application version still works against the migrated schema
-      (expand/backfill phases only).
-- [ ] Previous supported schema snapshot is pinned/updated in the migration replay
-      test and `npm run test:migrations` passes locally.
-- [ ] CI `migration-replay` job is green.
-- [ ] Backfill (if any) is batched, idempotent, resumable, and safe to re-run.
-- [ ] Locking/index impact assessed; long-running DDL uses concurrent variants or a
-      maintenance window.
-- [ ] Rollback plan documented (forward-fix migration preferred; no data loss).
-- [ ] Externally observable behavior documented: API/worker contract changes,
-      operational impact (downtime, backfill duration, index build time).
-- [ ] Regression and boundary tests added at the owning component's test layer
-      (e.g. `backend/tests/` for API/DB behavior).
-
-### Operational Impact Notes
-
-- **Expand** migrations are additive and should be deployable with zero downtime;
-  note any index build time on large tables.
-- **Backfill** jobs run alongside live traffic; document expected duration, batch
-  size, and how to pause/resume.
-- **Contract** migrations are the only ones allowed to remove or tighten schema;
-  they must ship only after the expand+backfill release is fully rolled out to all
-  API and worker instances.
-
----
-
-# Branching Strategy
-
-❌ Do NOT commit directly to `main`
-✅ Always create a feature branch
-
-## Branch Naming Convention
-
-| Type     | Format                       | Example                       |
-| -------- | ---------------------------- | ----------------------------- |
-| Feature  | `feature/short-description`  | `feature/add-stream-cancel`   |
-| Bug Fix  | `fix/short-description`      | `fix/dashboard-loading-error` |
-| Refactor | `refactor/short-description` | `refactor/api-service-layer`  |
-| Docs     | `docs/short-description`     | `docs/update-contributing`    |
-| Infra    | `infra/short-description`    | `infra/docker-improvement`    |
-
-## Create a Branch
-
-```bash
-git checkout -b feature/your-feature-name
-```
-
-Keep branch names short and descriptive.
-
----
-
-# Commit Guidelines & Hooks
-
-This repository uses **Husky** for commit hooks, with **lint-staged** running checks
-only against the files you staged:
-
-| Staged files | Check |
+| Capability | Requirement |
 | --- | --- |
-| `frontend/**/*.{ts,tsx,js,jsx}` | ESLint |
-| `contracts/**/*.rs` | `cargo fmt --check` + `cargo clippy -D warnings` |
+| Sign transaction | Required — returns signed envelope XDR |
+| Network passphrase echo | Required — response must include the network it signed for |
+| Cancellation signal | Required — user rejection must be distinguishable from error |
+| Return-link scheme | Required — must match the registered callback scheme |
+| Multi-op / fee-bump | Optional — note explicitly if unsupported |
 
-Rust checks are skipped automatically when Cargo is not installed, so a
-JavaScript-only contributor is never blocked. Install a Rust toolchain
-(`rustup`) to have them enforced locally before CI does.
+### Cancellation
 
-Before committing, ensure:
+- A user rejecting the request in the wallet must surface as a **cancellation**, not
+  a generic error, so the UI can return to an idle state without alarming the user.
+- Cancellation must never be treated as a successful signature.
 
-- Code compiles
-- Lint passes
-- No broken builds
+### Return-link validation
 
-## Commit Message Format
+- Only accept callbacks whose scheme, host, and path match the registered return link.
+- Reject malformed callbacks (missing/extra fields, unparsable payloads, unexpected
+  query parameters) and untrusted origins. A rejected callback must not be forwarded
+  to the backend or used to build a transaction.
+- Validate the returned envelope is well-formed before submission.
 
-We follow a conventional style:
+### Network matching
 
-```
-type(scope): short description
-```
+- The network passphrase echoed by the wallet must match the expected network for the
+  prepared transaction. A mismatch must be rejected; never submit a transaction signed
+  for a different network.
+- Chain/network validation must not be weakened to make an integration pass.
 
-### Examples
+### Testing expectations
 
-```
-feat(frontend): add wallet balance card
-fix(backed): resolve stream validation bug
-refactor(contracts): simplify transfer logic
-docs: update setup instructions
-```
+Add focused automated coverage for the adapter, including at least:
 
-## Commit Rules
-
-- Use present tense ("add", not "added")
-- Keep subject under ~72 characters
-- Make atomic commits (one logical change per commit)
-- Avoid vague messages like "update stuff"
-
----
-
-# Pull Request Process
-
-## Sync with Main
-
-Before opening a PR:
-
-```bash
-git checkout main
-git pull origin main
-git checkout your-branch
-git rebase main
-```
-
-Resolve conflicts locally if any.
+- Successful handoff and return-link validation.
+- Malformed callbacks (bad scheme/host/path, missing fields, unparsable payload).
+- Network mismatch rejection.
+- Cancellation path distinct from failure.
 
 ---
 
-## Push Your Branch
+## Branching Strategy
 
-```bash
-git push origin your-branch-name
-```
+- `main` — production-ready code
+- `develop` — integration branch
+- `feature/*` — new features
+- `fix/*` — bug fixes
+- `docs/*` — documentation updates
 
----
-
-## 3 Open a Pull Request
-
-When opening your PR:
-
-- Provide a clear title
-- Add a detailed description
-- Link related issues (e.g., `Closes #45`)
-- Add screenshots for UI changes
-- Explain why the change is needed
+Create branches from `develop` and open PRs against `develop` unless instructed otherwise.
 
 ---
 
-## PR Requirements
+## Commit Guidelines & Hooks
 
-Your PR must:
-
-- Build successfully
-- Pass lint checks
-- Follow commit conventions
-- Be properly described
-- Stay focused (avoid large unrelated changes)
-- For database changes: follow the [Database Migrations & Rollout](#database-migrations--rollout)
-  checklist and include the completed checklist in the PR description
-
----
-
-## Code Review
-
-Maintainers may:
-
-- Request changes
-- Ask clarifying questions
-- Suggest improvements
-
-Please respond respectfully and update your branch as requested.
-
----
-
-# 🔒 Security
-
-If you discover a security vulnerability, please do **NOT** open a public issue. Instead, follow our responsible disclosure process outlined in our [Security Policy](SECURITY.md).
-
-Security vulnerabilities should be reported privately to allow us to address them before public disclosure.
-
----
-
-# 📜 Code of Conduct
-
-This project follows a Code of Conduct to ensure a welcoming and inclusive community.
-
-Please read and follow our Code of Conduct before contributing:
-
-**[CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md)**
-
-Be respectful.
-Be collaborative.
-Be constructive.
-
----
-
-
-
----
-
-# 🤝 Contributor Badges
-
-This project uses the [all-contributors](https://github.com/all-contributors/all-contributors) specification to recognize contributors.
-
-## Triggering the Bot
-
-After your pull request is merged or closed, comment on the merged PR or issue:
+We use **Conventional Commits**:
 
 ```
-@all-contributors please add @<your-username> for code
+<type>(<scope>): <short description>
 ```
 
-The bot will add your profile to the Contributors table in the root `README.md`.
+Common types: `feat`, `fix`, `docs`, `test`, `refactor`, `chore`.
 
-## Adding Sub-Package READMEs
+Examples:
 
-Currently, only the root `README.md` has a Contributors section. If you add a Contributors section to a sub-package README (e.g., `backend/README.md`, `frontend/README.md`, `contracts/README.md`), update `.all-contributorsrc` in the repo root to include the additional path:
-
-```json
-"files": [
-  "README.md",
-  "backend/README.md"
-]
+```
+feat(sdk): add secure mobile wallet deep-link signer adapter
+fix(frontend): handle cancelled wallet handoff
 ```
 
-## Available Contribution Types
+Pre-commit hooks run linting and formatting. Do not bypass hooks with `--no-verify`
+unless you have a documented reason.
 
-- `code` — Code contributions
-- `doc` — Documentation
-- `design` — Design
-- `bug` — Bug reports
-- `review` — Pull Request reviews
-- `test` — Testing
-- `infra` — Infrastructure / DevOps
-- `ideas` — Ideas & planning
+---
 
+## Pull Request Process
 
-# Final Notes
+1. Fork the repo and create a branch from `develop`.
+2. Make focused changes — keep the scope limited to the linked issue.
+3. Add or update tests for the changed behavior, including failure and boundary cases.
+4. Update the relevant documentation (API, contract, operational, or contributor docs).
+5. Ensure `npm run lint` and `npm run build` pass for the affected package.
+6. Open a PR with a clear description, the linked issue, and manual verification notes
+   for any critical flow you touched.
 
-- Contributions of all sizes are welcome
-- Documentation improvements are valuable
-- Ask questions in Issues if unsure
-- Keep PRs small and manageable
+Keep existing interfaces compatible unless the change explicitly versions them.
 
-Thank you for helping improve FlowFi 💙
+---
+
+## Security
+
+- Never commit secrets, private keys, or credentials.
+- Never expose secret material to the application or backend. Mobile wallet signing
+  happens in the wallet; FlowFi only handles unsigned transactions and signed envelopes.
+- Do not weaken wallet authorization, chain/network validation, financial accounting
+  invariants, or secret-handling requirements to make an implementation pass.
+- Report security issues privately as described in [`SECURITY.md`](../SECURITY.md).
+
+---
+
+## Code of Conduct
+
+Be respectful and constructive. Harassment or abusive behavior is not tolerated.
+See [`CODE_OF_CONDUCT.md`](../CODE_OF_CONDUCT.md) for details.

@@ -166,26 +166,69 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Mobile Wallet Deep-Link Signer Adapter
 
-For a quick reference of the models involved in indexing:
+The SDK exposes a `MobileWalletDeepLinkSigner` adapter so mobile wallets can
+sign non-custodial actions (withdraw, pause/resume, create stream) via a
+deep-link handoff. The adapter is a **signer only** — it never receives, stores,
+or transmits secret material. The application and backend only ever see the
+unsigned transaction XDR and the returned signed XDR.
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+### Adapter Interface
 
----
+```ts
+export interface MobileWalletDeepLinkSigner {
+  /** Build a deep link that hands the unsigned XDR to the wallet. */
+  buildDeepLink(request: DeepLinkSignRequest): string;
+  /** Validate and parse the wallet's return callback. */
+  parseReturn(params: DeepLinkReturnParams): DeepLinkSignResult;
+  /** Abort an in-flight handoff (user cancelled or timeout). */
+  cancel(reason?: string): void;
+}
+```
 
-## Related Documentation
+### Supported Wallet Capabilities
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+| Capability | Supported | Notes |
+|------------|-----------|-------|
+| Sign arbitrary transaction XDR | Yes | Wallet returns signed XDR only. |
+| Network / passphrase binding | Yes | Request carries `networkPassphrase`; response must match. |
+| Cancellation signal | Yes | Wallet returns `status=cancelled` or the app calls `cancel()`. |
+| Secret export | **No** | The adapter never requests or accepts secret keys. |
+| Server-side submission | **No** | Submission stays client-side; backend never signs these actions. |
+
+### Cancellation
+
+A handoff can be cancelled by the user (wallet returns `status=cancelled`) or by
+the application (timeout / navigation away). Both paths resolve the pending
+promise with a `DeepLinkCancelledError` and never leave a dangling listener.
+
+### Return-Link Validation
+
+Return callbacks are untrusted input. The adapter rejects a callback when:
+
+- Required fields (`status`, `networkPassphrase`) are missing or malformed.
+- `status` is not one of `signed` / `cancelled` / `rejected`.
+- A `signed` response is missing a well-formed `signedXdr`.
+- The callback origin does not match the configured return origin.
+
+Malformed callbacks surface as `DeepLinkValidationError` and are never treated
+as a successful signature.
+
+### Network Matching
+
+The `networkPassphrase` in the return callback must equal the passphrase the
+request was built for. A mismatch (e.g. mainnet response for a testnet request)
+is rejected with `DeepLinkNetworkMismatchError` before the signed XDR is used.
+This preserves chain/network validation and prevents cross-network replay.
+
+### Secret-Handling Requirements
+
+- The adapter accepts only unsigned XDR and returns signed XDR.
+- No secret key, mnemonic, or seed is ever passed to the adapter, logged, or
+  sent to the backend.
+- The backend does not gain a submit path for these actions; the non-custodial
+  security model above is unchanged.
