@@ -130,6 +130,36 @@ throughput for healthy clients.
 
 ---
 
+## Shared Stream Review Links
+
+Stream owners can share a read-only review of a stream via a scoped link. The
+link exposes **only** the fields the owner explicitly selects as public; it never
+reveals wallet addresses, session data, tokens, or secrets.
+
+### Expiry
+
+- Every share link has a TTL. The default is **7 days** and can be configured
+  per link (bounded by a server-side maximum).
+- Expiry is evaluated server-side on every read; an expired link returns a safe
+  `404 Not Found` (identical to an unknown token) so expiry cannot be probed.
+
+### Revocation
+
+- The stream owner can revoke a link at any time before expiry. Revocation is
+  immediate and idempotent.
+- Revoked links return the same safe `404 Not Found` response as expired or
+  unknown links.
+
+### Privacy Boundary
+
+- The shared payload is built from an explicit allow-list of public fields
+  (e.g. stream id, status, amounts, timestamps). Private wallet/session data is
+  never included.
+- The share endpoint is strictly read-only: any mutating method or attempt to
+  access non-public data is rejected with `403 Forbidden`.
+
+---
+
 ## Keeper-Key Authorization Model
 
 FlowFi splits transaction signing into two categories: custodial (server-signed)
@@ -166,26 +196,3 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
-
----
-
-## Database Models
-
-For a quick reference of the models involved in indexing:
-
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
-
----
-
-## Related Documentation
-
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow

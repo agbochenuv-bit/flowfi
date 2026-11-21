@@ -49,12 +49,39 @@ model Stream {
   senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
   recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
   events            StreamEvent[]
+  shareLinks        StreamShareLink[]
 
   @@index([sender])
   @@index([recipient])
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+}
+
+// StreamShareLink model - scoped, read-only share links for a stream review.
+//
+// Privacy contract (issue #266): a share link only ever exposes the stream
+// fields explicitly listed in `publicFields`. Private wallet addresses,
+// session data, tokens, and secrets are never serialized into the shared
+// payload. Links expire at `expiresAt` (default TTL applied by the service)
+// and can be revoked early by the owner via `revokedAt`; both expired and
+// revoked links resolve to a safe not-found/expired response.
+model StreamShareLink {
+  id           String    @id @default(uuid())
+  token        String    @unique // Opaque, unguessable share token (never a secret)
+  streamId     BigInt    // Reference to on-chain stream ID (Soroban u64)
+  ownerAddress String    // Stellar public key of the link creator (authorization only, never exposed)
+  publicFields String[]  // Explicit allow-list of stream fields revealed by this link
+  expiresAt    DateTime  // Absolute expiry; expired links are treated as not-found
+  revokedAt    DateTime? // Set when the owner revokes the link before expiry
+  createdAt    DateTime  @default(now())
+
+  // Relations
+  stream       Stream    @relation(fields: [streamId], references: [streamId], onDelete: Cascade)
+
+  @@index([streamId])
+  @@index([ownerAddress])
+  @@index([expiresAt])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
@@ -193,31 +220,3 @@ model IndexerDeadLetterEvent {
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
-}
-
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
