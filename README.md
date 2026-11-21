@@ -463,3 +463,8 @@ This project follows the [all-contributors](https://github.com/all-contributors/
 ## License
 
 MIT.
+
+## Handsoff notes
+
+<!-- handsoff-issue-225 -->
+- #225: feat(contracts): add per-asset emergency quarantine controls
