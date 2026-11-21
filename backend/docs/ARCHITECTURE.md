@@ -166,26 +166,63 @@ for the transaction.
 > wallet-signed by the user to preserve the non-custodial security model.
 
 The keeper key is a server-side secret and is never exposed to the frontend.
-It lives exclusively in the backend's environment configuration.
 
 ---
 
-## Database Models
+## Verifier-Backed Conditional Release Policies
 
-For a quick reference of the models involved in indexing:
+Some streams gate accrual or release on the result of an external verifier
+(e.g. an oracle, attestation service, or off-chain job runner). This section
+defines the trust model and failure semantics for those streams. The interface
+is additive: streams without a configured verifier keep the existing
+unconditional accrual/release behavior.
 
-| Model | Key Fields | Purpose |
-|-------|------------|---------|
-| `User` | `publicKey` | Stellar wallet addresses |
-| `Stream` | `streamId`, `sender`, `recipient`, `ratePerSecond`, `depositedAmount`, `withdrawnAmount`, `isActive` | Mirrors on-chain stream state |
-| `StreamEvent` | `streamId`, `eventType`, `transactionHash`, `ledgerSequence`, `timestamp` | Indexed on-chain events; unique on `(transactionHash, eventType)` |
-| `IndexerState` | `lastLedger`, `lastCursor` | Cursor for last successfully indexed ledger sequence |
+### Verifier Identity
 
----
+- A verifier is identified by a stable `verifierId` (opaque string) plus the
+  on-chain `verifierAddress` that is authorized to submit results. Both are
+  configured at stream creation and are immutable for the life of the stream.
+- Only results whose `verifierAddress` matches the stream's configured address
+  are accepted. Results from any other address are rejected and never mutate
+  stream state.
+- The backend treats the verifier as an **untrusted external input**: it
+  validates identity and shape, but does not assume the verifier is honest or
+  available.
 
-## Related Documentation
+### Trust Assumptions
 
-- [Root Architecture](../../docs/ARCHITECTURE.md) — full project-wide architecture
-- [SSE Architecture](./SSE_ARCHITECTURE.md) — SSE scaling, security, operational runbook
-- [SSE Implementation](./SSE_IMPLEMENTATION.md) — client integration guide
-- [Authentication](./AUTHENTICATION.md) — SEP-10 + JWT auth flow
+> **The verifier is trusted only to report its own result — not to move funds,
+> change stream parameters, or bypass wallet authorization.** Release still
+> requires the normal wallet-signed withdraw path; the verifier result only
+> determines *whether* accrual/release is permitted, never *who* may trigger it.
+
+- Verifier results are advisory gates. They cannot weaken wallet authorization,
+  chain/network validation, or financial accounting invariants.
+- The verifier's correctness (e.g. whether a job truly succeeded) is outside the
+  protocol's trust boundary; the protocol only enforces that a result came from
+  the configured verifier and was well-formed.
+
+### Timeout, Failure, and Replay Semantics
+
+| Condition | Behavior |
+|-----------|----------|
+| **No result yet** | Stream accrues/releases per its default policy until a valid result arrives. |
+| **Timeout** | If no valid result arrives within the configured `verifierTimeoutSeconds`, the stream falls back to its configured failure mode (see below). |
+| **Verifier unavailable** | Treated as a timeout once the deadline passes; the failure mode applies. |
+| **Malformed response** | Rejected without mutating state; the stream remains in its pre-result state and the timeout clock continues. |
+| **Wrong verifier identity** | Rejected without mutating state (same as malformed). |
+| **Replay / duplicate result** | Results are keyed by `(streamId, verifierId, nonce)`. A result whose nonce was already consumed is ignored; it never re-triggers release. |
+
+**Failure modes** (configured per stream):
+
+- `block` — accrual/release is blocked until a valid result arrives (default).
+- `release` — accrual/release proceeds as if the verifier returned success.
+
+### Operational Notes
+
+- Malformed or unavailable verifier responses are logged with the stream ID and
+  verifier ID but never surface raw verifier payloads to clients.
+- The timeout boundary is inclusive of the deadline: a result arriving exactly at
+  `verifierTimeoutSeconds` is accepted; anything later is treated as a timeout.
+- Replay protection relies on the consumed-nonce set; operators must not reuse
+  nonces when re-submitting results.

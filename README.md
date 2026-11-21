@@ -463,3 +463,8 @@ This project follows the [all-contributors](https://github.com/all-contributors/
 ## License
 
 MIT.
+
+## Handsoff notes
+
+<!-- handsoff-issue-213 -->
+- #213: feat(contracts): allow third-party contributions to funded streams

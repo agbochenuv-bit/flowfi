@@ -76,6 +76,49 @@ does not explicitly re-check `status`, so the invariant relies on the fact that
 `cancel_stream` sets `is_active = false` and `validate_stream_active` is called
 before `pause_stream`. See Testing #94 for test coverage of this invariant.
 
+## Stream Receipts (Non-Transferable Metadata)
+
+Every stream exposes a **read-only receipt** for wallets and indexers. A receipt is
+purely descriptive metadata: it is derived from the stream's stored state and is
+**not** a bearer instrument. Holding, displaying, or indexing a receipt grants **no**
+privileged action — all authorization still flows through the stream's `sender` /
+`recipient` checks in the contract entry points.
+
+### Receipt fields
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `stream_id` | `u64` | Identifier of the stream the receipt describes |
+| `sender` | `Address` | Stream funder (authorization subject for cancel/pause) |
+| `recipient` | `Address` | Stream beneficiary (authorization subject for withdraw) |
+| `token` | `Address` | Token contract being streamed |
+| `deposited` | `i128` | Total amount deposited into the stream |
+| `withdrawn` | `i128` | Total amount already withdrawn |
+| `status` | `StreamStatus` | Lifecycle status at read time |
+| `paused` | `bool` | Whether the stream is currently paused |
+| `is_active` | `bool` | Whether the stream is currently active |
+
+### Lifecycle mapping
+
+The receipt's `status` / `paused` / `is_active` fields mirror the stream state machine
+above and are recomputed on every read, so the metadata stays stable and consistent
+through transitions:
+
+| Lifecycle | `status` | `paused` | `is_active` |
+|-----------|----------|----------|-------------|
+| Created / Active | `Active` | `false` | `true` |
+| Paused | `Paused` | `true` | `true` |
+| Resumed | `Active` | `false` | `true` |
+| Completed | `Completed` | `false` | `false` |
+| Cancelled | `Cancelled` | `false` | `false` |
+
+### Non-transferability & authorization
+
+- Receipts are **not** transferable: there is no mint, transfer, or approval entry point.
+- Reading a receipt (`get_stream_receipt`) requires no authorization and confers none.
+- Privileged actions remain gated by the stream's `sender` / `recipient` checks; a
+  receipt holder who is neither cannot withdraw, pause, resume, or cancel.
+
 ## Building & Testing
 
 To build the contracts for testing and validation:

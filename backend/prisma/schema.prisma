@@ -8,7 +8,7 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
 // User model - represents Stellar wallet addresses interacting with the protocol
@@ -49,12 +49,65 @@ model Stream {
   senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
   recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
   events            StreamEvent[]
+  releasePolicy     StreamReleasePolicy?
 
   @@index([sender])
   @@index([recipient])
   @@index([tokenAddress])
   @@index([isActive])
   @@index([isPaused])
+}
+
+// StreamReleasePolicy model - verifier-backed conditional release policy (issue #214).
+//
+// A stream may be gated so that accrual/release only happens once a configured
+// verifier returns a positive result. Trust assumptions are explicit:
+//   * `verifierAddress` is the ONLY trusted identity. Results signed by any other
+//     key are rejected; the verifier is trusted to answer honestly for the
+//     `policyKey` it is asked about (it is NOT trusted to move funds).
+//   * `timeoutSeconds` bounds how long a pending verification may block release.
+//     On timeout the stream falls back to `onTimeout` (default: keep locked).
+//   * `onFailure` defines behavior when the verifier is unavailable or returns a
+//     malformed response (default: keep locked, never auto-release).
+//   * Replay protection: each verification result carries a unique `nonce`; the
+//     `(streamId, nonce)` pair is unique so a replayed result cannot release twice.
+model StreamReleasePolicy {
+  id              String   @id @default(uuid())
+  streamId        BigInt   @unique
+  verifierAddress String   // Trusted verifier Stellar public key (G...)
+  policyKey       String   // Opaque key the verifier answers about
+  timeoutSeconds  Int      @default(3600) // Max wait before onTimeout applies
+  onTimeout       String   @default("LOCK") // "LOCK" | "RELEASE"
+  onFailure       String   @default("LOCK") // "LOCK" | "RELEASE"
+  lastNonce       String?  // Highest accepted verifier nonce (replay guard)
+  isReleased      Boolean  @default(false)
+  releasedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  stream          Stream   @relation(fields: [streamId], references: [streamId], onDelete: Cascade)
+  results         VerifierResult[]
+
+  @@index([verifierAddress])
+  @@index([isReleased])
+}
+
+// VerifierResult model - records verifier responses for audit and replay defense.
+// `(policyId, nonce)` is unique so a replayed verifier result is rejected at the
+// storage layer, independent of application-level checks.
+model VerifierResult {
+  id          String   @id @default(uuid())
+  policyId    String
+  nonce       String   // Unique per verifier response; replay guard
+  approved    Boolean
+  rawResponse String?  // Original response payload for audit/debugging
+  receivedAt  DateTime @default(now())
+
+  policy      StreamReleasePolicy @relation(fields: [policyId], references: [id], onDelete: Cascade)
+
+  @@unique([policyId, nonce])
+  @@index([policyId])
+  @@index([receivedAt])
 }
 
 // IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
@@ -193,31 +246,3 @@ model IndexerDeadLetterEvent {
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-
-  @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
-}
-
-enum BackfillStatus {
-  PENDING
-  RUNNING
-  COMPLETED
-  FAILED
-  CANCELLED
-}
