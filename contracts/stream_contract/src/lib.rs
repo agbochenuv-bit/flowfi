@@ -38,6 +38,8 @@ mod acceptance_tests;
 #[cfg(test)]
 mod property_tests;
 #[cfg(test)]
+mod model_tests;
+#[cfg(test)]
 mod test;
 
 use soroban_sdk::{

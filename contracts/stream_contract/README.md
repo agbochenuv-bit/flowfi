@@ -4,6 +4,16 @@ Soroban smart contract for time-based token streaming with optional protocol fee
 
 ## Overview
 
+### Lifecycle model tests
+
+`src/model_tests.rs` runs reproducible operation sequences against a separate
+accounting model and the Soroban contract. It covers successful and rejected
+pause, resume, top-up, withdrawal, cancellation, and unauthorized withdrawal
+operations, then checks balances, conservation, and terminal state after every
+step. A failure prints its seed and step; reduce the sequence and add it to
+`minimized_regression_sequences` so the case remains permanently reproducible.
+Run it with `cargo test model_tests` from `contracts/`.
+
 `stream_contract` lets a sender deposit tokens into a stream that accrues linearly to a recipient over time.
 The contract supports stream creation, top-ups, withdrawals, cancellation, pause/resume controls, and protocol fee administration.
 
