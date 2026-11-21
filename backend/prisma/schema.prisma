@@ -1,223 +1,78 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
+// Prisma schema for the streaming backend.
+// NOTE: This file is the source of truth for persisted stream state.
+// Recurring schedules (#221) are modeled here so that each generated
+// stream instance is independently funded, identified, and cancellable.
 
 generator client {
   provider = "prisma-client-js"
-  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
-  url = env("DATABASE_URL")
+  url      = env("DATABASE_URL")
 }
 
-// User model - represents Stellar wallet addresses interacting with the protocol
-model User {
-  id              String   @id @default(uuid())
-  publicKey       String   @unique // Stellar public key (G...)
+model Stream {
+  id              String   @id @default(cuid())
+  sender          String
+  recipient       String
+  token           String
+  amount          String
+  startTime       DateTime
+  endTime         DateTime
+  status          StreamStatus @default(ACTIVE)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  // Relations
-  sentStreams     Stream[] @relation("SentStreams")
-  receivedStreams Stream[] @relation("ReceivedStreams")
+  // Deterministic linkage to a recurring schedule (#221).
+  // Null for standalone streams; set for instances spawned by a schedule.
+  scheduleId      String?
+  scheduleIndex   Int?
+  schedule        RecurringSchedule? @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
 
-  @@index([publicKey])
-}
-
-// Stream model - mirrors on-chain stream state for fast querying
-model Stream {
-  id                String    @id @default(uuid())
-  streamId          BigInt    @unique // On-chain stream ID (Soroban u64)
-  sender            String    // Sender's Stellar public key
-  recipient         String    // Recipient's Stellar public key
-  tokenAddress      String    // Token contract address
-  ratePerSecond     String    // Rate as string to preserve precision (i128)
-  depositedAmount   String    // Total deposited amount (i128)
-  withdrawnAmount   String    // Total withdrawn amount (i128)
-  startTime         BigInt    // Unix timestamp when stream started
-  lastUpdateTime    BigInt    // Unix timestamp of last update
-  endTime           BigInt?   // Unix timestamp when stream ends
-  isActive          Boolean   @default(true)
-  isPaused          Boolean   @default(false)
-  pausedAt          BigInt?   // Unix timestamp when paused
-  totalPausedDuration Int     @default(0) // Accumulated paused duration in seconds
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
-
-  // Relations
-  senderUser        User      @relation("SentStreams", fields: [sender], references: [publicKey])
-  recipientUser     User      @relation("ReceivedStreams", fields: [recipient], references: [publicKey])
-  events            StreamEvent[]
-
+  @@unique([scheduleId, scheduleIndex])
   @@index([sender])
   @@index([recipient])
-  @@index([tokenAddress])
-  @@index([isActive])
-  @@index([isPaused])
 }
 
-// IndexerState model - tracks the last processed ledger/cursor for the Soroban event worker.
-//
-// Concurrency contract (issue #43): replay, reset, and normal polling all mutate
-// this single row. Writers MUST take a row-level lock (SELECT ... FOR UPDATE) on
-// the singleton row inside a transaction before reading or advancing the cursor,
-// so an admin replay cannot race the live worker or move the cursor backwards.
-// The `version` column is an optimistic-concurrency guard: every write bumps it
-// and callers that observed a stale version must retry. `lastCursor` is only ever
-// advanced monotonically (never regressed) by the poll loop; replay/reset are the
-// only operations allowed to rewind it, and they do so under the same lock.
-model IndexerState {
-  id          String   @id @default("singleton")
-  lastLedger  Int      @default(0)
-  lastCursor  String?  // Paging token of the last processed event (for cursor-based pagination)
-  version     Int      @default(0) // Optimistic-concurrency guard; bumped on every write
-  updatedAt   DateTime @updatedAt
+enum StreamStatus {
+  ACTIVE
+  COMPLETED
+  CANCELLED
 }
 
-// LedgerCheckpoint model - durable proof of the exact ledger sequence, hash
-// signature, and event count the indexer ingested. Written on every ingestion
-// cycle so the worker can (a) prove the canonical chain still contains what it
-// indexed and (b) roll back deterministically when a fork replaces it.
-model LedgerCheckpoint {
-  ledgerSequence Int      @id
-  ledgerHash     String
-  parentHash     String
-  processedAt    DateTime @default(now())
-  eventsCount    Int
-  stateRootHash  String?
-  isReverted     Boolean  @default(false)
-
-  @@index([processedAt])
-}
-
-// StreamEvent model - indexer events for tracking all on-chain stream activities
-model StreamEvent {
-  id              String   @id @default(uuid())
-  streamId        BigInt   // Reference to on-chain stream ID (Soroban u64)
-  eventType       String   // EventType: "CREATED", "TOPPED_UP", "WITHDRAWN", "CANCELLED", "COMPLETED", "PAUSED", "RESUMED"
-  amount          String?  // Amount involved in the event (for top-ups, withdrawals)
-  transactionHash String   // Stellar transaction hash
-  ledgerSequence  Int      // Ledger sequence number
-  timestamp       BigInt   // Unix timestamp
-  metadata        String?  // JSON string for additional event data
-  createdAt       DateTime @default(now())
-
-  // Relations
-  stream          Stream   @relation(fields: [streamId], references: [streamId])
-
-  @@unique([transactionHash, eventType])
-  @@index([streamId])
-  @@index([eventType])
-  @@index([streamId, eventType])
-  @@index([timestamp])
-  @@index([transactionHash])
-  @@index([createdAt])
-  @@index([streamId, timestamp])
-  // Canonical ordering index: (streamId, ledgerSequence) gives deterministic
-  // blockchain-ordered event listings. ledger_sequence is the total order on
-  // Stellar — no two events in different ledgers share a sequence number.
-  @@index([streamId, ledgerSequence])
-}
-
-// WebhookSubscription model - Outgoing webhook configuration for external integrations (Issue #1189)
-model WebhookSubscription {
-  id          String   @id @default(uuid())
-  userAddress String   // Stellar public key of the owner
-  targetUrl   String   // Destination webhook URL (must be HTTPS)
-  secretKey   String   // Secret used for HMAC-SHA256 signature
-  eventTypes  String[] // Array of subscribed event types (e.g., ["STREAM_CREATED", "TOKENS_WITHDRAWN"])
-  isActive    Boolean  @default(true)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  deliveries  WebhookDelivery[]
-
-  @@index([userAddress])
-  @@index([isActive])
-}
-
-// WebhookDelivery model - Webhook delivery history and retry tracking (Issue #1189)
-model WebhookDelivery {
-  id             String   @id @default(uuid())
-  subscriptionId String
-  eventType      String
-  payload        String   // JSON
-  responseStatus Int?
-  attempts       Int      @default(0)
-  deliveredAt    DateTime?
-  error          String?
-  createdAt      DateTime @default(now())
-
-  subscription   WebhookSubscription @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
-
-  @@index([subscriptionId])
-  @@index([createdAt])
-}
-
-// AlertHistory model - Tracks sent alerts to prevent duplicate notifications (Issue #1190)
-model AlertHistory {
-  id        String   @id @default(uuid())
-  streamId  BigInt
-  alertType String   // "WARNING_48H" or "CRITICAL_24H"
-  sentAt    DateTime @default(now())
-
-  @@unique([streamId, alertType, sentAt])
-  @@index([streamId])
-  @@index([sentAt])
-}
-
-// IndexerDeadLetterEvent model - quarantines Soroban events whose processing
-// failed (unexpected payload shape, transient DB lock, RPC timeout mid-handler).
-// A quarantined event is never retried inline by the poll loop, so one malformed
-// event cannot freeze the worker cursor; operators replay or discard it through
-// the admin dead-letter endpoints instead.
-model IndexerDeadLetterEvent {
-  id             String   @id @default(uuid())
-  eventId        String   // Soroban paging token / event id of the quarantined event
-  eventType      String   // Contract event name, e.g. "stream_created"
-  txHash         String   // Stellar transaction hash
-  ledgerSequence Int      // Ledger the event was emitted in
-  cursor         String?  // Paging token captured alongside the event
-  payload        String   // JSON envelope: base64 XDR for each topic ScVal + value ScVal
-  errorMessage   String   // Failure reason from the processing attempt
-  attempts       Int      @default(1)
-  lastAttemptAt  DateTime @default(now())
-  createdAt      DateTime @default(now())
-
-  @@unique([eventId, eventType])
-  @@index([ledgerSequence])
-  @@index([createdAt])
-  @@index([attempts])
-  @@index([eventType])
-}
-
-// BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
-// Allows safe restart, progress monitoring, and protection from duplicate writes.
-model BackfillJob {
-  id            String   @id @default(uuid())
-  name          String?  // Optional human-readable name for the backfill
-  fromLedger    Int      // Inclusive start ledger
-  toLedger      Int      // Inclusive end ledger
-  status        BackfillStatus @default(PENDING)
-  currentLedger Int      @default(0) // Current ledger being processed (for progress tracking)
-  eventsProcessed Int    @default(0)
-  eventsFailed    Int    @default(0)
-  errorMessage    String? // Last error if failed
-  startedAt       DateTime?
-  completedAt     DateTime?
+// Bounded recurring schedule (#221).
+// Limits are enforced at the contract/API layer; the schema stores the
+// declared bounds so instances can be derived deterministically.
+model RecurringSchedule {
+  id              String   @id @default(cuid())
+  sender          String
+  recipient       String
+  token           String
+  // Per-instance funding amount; each instance is funded independently.
+  amountPerInstance String
+  // Interval between instance start times, in seconds.
+  intervalSeconds Int
+  // First instance start time.
+  startTime       DateTime
+  // Maximum number of instances that may be spawned from this schedule.
+  maxInstances    Int
+  // Number of instances already spawned (monotonic; guards duplicate execution).
+  spawnedCount    Int      @default(0)
+  // Duration of each instance, in seconds.
+  instanceDurationSeconds Int
+  status          ScheduleStatus @default(ACTIVE)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  instances       Stream[]
+
+  @@index([sender])
   @@index([status])
-  @@index([fromLedger, toLedger])
-  @@index([createdAt])
 }
 
-enum BackfillStatus {
-  PENDING
-  RUNNING
+enum ScheduleStatus {
+  ACTIVE
   COMPLETED
-  FAILED
   CANCELLED
 }
