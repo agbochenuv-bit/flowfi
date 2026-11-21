@@ -11,6 +11,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const hoisted = vi.hoisted(() => {
   const tx = {
+    auditEvent: { create: vi.fn().mockResolvedValue({}) },
     streamEvent: { findMany: vi.fn(), deleteMany: vi.fn() },
     stream: { findUnique: vi.fn(), update: vi.fn(), delete: vi.fn() },
     ledgerCheckpoint: { updateMany: vi.fn() },
@@ -25,6 +26,7 @@ const hoisted = vi.hoisted(() => {
         upsert: vi.fn(),
       },
       indexerDeadLetterEvent: { upsert: vi.fn() },
+      auditEvent: { create: vi.fn().mockResolvedValue({}) },
       $transaction: vi.fn((cb: (client: unknown) => unknown) => cb(tx)),
     },
   };
@@ -37,12 +39,18 @@ vi.mock('../src/lib/prisma.js', () => ({
 
 vi.mock('../src/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+  requestContext: { getStore: vi.fn().mockReturnValue(undefined) },
+}));
+
+vi.mock('../src/services/sse.service.js', () => ({
+  sseService: { broadcastToStream: vi.fn() },
 }));
 
 import { prisma } from '../src/lib/prisma.js';
 import logger from '../src/logger.js';
 import { indexerReorgEventsTotal } from '../src/lib/metrics.js';
 import * as checkpoint from '../src/services/checkpoint.service.js';
+import { sseService } from '../src/services/sse.service.js';
 
 const mockedPrisma = prisma as unknown as typeof hoisted.prisma;
 const tx = hoisted.tx;
@@ -253,6 +261,9 @@ describe('rollbackAboveLedger', () => {
     const update = tx.stream.update.mock.calls[0]![0];
     expect(update.where).toEqual({ streamId: 42n });
     expect(update.data.withdrawnAmount).toBe('1000');
+    expect(sseService.broadcastToStream).toHaveBeenCalledWith('42', 'stream.reconciled', {
+      streamId: '42', safeLedger: 1002,
+    });
 
     // No orphaned stream, and the reverted checkpoint is flagged.
     expect(tx.stream.delete).not.toHaveBeenCalled();
@@ -436,5 +447,48 @@ describe('forward resumption after rollback', () => {
     // replaying the canonical sequence forward from the recovered ledger.
     expect(upsert.update.lastLedger).toBe(1004);
     expect(upsert.update.lastCursor).toBeNull();
+  });
+});
+
+describe('canonical correction delivery', () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it('does not publish a correction if the database rollback fails', async () => {
+    mockedPrisma.$transaction.mockRejectedValueOnce(new Error('database unavailable'));
+    await expect(checkpoint.rollbackAboveLedger(1003)).rejects.toThrow('database unavailable');
+    expect(sseService.broadcastToStream).not.toHaveBeenCalled();
+  });
+
+  it('rewinds the cursor and emits one correction per affected stream after commit', async () => {
+    let committed = false;
+    mockedPrisma.$transaction.mockImplementationOnce(async (callback: (client: typeof tx) => unknown) => {
+      const value = await callback(tx);
+      committed = true;
+      return value;
+    });
+    tx.streamEvent.findMany
+      .mockResolvedValueOnce([
+        { streamId: 42n, ledgerSequence: 1004 },
+        { streamId: 42n, ledgerSequence: 1005 },
+        { streamId: 43n, ledgerSequence: 1005 },
+      ])
+      .mockResolvedValueOnce([streamEventRow({ streamId: 42n })])
+      .mockResolvedValueOnce([streamEventRow({ streamId: 43n })]);
+    tx.streamEvent.deleteMany.mockResolvedValue({ count: 3 });
+    tx.stream.findUnique.mockResolvedValue(streamRow());
+    tx.stream.update.mockResolvedValue({});
+    tx.ledgerCheckpoint.updateMany.mockResolvedValue({ count: 2 });
+    tx.indexerState.upsert.mockResolvedValue({});
+    vi.mocked(sseService.broadcastToStream).mockImplementation(() => {
+      expect(committed).toBe(true);
+    });
+
+    const result = await checkpoint.rollbackAboveLedger(1003);
+
+    expect(result).toMatchObject({ safeLedger: 1003, eventsDeleted: 3, ledgersRolledBack: 2 });
+    expect(tx.indexerState.upsert).toHaveBeenCalledWith(expect.objectContaining({
+      update: { lastLedger: 1003, lastCursor: null },
+    }));
+    expect(vi.mocked(sseService.broadcastToStream).mock.calls.map(([id]) => id)).toEqual(['42', '43']);
   });
 });

@@ -8,6 +8,7 @@ import {
 import logger from '../logger.js';
 import type { Prisma } from '../generated/prisma/index.js';
 import { recordAuditEvent } from './audit.service.js';
+import { sseService } from './sse.service.js';
 
 /**
  * Ledger checkpointing + fork/reorg recovery engine (issue #1468).
@@ -313,6 +314,7 @@ export async function rollbackAboveLedger(safeLedger: number): Promise<RollbackR
     }, tx);
 
     return {
+      streamIds,
       eventsDeleted: deleted.count,
       streamsRecomputed,
       streamsDeleted,
@@ -322,7 +324,21 @@ export async function rollbackAboveLedger(safeLedger: number): Promise<RollbackR
     };
   });
 
-  return { safeLedger, ...result };
+  // Publish only after the transaction commits. A subscriber must never see a
+  // correction while the old projection is still visible to GET requests.
+  for (const streamId of result.streamIds) {
+    try {
+      sseService.broadcastToStream(String(streamId), 'stream.reconciled', {
+        streamId: String(streamId),
+        safeLedger,
+      });
+    } catch (error) {
+      logger.error('[CheckpointService] Failed to publish stream correction:', error);
+    }
+  }
+
+  const { streamIds: _streamIds, ...summary } = result;
+  return { safeLedger, ...summary };
 }
 
 /**

@@ -4,6 +4,15 @@ title: Event ingestion
 
 # Event ingestion
 
+When a checkpoint no longer matches the canonical ledger, the indexer deletes
+events above the last verified ledger and recomputes affected stream projections
+inside one database transaction. It rewinds the cursor to that ledger with a
+null event cursor, then replays canonical events. After the rollback commits,
+each affected stream subscription receives `stream.reconciled` with `streamId`
+and `safeLedger`. Subscribers should refetch the stream and its event list when
+they receive this correction; a previously delivered event may have vanished.
+Repeated canonical events remain deduplicated by their event identity.
+
 ```mermaid
 sequenceDiagram
     participant SC as Soroban (stream_contract)
