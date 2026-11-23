@@ -7,6 +7,7 @@ import privacyRoutes from './privacy.routes.js';
 import userRoutes from './user.routes.js';
 import analyticsRoutes from './analytics.routes.js';
 import tokenRoutes from './token.routes.js';
+import organizationRoutes from './organizations.routes.js';
 import adminRoutes from './admin.routes.js';
 import exportRoutes from './export.routes.js';
 
@@ -22,6 +23,9 @@ const router = Router();
 
 // Authentication — wallet challenge / verify flow
 router.use('/auth', authRoutes);
+
+// Organizations — wallet-linked membership, invitations, and treasury summary
+router.use('/organizations', organizationRoutes);
 
 // Payment streams — create, query, lifecycle actions
 router.use('/streams', streamRoutes);

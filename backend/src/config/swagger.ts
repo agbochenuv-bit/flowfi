@@ -263,6 +263,10 @@ change between the check and submission.
         description: 'Wallet-authenticated session inventory and revocation',
       },
       {
+        name: 'Organizations',
+        description: 'Wallet-linked organization membership, invitations, and treasury summary',
+      },
+      {
         name: 'Readiness',
         description: 'Preflight action readiness checks (advisory, not a transaction guarantee)',
       },
@@ -1152,6 +1156,148 @@ rely on \`error.requestId\` for correlation and \`error.details\` for structured
                 },
               },
             },
+          },
+        },
+        Organization: {
+          type: 'object',
+          required: ['id', 'name', 'slug', 'network', 'ownerWalletAddress'],
+          description: 'A wallet-scoped organization on a single Stellar network.',
+          properties: {
+            id: {
+              type: 'string',
+              format: 'uuid',
+              description: 'Organization identifier',
+              example: '550e8400-e29b-41d4-a716-446655440000',
+            },
+            name: {
+              type: 'string',
+              description: 'Human-readable organization name',
+              example: 'Acme Payroll',
+            },
+            slug: {
+              type: 'string',
+              description: 'URL-safe organization slug, unique per network',
+              example: 'acme-payroll',
+            },
+            network: {
+              type: 'string',
+              enum: ['testnet', 'mainnet'],
+              description: 'Stellar network the organization is scoped to',
+              example: 'testnet',
+            },
+            ownerWalletAddress: {
+              type: 'string',
+              description: 'Stellar public key of the organization owner',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            createdAt: { type: 'string', format: 'date-time' },
+            updatedAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        OrganizationMember: {
+          type: 'object',
+          required: ['walletAddress', 'role', 'joinedAt'],
+          description: "A wallet's membership within an organization, carrying its role.",
+          properties: {
+            walletAddress: {
+              type: 'string',
+              description: 'Stellar public key of the member',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            role: {
+              type: 'string',
+              enum: ['OWNER', 'ADMIN', 'MEMBER'],
+              description: 'Role determining which organization-scoped actions the wallet may perform',
+              example: 'MEMBER',
+            },
+            invitedBy: {
+              type: 'string',
+              nullable: true,
+              description: 'Wallet that issued the invitation, if any',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            joinedAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        OrganizationInvitation: {
+          type: 'object',
+          required: ['token', 'walletAddress', 'role', 'status', 'expiresAt'],
+          description: 'A single-use, time-bound organization membership invitation.',
+          properties: {
+            token: {
+              type: 'string',
+              description: 'Single-use acceptance token presented to POST /organizations/invitations/{token}/accept',
+              example: 'a1b2c3d4...',
+            },
+            walletAddress: {
+              type: 'string',
+              description: 'Stellar public key the invitation is addressed to',
+              example: 'GABC123XYZ456DEF789GHI012JKL345MNO678PQR901STU234VWX567YZA',
+            },
+            role: {
+              type: 'string',
+              enum: ['OWNER', 'ADMIN', 'MEMBER'],
+              description: 'Role the invitee would assume on acceptance',
+              example: 'MEMBER',
+            },
+            status: {
+              type: 'string',
+              enum: ['PENDING', 'ACCEPTED', 'REVOKED', 'EXPIRED'],
+              description: 'Invitation lifecycle status',
+              example: 'PENDING',
+            },
+            expiresAt: { type: 'string', format: 'date-time' },
+            acceptedAt: { type: 'string', format: 'date-time', nullable: true },
+            createdAt: { type: 'string', format: 'date-time' },
+          },
+        },
+        TreasurySummary: {
+          type: 'object',
+          required: ['organizationId', 'network', 'sourceLedger', 'reconciliationStatus', 'assets', 'recordedFees', 'outstandingLiabilities', 'computedAt'],
+          description: 'Operator-facing treasury balance and liability summary reconciled against the source ledger.',
+          properties: {
+            organizationId: { type: 'string', description: 'Organization the summary was computed for' },
+            network: { type: 'string', enum: ['testnet', 'mainnet'], description: 'Stellar network the summary is scoped to' },
+            sourceLedger: {
+              type: 'object',
+              required: ['ledgerSequence', 'processedAt'],
+              properties: {
+                ledgerSequence: { type: 'integer', nullable: true, description: 'Source ledger sequence the summary is pinned to' },
+                processedAt: { type: 'string', format: 'date-time', nullable: true, description: 'When the source ledger was processed' },
+              },
+            },
+            reconciliationStatus: {
+              type: 'string',
+              enum: ['reconciled', 'stale', 'unknown'],
+              description: 'Whether the summary reconciles against a current ledger checkpoint',
+              example: 'reconciled',
+            },
+            assets: {
+              type: 'array',
+              description: 'Treasury assets grouped by token contract',
+              items: {
+                type: 'object',
+                required: ['token', 'deposited', 'withdrawn', 'balance'],
+                properties: {
+                  token: { type: 'string', description: 'Token contract address' },
+                  deposited: { type: 'string', description: 'Total deposited amount (i128 as string)' },
+                  withdrawn: { type: 'string', description: 'Total withdrawn amount (i128 as string)' },
+                  balance: { type: 'string', description: 'Deposited minus withdrawn (i128 as string)' },
+                },
+              },
+            },
+            recordedFees: {
+              type: 'object',
+              description: 'Total fees collected, grouped by token (i128 as string)',
+              additionalProperties: { type: 'string' },
+              example: { USDC: '2500' },
+            },
+            outstandingLiabilities: {
+              type: 'string',
+              description: 'Deposited but not yet withdrawn across active streams (i128 as string)',
+              example: '7500',
+            },
+            computedAt: { type: 'string', format: 'date-time' },
           },
         },
         Error: {
