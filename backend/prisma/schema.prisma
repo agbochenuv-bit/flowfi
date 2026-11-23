@@ -230,3 +230,81 @@ enum StreamStatus {
 }
 
 // BackfillJob model - tracks historical backfill operations for bounded ledger ranges.
+
+// Organization model - groups wallet-linked members under a shared identity for
+// payroll and subscription workflows (issue #233). Personal wallet ownership and
+// signing authority remain distinct from organization membership: a wallet owns
+// its own key pair and signs on its own behalf; membership only grants the right
+// to act on organization-scoped resources according to a role (issue #234).
+//
+// `network` is part of the organization identity so the same slug cannot be
+// reused across Stellar networks to collide on organization-scoped resources
+// (issue #236).
+model Organization {
+  id            String   @id @default(cuid())
+  name          String
+  slug          String
+  network       String   // Stellar network the organization is scoped to (testnet/mainnet)
+  ownerWalletAddress String
+  description   String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  members       OrganizationMember[]
+  invitations   OrganizationInvitation[]
+
+  @@unique([slug, network])
+  @@index([network])
+  @@index([ownerWalletAddress])
+}
+
+// OrganizationMember model - a wallet's membership within an organization,
+// carrying the role that determines which organization-scoped actions the
+// wallet may perform (issue #234).
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  walletAddress  String
+  role           OrganizationRole @default(MEMBER)
+  invitedBy      String?    // Wallet that issued the invitation, if any
+  joinedAt       DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([organizationId, walletAddress])
+  @@index([organizationId])
+  @@index([walletAddress])
+}
+
+enum OrganizationRole {
+  OWNER
+  ADMIN
+  MEMBER
+}
+
+// OrganizationInvitation model - a pending membership invitation. Invitations
+// are single-use, time-bound, and can be revoked before acceptance (issue #233).
+model OrganizationInvitation {
+  id               String   @id @default(cuid())
+  organizationId   String
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  walletAddress    String   // Wallet the invitation is addressed to
+  role             OrganizationRole @default(MEMBER)
+  token            String   @unique // Single-use acceptance token
+  status           OrganizationInvitationStatus @default(PENDING)
+  expiresAt        DateTime
+  acceptedAt       DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([walletAddress])
+  @@index([status])
+}
+
+enum OrganizationInvitationStatus {
+  PENDING
+  ACCEPTED
+  REVOKED
+  EXPIRED
+}
