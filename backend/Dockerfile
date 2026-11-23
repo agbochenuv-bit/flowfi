@@ -1,4 +1,4 @@
-FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS dependencies
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS dependencies
 WORKDIR /app
 COPY package.json package-lock.json ./
 COPY backend/package.json backend/
@@ -13,7 +13,7 @@ RUN npm run build -- --project tsconfig.build.json
 FROM dependencies AS production
 RUN npm ci --workspace=backend --omit=dev --ignore-scripts
 
-FROM node:26-alpine@sha256:6f08a523443ddedf52941874c203475b0ad503e859ad70cb26ab8be9a517dbd5 AS runtime
+FROM node:26-alpine@sha256:6bd9ab43c0ec0190ca7b2d193906cb8b7edf6e7f4afa43ddeccd6452710bffb5 AS runtime
 WORKDIR /app/backend
 ENV NODE_ENV=production
 COPY --from=production /app/node_modules /app/node_modules
