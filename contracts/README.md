@@ -48,6 +48,48 @@ For contract-specific documentation see the crate's own `README.md`.
 
 - `stream_contract/`: Contains the core streaming logic, including stream creation, funding, claiming, and cancellation.
 
+## Protocol Governance Features
+
+### Timelocked Policy Changes (#217)
+
+Protocol-wide configuration changes (fee config, circuit breaker, emergency guardian, admin transfer) can be proposed through a timelocked lifecycle:
+
+1. **Propose** — `propose_policy_change` stores a `PolicyOperation` with an `execute_after` timestamp set `timelock_delay_seconds` in the future.
+2. **Wait** — the delay must elapse before execution; the proposal stays `Pending` and cancellable.
+3. **Execute** — `execute_policy_change` replays the stored operation after the delay elapses (callable by anyone).
+4. **Cancel** — `cancel_policy_change` revokes a pending proposal (callable by proposer or admin).
+
+Guardian-restricted operations (pause, guardian) may be proposed by the emergency guardian; admin-only operations (fee config, admin transfer) require the admin.
+
+### Contract Upgrade & State Migration (#218, #219)
+
+The contract supports in-place executable upgrades and state schema migrations:
+
+- **`upgrade(new_wasm_hash)`** — replaces the contract's WASM in place, preserving address, storage, and active streams. Admin-only. Records the old and new hashes in `DataKey::ContractWasmHash` and emits `ContractUpgradedEvent`.
+- **`migrate(target_version)`** — advances the on-chain state schema version. Forward-only, idempotent, admin-only. Rewrites the protocol config into the current shape; stream records heal lazily on next read via `load_stream` / `load_config`.
+
+Version compatibility matrix:
+
+| On-chain version | Layout | Readable by contract v2 |
+|------------------|--------|-------------------------|
+| `0` (unversioned) | 3-field `ProtocolConfig`, 12-field `Stream` | Yes (legacy decode) |
+| `1` (versioned pre-breaker) | 3-field `ProtocolConfig`, no `schedule` on `Stream` | Yes (legacy decode) |
+| `2` (current) | 7-field `ProtocolConfig`, 17-field `Stream` with `schedule` | Yes (native) |
+
+Migration is lazy: Soroban exposes no persistent-storage enumeration, so records are upgraded on first touch rather than in bulk.
+
+### Versioned Storage Decoding (#219)
+
+Each `Stream` record carries a `stream_schema_version` field stamped at write time. Legacy records (fewer fields) are detected by field count and decoded into `LegacyStream` / `LegacyProtocolConfig`, then widened in memory with safe defaults (`dispute_requested_at: None`, `arbiter: None`, `dispute_status: None`, `is_allowance_based: false`, `stream_schema_version: CURRENT_DATA_VERSION`).
+
+### Dispute Holds with Timeout (#220)
+
+A stream with an `arbiter` configured cannot be unilaterally cancelled. Instead:
+
+1. The sender calls `request_dispute`, setting `dispute_status = Requested` and recording `dispute_requested_at`.
+2. The arbiter calls `resolve_dispute` with `approved = true` (cancels and distributes funds) or `approved = false` (rejects, stream stays active).
+3. If `ProtocolConfig::dispute_timeout_seconds` is set and the deadline passes, the admin may call `resolve_dispute_timeout` to force-reject the dispute (`approved = false`), keeping the stream active.
+
 ## Stream State Machine
 
 Payment streams have two independent boolean fields (`is_active` and `paused`) plus a

@@ -119,6 +119,16 @@ pub enum StreamError {
     /// audit (#26) so an out-of-range timestamp is reported as a stable error
     /// code rather than silently wrapping or panicking.
     TimestampOverflow = 45,
+    /// No timelocked proposal exists with the supplied id.
+    TimelockNotFound = 46,
+    /// The timelock delay for the proposal has not yet elapsed.
+    TimelockNotReady = 47,
+    /// The proposal is no longer pending (already executed, cancelled, or expired).
+    TimelockAlreadyExecuted = 48,
+    /// Timelock is disabled because `timelock_delay_seconds` is zero.
+    InvalidTimelockDelay = 49,
+    /// The dispute timeout window has not yet elapsed.
+    DisputeNotTimedOut = 50,
 }
 
 // ─── Test diagnostics (compiled only under `cfg(test)`) ───────────────────
@@ -187,6 +197,11 @@ pub(crate) mod test_diagnostics {
                 StreamError::MilestoneCallerUnauthorized => "MilestoneCallerUnauthorized",
                 StreamError::TooManyMilestones => "TooManyMilestones",
                 StreamError::TimestampOverflow => "TimestampOverflow",
+                StreamError::TimelockNotFound => "TimelockNotFound",
+                StreamError::TimelockNotReady => "TimelockNotReady",
+                StreamError::TimelockAlreadyExecuted => "TimelockAlreadyExecuted",
+                StreamError::InvalidTimelockDelay => "InvalidTimelockDelay",
+                StreamError::DisputeNotTimedOut => "DisputeNotTimedOut",
             }
         }
     }
@@ -258,7 +273,7 @@ pub(crate) mod test_diagnostics {
         use std::string::ToString;
 
         /// (variant, identifier, documented numeric code) for every variant.
-        const ALL_VARIANTS: [(StreamError, &str, u32); 27] = [
+        const ALL_VARIANTS: [(StreamError, &str, u32); 32] = [
             (StreamError::InvalidAmount, "InvalidAmount", 1),
             (StreamError::StreamNotFound, "StreamNotFound", 2),
             (StreamError::Unauthorized, "Unauthorized", 3),
@@ -314,6 +329,11 @@ pub(crate) mod test_diagnostics {
             ),
             (StreamError::StateVersionTooNew, "StateVersionTooNew", 26),
             (StreamError::TopUpUnsupported, "TopUpUnsupported", 27),
+            (StreamError::TimelockNotFound, "TimelockNotFound", 46),
+            (StreamError::TimelockNotReady, "TimelockNotReady", 47),
+            (StreamError::TimelockAlreadyExecuted, "TimelockAlreadyExecuted", 48),
+            (StreamError::InvalidTimelockDelay, "InvalidTimelockDelay", 49),
+            (StreamError::DisputeNotTimedOut, "DisputeNotTimedOut", 50),
         ];
 
         #[test]

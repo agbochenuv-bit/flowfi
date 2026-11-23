@@ -54,15 +54,17 @@ use events::{
     emit_step_vesting_stream_created, emit_stream_cancelled, emit_stream_closed,
     emit_stream_completed, emit_stream_created, emit_stream_paused, emit_stream_resumed,
     emit_stream_topped_up, emit_tokens_withdrawn, emit_admin_transfer_cancelled,
-    emit_admin_transfer_proposed, AdminTransferCancelledEvent, AdminTransferProposedEvent,
-    AdminTransferredEvent,
+    emit_admin_transfer_proposed, emit_timelock_proposal_cancelled,
+    emit_timelock_proposal_executed, emit_timelock_proposal_proposed, AdminTransferCancelledEvent,
+    AdminTransferProposedEvent, AdminTransferredEvent,
     AllowanceStreamCreatedEvent, ContractUpgradedEvent, DisputeRequestedEvent,
     DisputeResolvedEvent, EmergencyGuardianUpdatedEvent, FeeCollectedEvent, FeeConfigUpdatedEvent,
     HybridCliffStreamCreatedEvent, InitializedEvent, MilestoneConditionUnlockedEvent,
     ProtocolPauseStatusEvent, RecipientTransferredEvent, StateMigratedEvent,
     StepVestingStreamCreatedEvent, StreamCancelledEvent, StreamClosedEvent, StreamCompletedEvent,
     StreamCreatedEvent, StreamPausedEvent, StreamRateModifiedEvent, StreamResumedEvent,
-    StreamToppedUpEvent, TokensWithdrawnEvent,
+    StreamToppedUpEvent, TokensWithdrawnEvent, TimelockProposalCancelledEvent,
+    TimelockProposalExecutedEvent, TimelockProposalProposedEvent,
 };
 use storage::{
     config_exists, get_contract_version, get_recorded_wasm_hash, load_config, load_stream,
@@ -72,9 +74,9 @@ use storage::{
 };
 use types::{
     BatchStreamInput, ConditionalMilestone, DataKey, DisputeStatus, OracleAsset, OracleClient,
-    ProtocolConfig, Stream, StreamStatus, UnlockCondition, VestingSchedule, VestingStep,
-    MAX_BATCH_CREATE, MAX_BATCH_WITHDRAW, MAX_CONDITIONAL_MILESTONES, MAX_VESTING_STEPS,
-    ORACLE_PRICE_MAX_AGE_SECS,
+    PolicyOperation, ProposalStatus, ProtocolConfig, Stream, StreamStatus, TimelockedProposal,
+    UnlockCondition, VestingSchedule, VestingStep, MAX_BATCH_CREATE, MAX_BATCH_WITHDRAW,
+    MAX_CONDITIONAL_MILESTONES, MAX_VESTING_STEPS, ORACLE_PRICE_MAX_AGE_SECS,
 };
 
 /// Maximum allowed protocol fee: 1 000 bps = 10%.
@@ -127,6 +129,8 @@ impl StreamContract {
                 fee_rate_bps,
                 is_protocol_paused: false,
                 emergency_guardian: None,
+                timelock_delay_seconds: 0,
+                dispute_timeout_seconds: 0,
             },
         );
         save_contract_version(&env, CURRENT_DATA_VERSION);
@@ -175,6 +179,8 @@ impl StreamContract {
                 fee_rate_bps,
                 is_protocol_paused: config.is_protocol_paused,
                 emergency_guardian: config.emergency_guardian,
+                timelock_delay_seconds: config.timelock_delay_seconds,
+                dispute_timeout_seconds: config.dispute_timeout_seconds,
             },
         );
 
@@ -227,6 +233,8 @@ impl StreamContract {
                 fee_rate_bps: config.fee_rate_bps,
                 is_protocol_paused: config.is_protocol_paused,
                 emergency_guardian: config.emergency_guardian,
+                timelock_delay_seconds: config.timelock_delay_seconds,
+                dispute_timeout_seconds: config.dispute_timeout_seconds,
             },
         );
 
@@ -351,6 +359,267 @@ impl StreamContract {
         Ok(())
     }
 
+    // ─── Timelocked Policy Changes (#217) ──────────────────────────────────────
+
+    /// Propose a protocol-wide policy change subject to a timelock delay.
+    ///
+    /// The caller must be the protocol admin or the emergency guardian (when the
+    /// operation is guardian-authorized). The proposal is stored with an
+    /// `execute_after` timestamp set `timelock_delay_seconds` in the future.
+    /// While `Pending`, the proposer or the admin may cancel it; once the delay
+    /// elapses, anyone may execute it.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — `initialize` has not been called.
+    /// - `NotAdmin` — caller is neither admin nor a guardian-authorized proposer.
+    /// - `InvalidTimelockDelay` — the configured delay is zero (timelock disabled).
+    pub fn propose_policy_change(
+        env: Env,
+        proposer: Address,
+        operation: PolicyOperation,
+    ) -> Result<u64, StreamError> {
+        let config = load_config(&env)?;
+        proposer.require_auth();
+
+        // Guardian may only propose pause/guardian changes; admin may propose any.
+        let is_admin = config.admin == proposer;
+        let is_guardian = config
+            .emergency_guardian
+            .as_ref()
+            .map(|g| g == &proposer)
+            .unwrap_or(false);
+        if !is_admin && !is_guardian {
+            return Err(StreamError::NotAdmin);
+        }
+        if config.timelock_delay_seconds == 0 {
+            return Err(StreamError::InvalidTimelockDelay);
+        }
+
+        // Guardian-restricted operations.
+        match &operation {
+            PolicyOperation::TransferAdmin { .. } | PolicyOperation::UpdateFeeConfig { .. } => {
+                if !is_admin {
+                    return Err(StreamError::NotAdmin);
+                }
+            }
+            PolicyOperation::SetProtocolPause { .. }
+            | PolicyOperation::SetEmergencyGuardian { .. } => {}
+        }
+
+        let now = env.ledger().timestamp();
+        let execute_after = now
+            .checked_add(config.timelock_delay_seconds)
+            .ok_or(StreamError::TimestampOverflow)?;
+        let id = next_timelock_id(&env);
+
+        save_timelock_proposal(
+            &env,
+            id,
+            &TimelockedProposal {
+                id,
+                proposer: proposer.clone(),
+                operation,
+                execute_after,
+                status: ProposalStatus::Pending,
+                created_at: now,
+            },
+        );
+
+        emit_timelock_proposal_proposed(
+            &env,
+            TimelockProposalProposedEvent {
+                proposal_id: id,
+                proposer,
+                execute_after,
+                timestamp: now,
+            },
+        );
+
+        Ok(id)
+    }
+
+    /// Execute a pending timelocked proposal once its delay has elapsed.
+    ///
+    /// Any caller may execute a proposal whose `execute_after` timestamp has
+    /// passed. Execution replays the stored `PolicyOperation` against the
+    /// current protocol config. The proposal is marked `Executed` before the
+    /// operation runs, so a re-entrant call cannot execute it twice.
+    ///
+    /// # Errors
+    /// - `TimelockNotFound` — no proposal with that id exists.
+    /// - `TimelockNotReady` — the delay has not yet elapsed.
+    /// - `TimelockAlreadyExecuted` — the proposal is no longer pending.
+    pub fn execute_policy_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), StreamError> {
+        let mut proposal = load_timelock_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(StreamError::TimelockAlreadyExecuted);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < proposal.execute_after {
+            return Err(StreamError::TimelockNotReady);
+        }
+
+        proposal.status = ProposalStatus::Executed;
+        save_timelock_proposal(&env, proposal_id, &proposal);
+
+        let config = load_config(&env)?;
+        match proposal.operation {
+            PolicyOperation::UpdateFeeConfig { treasury, fee_rate_bps } => {
+                if fee_rate_bps > MAX_FEE_RATE_BPS {
+                    return Err(StreamError::InvalidFeeRate);
+                }
+                save_config(
+                    &env,
+                    &ProtocolConfig {
+                        admin: config.admin,
+                        treasury,
+                        fee_rate_bps,
+                        is_protocol_paused: config.is_protocol_paused,
+                        emergency_guardian: config.emergency_guardian,
+                        timelock_delay_seconds: config.timelock_delay_seconds,
+                        dispute_timeout_seconds: config.dispute_timeout_seconds,
+                    },
+                );
+                emit_fee_config_updated(
+                    &env,
+                    FeeConfigUpdatedEvent {
+                        admin: caller,
+                        old_treasury: config.treasury,
+                        new_treasury: treasury,
+                        old_fee_rate_bps: config.fee_rate_bps,
+                        new_fee_rate_bps: fee_rate_bps,
+                    },
+                );
+            }
+            PolicyOperation::SetProtocolPause { paused } => {
+                save_config(
+                    &env,
+                    &ProtocolConfig {
+                        admin: config.admin,
+                        treasury: config.treasury,
+                        fee_rate_bps: config.fee_rate_bps,
+                        is_protocol_paused: paused,
+                        emergency_guardian: config.emergency_guardian,
+                        timelock_delay_seconds: config.timelock_delay_seconds,
+                        dispute_timeout_seconds: config.dispute_timeout_seconds,
+                    },
+                );
+                emit_protocol_pause_status(
+                    &env,
+                    ProtocolPauseStatusEvent {
+                        caller,
+                        paused,
+                        timestamp: now,
+                    },
+                );
+            }
+            PolicyOperation::SetEmergencyGuardian { guardian } => {
+                save_config(
+                    &env,
+                    &ProtocolConfig {
+                        admin: config.admin,
+                        treasury: config.treasury,
+                        fee_rate_bps: config.fee_rate_bps,
+                        is_protocol_paused: config.is_protocol_paused,
+                        emergency_guardian: guardian,
+                        timelock_delay_seconds: config.timelock_delay_seconds,
+                        dispute_timeout_seconds: config.dispute_timeout_seconds,
+                    },
+                );
+                emit_emergency_guardian_updated(
+                    &env,
+                    EmergencyGuardianUpdatedEvent {
+                        admin: config.admin,
+                        guardian,
+                    },
+                );
+            }
+            PolicyOperation::TransferAdmin { new_admin } => {
+                save_config(
+                    &env,
+                    &ProtocolConfig {
+                        admin: new_admin.clone(),
+                        treasury: config.treasury,
+                        fee_rate_bps: config.fee_rate_bps,
+                        is_protocol_paused: config.is_protocol_paused,
+                        emergency_guardian: config.emergency_guardian,
+                        timelock_delay_seconds: config.timelock_delay_seconds,
+                        dispute_timeout_seconds: config.dispute_timeout_seconds,
+                    },
+                );
+                emit_admin_transferred(
+                    &env,
+                    AdminTransferredEvent {
+                        previous_admin: config.admin,
+                        new_admin,
+                    },
+                );
+            }
+        }
+
+        emit_timelock_proposal_executed(
+            &env,
+            TimelockProposalExecutedEvent {
+                proposal_id,
+                executor: caller,
+                timestamp: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending timelocked proposal.
+    ///
+    /// Only the proposer or the protocol admin may cancel. A cancelled proposal
+    /// can no longer be executed.
+    ///
+    /// # Errors
+    /// - `TimelockNotFound` — no proposal with that id exists.
+    /// - `TimelockAlreadyExecuted` — the proposal is no longer pending.
+    /// - `Unauthorized` — caller is neither the proposer nor the admin.
+    pub fn cancel_policy_change(
+        env: Env,
+        caller: Address,
+        proposal_id: u64,
+    ) -> Result<(), StreamError> {
+        let mut proposal = load_timelock_proposal(&env, proposal_id)?;
+
+        if proposal.status != ProposalStatus::Pending {
+            return Err(StreamError::TimelockAlreadyExecuted);
+        }
+
+        let config = load_config(&env)?;
+        if caller != proposal.proposer && caller != config.admin {
+            return Err(StreamError::Unauthorized);
+        }
+
+        proposal.status = ProposalStatus::Cancelled;
+        save_timelock_proposal(&env, proposal_id, &proposal);
+
+        emit_timelock_proposal_cancelled(
+            &env,
+            TimelockProposalCancelledEvent {
+                proposal_id,
+                canceller: caller,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Returns the timelocked proposal with the given id, or `None` if absent.
+    pub fn get_pending_timelock_proposal(env: Env, proposal_id: u64) -> Option<TimelockedProposal> {
+        try_load_timelock_proposal(&env, proposal_id)
+    }
+
     // ─── Stream Operations ────────────────────────────────────────────────────
 
     /// Create a new payment stream.
@@ -447,6 +716,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: false,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
 
@@ -712,6 +983,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: false,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
 
@@ -919,6 +1192,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: false,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
 
@@ -1023,6 +1298,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: false,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
 
@@ -1221,6 +1498,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: false,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
         env.storage()
@@ -2500,6 +2779,8 @@ impl StreamContract {
                 arbiter: None,
                 dispute_status: DisputeStatus::None,
                 is_allowance_based: true,
+                dispute_requested_at: None,
+                stream_schema_version: CURRENT_DATA_VERSION,
             },
         );
 
@@ -2546,6 +2827,7 @@ impl StreamContract {
 
         stream.dispute_status = DisputeStatus::Requested;
         let now = env.ledger().timestamp();
+        stream.dispute_requested_at = Some(now);
         save_stream(&env, stream_id, &stream);
 
         env.events().publish(
@@ -2653,6 +2935,66 @@ impl StreamContract {
         } else {
             save_stream(&env, stream_id, &stream);
         }
+
+        Ok(())
+    }
+
+    /// Force-resolve a dispute that has timed out (#220).
+    ///
+    /// Only the protocol admin may call this, and only after
+    /// `ProtocolConfig::dispute_timeout_seconds` has elapsed since
+    /// `dispute_requested_at`. On timeout the dispute is auto-rejected
+    /// (`approved = false`), so the stream remains active and no funds move.
+    ///
+    /// # Errors
+    /// - `NotInitialized` — protocol config has not been initialized.
+    /// - `NotAdmin` — caller is not the current admin.
+    /// - `DisputeNotSupported` — stream has no arbiter configured.
+    /// - `NoActiveDispute` — the stream has no open dispute.
+    /// - `DisputeNotTimedOut` — the timeout window has not yet elapsed.
+    pub fn resolve_dispute_timeout(
+        env: Env,
+        admin: Address,
+        stream_id: u64,
+    ) -> Result<(), StreamError> {
+        let config = load_config(&env)?;
+        admin.require_auth();
+        if config.admin != admin {
+            return Err(StreamError::NotAdmin);
+        }
+
+        let mut stream = load_stream(&env, stream_id)?;
+
+        stream
+            .arbiter
+            .as_ref()
+            .ok_or(StreamError::DisputeNotSupported)?;
+
+        if !matches!(stream.dispute_status, DisputeStatus::Requested) {
+            return Err(StreamError::NoActiveDispute);
+        }
+
+        let requested_at = stream
+            .dispute_requested_at
+            .ok_or(StreamError::NoActiveDispute)?;
+        let now = env.ledger().timestamp();
+        if now < requested_at.saturating_add(config.dispute_timeout_seconds) {
+            return Err(StreamError::DisputeNotTimedOut);
+        }
+
+        stream.dispute_status = DisputeStatus::Resolved(false);
+        stream.dispute_requested_at = None;
+        save_stream(&env, stream_id, &stream);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_resolved"), stream_id),
+            DisputeResolvedEvent {
+                stream_id,
+                arbiter: admin.clone(),
+                approved: false,
+                timestamp: now,
+            },
+        );
 
         Ok(())
     }

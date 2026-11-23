@@ -11,9 +11,11 @@ pub const INSTANCE_BUMP_AMOUNT: u32 = 518_400;
 
 use crate::errors::StreamError;
 use crate::types::{
-    DataKey, DisputeStatus, LegacyProtocolConfig, LegacyStream, ProtocolConfig, Stream,
-    VestingSchedule,
+    DataKey, DisputeStatus, LegacyProtocolConfig, LegacyStream, PolicyOperation, ProposalStatus,
+    ProtocolConfig, Stream, TimelockedProposal, VestingSchedule,
 };
+
+use crate::CURRENT_DATA_VERSION;
 
 // ─── Version-Tolerant Decoding ────────────────────────────────────────────────
 
@@ -164,6 +166,8 @@ fn upgrade_legacy_stream(legacy: LegacyStream) -> Stream {
         arbiter: None,
         dispute_status: DisputeStatus::None,
         is_allowance_based: false,
+        dispute_requested_at: None,
+        stream_schema_version: CURRENT_DATA_VERSION,
     }
 }
 
@@ -268,4 +272,45 @@ pub fn save_recorded_wasm_hash(env: &Env, hash: &soroban_sdk::BytesN<32>) {
     env.storage()
         .instance()
         .set(&DataKey::ContractWasmHash, hash);
+}
+
+// ─── Timelocked Proposals (#217) ───────────────────────────────────────────────
+
+/// Returns the next timelock proposal ID and persists the updated counter.
+pub fn next_timelock_id(env: &Env) -> u64 {
+    let id: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TimelockCounter)
+        .unwrap_or(0)
+        + 1;
+    env.storage().instance().set(&DataKey::TimelockCounter, &id);
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    id
+}
+
+/// Persists a timelocked proposal.
+pub fn save_timelock_proposal(env: &Env, id: u64, proposal: &TimelockedProposal) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::TimelockProposal(id), proposal);
+    env.storage()
+        .persistent()
+        .extend_ttl(
+            &DataKey::TimelockProposal(id),
+            PERSISTENT_LIFETIME_THRESHOLD,
+            PERSISTENT_BUMP_AMOUNT,
+        );
+}
+
+/// Loads a timelocked proposal by ID.
+pub fn load_timelock_proposal(env: &Env, id: u64) -> Result<TimelockedProposal, StreamError> {
+    try_load_timelock_proposal(env, id).ok_or(StreamError::TimelockNotFound)
+}
+
+/// Returns the proposal if it exists, `None` otherwise.
+pub fn try_load_timelock_proposal(env: &Env, id: u64) -> Option<TimelockedProposal> {
+    env.storage().persistent().get(&DataKey::TimelockProposal(id))
 }

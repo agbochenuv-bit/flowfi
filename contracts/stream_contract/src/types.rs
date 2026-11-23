@@ -200,6 +200,10 @@ pub enum DataKey {
     /// Set by `propose_admin_transfer`, cleared by `accept_admin_transfer` or
     /// `cancel_admin_transfer`.
     PendingAdmin,
+    /// Monotonic counter for assigning timelock proposal IDs (#217).
+    TimelockCounter,
+    /// A pending timelocked proposal, keyed by its u64 ID (#217).
+    TimelockProposal(u64),
 }
 
 /// Immutable state of a payment stream.
@@ -266,6 +270,13 @@ pub struct Stream {
     pub dispute_status: DisputeStatus,
     /// Whether this stream uses allowance-based funding (for #1318).
     pub is_allowance_based: bool,
+    /// Timestamp at which the dispute was requested (`None` when no dispute is
+    /// open). Used with `ProtocolConfig::dispute_timeout_seconds` to enforce
+    /// dispute-hold timeouts (#220).
+    pub dispute_requested_at: Option<u64>,
+    /// Storage schema version under which this stream record was written.
+    /// Used by migration hooks to detect and upgrade legacy records (#219).
+    pub stream_schema_version: u32,
 }
 
 /// A single stream to create inside `batch_create_streams`.
@@ -306,6 +317,12 @@ pub struct ProtocolConfig {
     /// Optional guardian permitted to trip — but never to clear — the
     /// circuit breaker. `None` means the admin is the only authority.
     pub emergency_guardian: Option<Address>,
+    /// Minimum delay (in ledger seconds) between a timelocked proposal and its
+    /// execution. Zero means timelocked proposals execute immediately.
+    pub timelock_delay_seconds: u64,
+    /// Maximum age (in ledger seconds) of an open dispute before it times out
+    /// and can be force-resolved by the protocol admin. Zero disables timeouts.
+    pub dispute_timeout_seconds: u64,
 }
 
 /// Pre-v2 shape of [`ProtocolConfig`], persisted by contract versions before
@@ -341,4 +358,59 @@ pub struct LegacyStream {
     pub paused: bool,
     pub paused_at: Option<u64>,
     pub status: StreamStatus,
+}
+
+/// A protocol-wide policy change that has been proposed but not yet executed.
+///
+/// The delay between `created_at` and `execute_after` is enforced by
+/// [`ProtocolConfig::timelock_delay_seconds`] (#217). While pending, the
+/// proposal can be cancelled by its proposer or the protocol admin; once the
+/// delay elapses it can be executed by anyone.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockedProposal {
+    /// Monotonically increasing proposal id.
+    pub id: u64,
+    /// Address that proposed the change; may cancel while pending.
+    pub proposer: Address,
+    /// The policy operation to execute once the delay elapses.
+    pub operation: PolicyOperation,
+    /// Earliest ledger timestamp at which the proposal may be executed.
+    pub execute_after: u64,
+    /// Current lifecycle state of the proposal.
+    pub status: ProposalStatus,
+    /// Ledger timestamp at which the proposal was created.
+    pub created_at: u64,
+}
+
+/// The kind of protocol-wide change that can be timelocked (#217).
+///
+/// Variants carry the parameters needed to replay the underlying admin
+/// entrypoint at execution time, so execution never re-reads mutable state
+/// that could have changed between proposal and execution.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyOperation {
+    /// Update the treasury address and/or fee rate (`update_fee_config`).
+    UpdateFeeConfig { treasury: Address, fee_rate_bps: u32 },
+    /// Trip or clear the protocol circuit breaker (`set_protocol_pause`).
+    SetProtocolPause { paused: bool },
+    /// Set or clear the emergency guardian (`set_emergency_guardian`).
+    SetEmergencyGuardian { guardian: Option<Address> },
+    /// Transfer the protocol admin role (`transfer_admin`).
+    TransferAdmin { new_admin: Address },
+}
+
+/// Lifecycle of a timelocked proposal (#217).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProposalStatus {
+    /// Awaiting the timelock delay; cancellable by proposer or admin.
+    Pending,
+    /// Executed; the operation has been applied.
+    Executed,
+    /// Cancelled before execution; no longer actionable.
+    Cancelled,
+    /// Past `execute_after` without being executed; can be re-proposed.
+    Expired,
 }

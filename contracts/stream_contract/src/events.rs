@@ -441,6 +441,50 @@ pub struct MilestoneConditionUnlockedEvent {
     pub timestamp: u64,
 }
 
+/// Emitted when a timelocked policy change is proposed (#217).
+///
+/// Topic: `("timelock_proposal_proposed", proposal_id)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposalProposedEvent {
+    /// Monotonically increasing proposal id.
+    pub proposal_id: u64,
+    /// Address that proposed the change.
+    pub proposer: Address,
+    /// Earliest ledger timestamp at which the proposal may be executed.
+    pub execute_after: u64,
+    /// Ledger timestamp of the proposal.
+    pub timestamp: u64,
+}
+
+/// Emitted when a timelocked proposal is executed (#217).
+///
+/// Topic: `("timelock_proposal_executed", proposal_id)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposalExecutedEvent {
+    /// The proposal that was executed.
+    pub proposal_id: u64,
+    /// Address that triggered execution.
+    pub executor: Address,
+    /// Ledger timestamp of execution.
+    pub timestamp: u64,
+}
+
+/// Emitted when a timelocked proposal is cancelled (#217).
+///
+/// Topic: `("timelock_proposal_cancelled", proposal_id)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TimelockProposalCancelledEvent {
+    /// The proposal that was cancelled.
+    pub proposal_id: u64,
+    /// Address that cancelled the proposal.
+    pub canceller: Address,
+    /// Ledger timestamp of cancellation.
+    pub timestamp: u64,
+}
+
 // ─── Emission Helpers ────────────────────────────────────────────────────────
 //
 // Every publish site in `lib.rs` routes through one of these helpers so that
@@ -844,4 +888,56 @@ pub fn emit_contract_upgraded(env: &Env, event: ContractUpgradedEvent) {
 pub fn emit_state_migrated(env: &Env, event: StateMigratedEvent) {
     env.events()
         .publish((Symbol::new(env, "state_migrated"),), event);
+}
+
+/// Emit a `timelock_proposal_proposed` event indexed by `proposal_id`.
+///
+/// # Event topic
+/// `("timelock_proposal_proposed", proposal_id: u64)`.
+///
+/// # Emission trigger
+/// `propose_policy_change`, after the proposal has been persisted.
+///
+/// # Parameters
+/// - `env` — the Soroban environment to publish into.
+/// - `event` — the [`TimelockProposalProposedEvent`] payload: proposer,
+///   `execute_after` timestamp, and the ledger `timestamp` of the proposal.
+pub fn emit_timelock_proposal_proposed(env: &Env, event: TimelockProposalProposedEvent) {
+    env.events()
+        .publish((Symbol::new(env, "timelock_proposal_proposed"), event.proposal_id), event);
+}
+
+/// Emit a `timelock_proposal_executed` event indexed by `proposal_id`.
+///
+/// # Event topic
+/// `("timelock_proposal_executed", proposal_id: u64)`.
+///
+/// # Emission trigger
+/// `execute_policy_change`, after the stored operation has been replayed and
+/// the proposal marked `Executed`.
+///
+/// # Parameters
+/// - `env` — the Soroban environment to publish into.
+/// - `event` — the [`TimelockProposalExecutedEvent`] payload: executor and the
+///   ledger `timestamp` of execution.
+pub fn emit_timelock_proposal_executed(env: &Env, event: TimelockProposalExecutedEvent) {
+    env.events()
+        .publish((Symbol::new(env, "timelock_proposal_executed"), event.proposal_id), event);
+}
+
+/// Emit a `timelock_proposal_cancelled` event indexed by `proposal_id`.
+///
+/// # Event topic
+/// `("timelock_proposal_cancelled", proposal_id: u64)`.
+///
+/// # Emission trigger
+/// `cancel_policy_change`, after the proposal has been marked `Cancelled`.
+///
+/// # Parameters
+/// - `env` — the Soroban environment to publish into.
+/// - `event` — the [`TimelockProposalCancelledEvent`] payload: canceller and
+///   the ledger `timestamp` of cancellation.
+pub fn emit_timelock_proposal_cancelled(env: &Env, event: TimelockProposalCancelledEvent) {
+    env.events()
+        .publish((Symbol::new(env, "timelock_proposal_cancelled"), event.proposal_id), event);
 }
