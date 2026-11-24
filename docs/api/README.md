@@ -23,3 +23,8 @@ This directory contains hand-maintained Postman/Hoppscotch collections for explo
 3. If a collection and the Swagger spec ever disagree, the Swagger spec wins.
 
 See the [financial glossary](../ux/FINANCIAL_GLOSSARY.md) for amount sources, freshness, and transaction status terminology.
+
+## Feature Specifications
+
+- [Organizations API](./ORGANIZATIONS.md) — Wallet-linked organization membership, role/action matrix, treasury summary, and multi-network scoping.
+- [Stream Reads, Search, Chain Freshness, and Wallet-Scoped API Credentials](./STREAMS_READ_AND_CREDENTIALS.md) — Bounded multi-stream reads (#229), normalized search/filter semantics (#230), chain freshness & finality metadata (#231), and wallet-scoped API credentials (#232).

@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import authRoutes from './auth.routes.js';
+import credentialsRoutes from './credentials.routes.js';
 import streamRoutes from './stream.routes.js';
 import eventsRoutes from './events.routes.js';
 import webhookRoutes from './webhook.routes.js';
@@ -23,6 +24,9 @@ const router = Router();
 
 // Authentication — wallet challenge / verify flow
 router.use('/auth', authRoutes);
+
+// Wallet-scoped API credentials for integrations (requires wallet JWT session)
+router.use('/credentials', credentialsRoutes);
 
 // Organizations — wallet-linked membership, invitations, and treasury summary
 router.use('/organizations', organizationRoutes);

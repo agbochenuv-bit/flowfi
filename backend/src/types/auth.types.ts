@@ -1,16 +1,24 @@
-import { Request } from 'express';
+import type { Request } from 'express';
+import type { ApiCredentialScope } from '../services/api-credential.service.js';
+
+export type AuthMethod = 'jwt' | 'api_key';
 
 /**
  * Authenticated wallet user attached to a request after successful
- * wallet-signature verification.
+ * wallet-signature verification or wallet-scoped API credential verification.
  *
  * `sessionId` identifies the server-side wallet session that authorized the
  * request. It is an opaque, non-secret identifier (never a signing key or
  * signature) and is used to inventory and revoke sessions.
  */
 export interface AuthenticatedUser {
-  walletAddress: string;
-  sessionId: string;
+  publicKey: string;
+  walletAddress?: string | undefined;
+  sessionId?: string | undefined;
+  authMethod?: AuthMethod | undefined;
+  credentialId?: string | undefined;
+  credentialKeyPrefix?: string | undefined;
+  scopes?: ApiCredentialScope[] | undefined;
 }
 
 /**

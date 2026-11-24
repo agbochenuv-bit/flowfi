@@ -74,25 +74,49 @@ export const getStreamVersion = async (streamId: bigint): Promise<number | null>
   return stream?.version ?? null;
 };
 
-type StreamWhere = {
-  sender?: string;
-  recipient?: string;
-  tokenAddress?: string;
+type StreamStatusFilter = 'active' | 'paused' | 'cancelled' | 'completed';
+
+type StreamStatusCondition = {
   isActive?: boolean;
   isPaused?: boolean;
   events?: { some: { eventType: string } };
 };
 
+type StreamWhere = {
+  sender?: string | { contains: string; mode: 'insensitive' };
+  recipient?: string | { contains: string; mode: 'insensitive' };
+  tokenAddress?: string | { contains: string; mode: 'insensitive' };
+  streamId?: bigint;
+  isActive?: boolean;
+  isPaused?: boolean;
+  events?: { some: { eventType: string } };
+  startTime?: { gte?: bigint; lte?: bigint };
+  endTime?: { gte?: bigint; lte?: bigint };
+  createdAt?: { gte?: Date; lte?: Date };
+  AND?: StreamWhere[];
+  OR?: StreamWhere[];
+};
+
 export interface FindStreamsParams {
-  status?: 'active' | 'paused' | 'cancelled' | 'completed';
-  sender?: string;
-  recipient?: string;
-  tokenAddress?: string;
+  status?: StreamStatusFilter | undefined;
+  statuses?: StreamStatusFilter[] | undefined;
+  sender?: string | undefined;
+  recipient?: string | undefined;
+  participant?: string | undefined;
+  tokenAddress?: string | undefined;
+  search?: string | undefined;
+  searchStreamId?: bigint | undefined;
+  startTimeFrom?: bigint | undefined;
+  startTimeTo?: bigint | undefined;
+  endTimeFrom?: bigint | undefined;
+  endTimeTo?: bigint | undefined;
+  createdAfter?: Date | undefined;
+  createdBefore?: Date | undefined;
   limit: number;
   offset: number;
-  cursor?: string;
-  sortField?: string;
-  sortOrder?: 'asc' | 'desc';
+  cursor?: string | undefined;
+  sortField?: string | undefined;
+  sortOrder?: 'asc' | 'desc' | undefined;
 }
 
 export interface FindStreamsResult {
@@ -102,32 +126,92 @@ export interface FindStreamsResult {
   nextCursor: string | null;
 }
 
-export const findStreams = async (params: FindStreamsParams): Promise<FindStreamsResult> => {
+function statusToCondition(status: StreamStatusFilter): StreamStatusCondition {
+  switch (status) {
+    case 'active':
+      return { isActive: true, isPaused: false };
+    case 'paused':
+      return { isPaused: true };
+    case 'cancelled':
+      return { isActive: false, events: { some: { eventType: 'CANCELLED' } } };
+    case 'completed':
+      return { isActive: false, events: { some: { eventType: 'COMPLETED' } } };
+  }
+}
+
+export function buildStreamWhere(params: FindStreamsParams): StreamWhere {
   const where: StreamWhere = {};
+  const andConditions: StreamWhere[] = [];
 
   if (params.sender) where.sender = params.sender;
   if (params.recipient) where.recipient = params.recipient;
   if (params.tokenAddress) where.tokenAddress = params.tokenAddress;
 
-  if (params.status) {
-    switch (params.status) {
-      case 'active':
-        where.isActive = true;
-        where.isPaused = false;
-        break;
-      case 'paused':
-        where.isPaused = true;
-        break;
-      case 'cancelled':
-        where.isActive = false;
-        where.events = { some: { eventType: 'CANCELLED' } };
-        break;
-      case 'completed':
-        where.isActive = false;
-        where.events = { some: { eventType: 'COMPLETED' } };
-        break;
-    }
+  if (params.participant) {
+    andConditions.push({
+      OR: [{ sender: params.participant }, { recipient: params.participant }],
+    });
   }
+
+  const effectiveStatuses: StreamStatusFilter[] = [];
+  if (params.statuses && params.statuses.length > 0) {
+    effectiveStatuses.push(...params.statuses);
+  }
+  if (params.status && !effectiveStatuses.includes(params.status)) {
+    effectiveStatuses.push(params.status);
+  }
+
+  if (effectiveStatuses.length === 1) {
+    const onlyStatus = effectiveStatuses[0]!;
+    Object.assign(where, statusToCondition(onlyStatus));
+  } else if (effectiveStatuses.length > 1) {
+    andConditions.push({
+      OR: effectiveStatuses.map((s) => statusToCondition(s)),
+    });
+  }
+
+  if (params.search) {
+    const searchClauses: StreamWhere[] = [
+      { sender: { contains: params.search, mode: 'insensitive' } },
+      { recipient: { contains: params.search, mode: 'insensitive' } },
+      { tokenAddress: { contains: params.search, mode: 'insensitive' } },
+    ];
+    if (params.searchStreamId !== undefined) {
+      searchClauses.unshift({ streamId: params.searchStreamId });
+    }
+    andConditions.push({ OR: searchClauses });
+  }
+
+  if (params.startTimeFrom !== undefined || params.startTimeTo !== undefined) {
+    where.startTime = {
+      ...(params.startTimeFrom !== undefined ? { gte: params.startTimeFrom } : {}),
+      ...(params.startTimeTo !== undefined ? { lte: params.startTimeTo } : {}),
+    };
+  }
+
+  if (params.endTimeFrom !== undefined || params.endTimeTo !== undefined) {
+    where.endTime = {
+      ...(params.endTimeFrom !== undefined ? { gte: params.endTimeFrom } : {}),
+      ...(params.endTimeTo !== undefined ? { lte: params.endTimeTo } : {}),
+    };
+  }
+
+  if (params.createdAfter !== undefined || params.createdBefore !== undefined) {
+    where.createdAt = {
+      ...(params.createdAfter !== undefined ? { gte: params.createdAfter } : {}),
+      ...(params.createdBefore !== undefined ? { lte: params.createdBefore } : {}),
+    };
+  }
+
+  if (andConditions.length > 0) {
+    where.AND = andConditions;
+  }
+
+  return where;
+}
+
+export const findStreams = async (params: FindStreamsParams): Promise<FindStreamsResult> => {
+  const where = buildStreamWhere(params);
 
   const sortField = params.sortField || 'startTime';
   const sortOrder = params.sortOrder || 'desc';
