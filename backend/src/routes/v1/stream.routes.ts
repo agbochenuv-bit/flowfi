@@ -1,8 +1,14 @@
 import { Router } from 'express';
-import { requireAuth } from '../../middleware/auth.js';
+import {
+  optionalAuthWithScope,
+  requireAuth,
+  requireScope,
+} from '../../middleware/auth.js';
 import {
   createStream,
   listStreams,
+  batchReadStreams,
+  getChainFreshness,
   getStream,
   getStreamEvents,
   getStreamClaimableAmount,
@@ -23,11 +29,18 @@ const router = Router();
  * /v1/streams:
  *   get:
  *     tags: [Streams]
- *     summary: List streams
+ *     summary: List and search streams with normalized filter semantics
  *     description: |
- *       Returns a paginated list of streams optionally filtered by sender,
- *       recipient, status, or token address.
+ *       Returns a paginated list of streams with normalized search (`q` / `search`),
+ *       participant (`participant` / `address`), sender, recipient, multi-status
+ *       (`status=active,paused`), token (`token` / `tokenAddress`), and time-range
+ *       filters, plus canonical `appliedFilters` and explicit chain `freshness`
+ *       metadata.
  *     parameters:
+ *       - in: query
+ *         name: q
+ *         schema: { type: string, maxLength: 128 }
+ *         description: Normalized search term matching streamId or sender/recipient/token substring
  *       - in: query
  *         name: sender
  *         schema: { type: string }
@@ -35,37 +48,143 @@ const router = Router();
  *         name: recipient
  *         schema: { type: string }
  *       - in: query
+ *         name: participant
+ *         schema: { type: string }
+ *         description: Match streams where the address is either sender or recipient (alias `address`)
+ *       - in: query
  *         name: status
- *         schema: { type: string, enum: [active, cancelled, completed, paused] }
+ *         schema: { type: string }
+ *         description: Single or comma-separated statuses (`active`, `paused`, `cancelled`, `completed`)
  *       - in: query
  *         name: token
  *         schema: { type: string }
+ *         description: Token contract address (alias `tokenAddress`)
+ *       - in: query
+ *         name: startTimeFrom
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: startTimeTo
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: endTimeFrom
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: endTimeTo
+ *         schema: { type: integer }
+ *       - in: query
+ *         name: createdAfter
+ *         schema: { type: string }
+ *       - in: query
+ *         name: createdBefore
+ *         schema: { type: string }
  *       - in: query
  *         name: sort
- *         schema: { type: string }
+ *         schema: { type: string, enum: [createdAt, startTime, lastUpdateTime, depositedAmount, endTime, streamId] }
  *       - in: query
  *         name: order
  *         schema: { type: string, enum: [asc, desc] }
  *       - in: query
  *         name: limit
- *         schema: { type: integer }
+ *         schema: { type: integer, minimum: 1, maximum: 100 }
  *       - in: query
  *         name: offset
- *         schema: { type: integer }
+ *         schema: { type: integer, minimum: 0 }
+ *       - in: query
+ *         name: page
+ *         schema: { type: integer, minimum: 1 }
  *       - in: query
  *         name: cursor
  *         schema: { type: string }
+ *       - in: query
+ *         name: network
+ *         schema: { type: string, enum: [testnet, mainnet] }
  *     responses:
  *       200:
- *         description: Paginated stream list
+ *         description: Paginated stream list with appliedFilters and chain freshness metadata
  *         content:
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/StreamListResponse'
  *       400:
- *         description: Invalid query parameters
+ *         description: Invalid or conflicting query parameters
+ *       401:
+ *         description: Invalid, expired, or revoked API credential
+ *       403:
+ *         description: API credential lacks `streams:read` scope
+ *       409:
+ *         description: Requested network does not match configured indexer network
  */
-router.get('/', listStreams);
+router.get('/', optionalAuthWithScope('streams:read'), listStreams);
+
+/**
+ * @openapi
+ * /v1/streams/freshness:
+ *   get:
+ *     tags: [Streams]
+ *     summary: Inspect chain freshness and finality metadata
+ *     description: |
+ *       Exposes explicit indexer freshness, ledger lag, verified checkpoint
+ *       status, finality classification, and operator/client recovery guidance.
+ *       Also sets `X-Chain-*` response headers for lightweight monitoring.
+ *     parameters:
+ *       - in: query
+ *         name: includeNetworkTip
+ *         schema: { type: boolean, default: true }
+ *       - in: query
+ *         name: network
+ *         schema: { type: string, enum: [testnet, mainnet] }
+ *     responses:
+ *       200:
+ *         description: Explicit chain freshness and finality metadata
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/ChainFreshness'
+ *       401:
+ *         description: Invalid, expired, or revoked API credential
+ *       403:
+ *         description: API credential lacks `streams:read` scope
+ *       409:
+ *         description: Requested network does not match configured indexer network
+ */
+router.get('/freshness', optionalAuthWithScope('streams:read'), getChainFreshness);
+
+/**
+ * @openapi
+ * /v1/streams/batch-read:
+ *   post:
+ *     tags: [Streams]
+ *     summary: Bounded multi-stream read endpoint
+ *     description: |
+ *       Fetches up to 50 streams in a single bounded database query, preserving
+ *       deduplicated caller order and returning explicit per-item status
+ *       (`found`, `not_found`, `error`), `missingStreamIds`, `failedStreamIds`,
+ *       optional claimable calculations, and chain freshness metadata.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/BatchStreamReadRequest'
+ *     responses:
+ *       200:
+ *         description: Bounded multi-stream read result
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/BatchStreamReadResponse'
+ *       400:
+ *         description: Invalid streamIds or batch size exceeded (max 50)
+ *       401:
+ *         description: Invalid, expired, or revoked API credential
+ *       403:
+ *         description: API credential lacks `streams:read` scope
+ *       409:
+ *         description: Requested network does not match configured indexer network
+ *       503:
+ *         description: Indexed stream store temporarily unavailable (retryable)
+ */
+router.post('/batch-read', optionalAuthWithScope('streams:read'), batchReadStreams);
 
 /**
  * @openapi
@@ -116,7 +235,7 @@ router.get('/', listStreams);
  *           The response includes `code: POLICY_EVALUATION_FAILED` and the audit
  *           fields `policyId`, `decision`, `reason`, and `evaluatedAt`.
  */
-router.post('/', requireAuth, createStream);
+router.post('/', requireAuth, requireScope('streams:write'), createStream);
 
 /**
  * @openapi
@@ -169,7 +288,7 @@ router.get('/users/:address/summary', getUserStreamSummary);
  *       404:
  *         description: Stream not found
  */
-router.get('/:streamId', getStream);
+router.get('/:streamId', optionalAuthWithScope('streams:read'), getStream);
 
 /**
  * @openapi
@@ -205,7 +324,7 @@ router.get('/:streamId', getStream);
  *       404:
  *         description: Stream not found
  */
-router.get('/:streamId/events', getStreamEvents);
+router.get('/:streamId/events', optionalAuthWithScope('streams:read'), getStreamEvents);
 
 /**
  * @openapi
@@ -230,7 +349,7 @@ router.get('/:streamId/events', getStreamEvents);
  *       404:
  *         description: Stream not found
  */
-router.get('/:streamId/claimable', getStreamClaimableAmount);
+router.get('/:streamId/claimable', optionalAuthWithScope('streams:read'), getStreamClaimableAmount);
 
 /**
  * @openapi
@@ -313,7 +432,7 @@ router.get('/:streamId/readiness', requireAuth, getStreamReadinessHandler);
  *             schema:
  *               $ref: '#/components/schemas/StreamVersionConflict'
  */
-router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
+router.post('/:streamId/top-up', requireAuth, requireScope('streams:write'), topUpStreamHandler);
 
 /**
  * @openapi
@@ -350,7 +469,7 @@ router.post('/:streamId/top-up', requireAuth, topUpStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/StreamVersionConflict'
  */
-router.post('/:streamId/pause', requireAuth, pauseStream);
+router.post('/:streamId/pause', requireAuth, requireScope('streams:write'), pauseStream);
 
 /**
  * @openapi
@@ -387,7 +506,7 @@ router.post('/:streamId/pause', requireAuth, pauseStream);
  *             schema:
  *               $ref: '#/components/schemas/StreamVersionConflict'
  */
-router.post('/:streamId/resume', requireAuth, resumeStream);
+router.post('/:streamId/resume', requireAuth, requireScope('streams:write'), resumeStream);
 
 /**
  * @openapi
@@ -424,7 +543,7 @@ router.post('/:streamId/resume', requireAuth, resumeStream);
  *             schema:
  *               $ref: '#/components/schemas/StreamVersionConflict'
  */
-router.post('/:streamId/cancel', requireAuth, cancelStreamHandler);
+router.post('/:streamId/cancel', requireAuth, requireScope('streams:write'), cancelStreamHandler);
 
 /**
  * @openapi
@@ -461,6 +580,6 @@ router.post('/:streamId/cancel', requireAuth, cancelStreamHandler);
  *             schema:
  *               $ref: '#/components/schemas/StreamVersionConflict'
  */
-router.post('/:streamId/withdraw', requireAuth, withdrawHandler);
+router.post('/:streamId/withdraw', requireAuth, requireScope('streams:write'), withdrawHandler);
 
 export default router;

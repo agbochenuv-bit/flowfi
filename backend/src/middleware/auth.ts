@@ -2,6 +2,12 @@ import type { Request, Response, NextFunction } from 'express';
 import * as crypto from 'crypto';
 import * as StellarSdk from '@stellar/stellar-sdk';
 import type { AuthenticatedRequest } from '../types/auth.types.js';
+import {
+  isApiCredentialToken,
+  recordCredentialScopeDenial,
+  verifyApiCredential,
+  type ApiCredentialScope,
+} from '../services/api-credential.service.js';
 import logger from '../logger.js';
 
 const isProduction = process.env.NODE_ENV === 'production';
@@ -680,7 +686,84 @@ export function verifyChallenge(req: Request, res: Response): void {
 
 // ─── Auth middleware ─────────────────────────────────────────────────────────
 
+function readHeaderString(value: string | string[] | undefined): string | undefined {
+  if (typeof value === 'string') return value;
+  if (Array.isArray(value)) return value[0];
+  return undefined;
+}
+
+/**
+ * Extract a wallet-scoped API credential from `X-API-Key`,
+ * `Authorization: ApiKey <secret>`, or `Authorization: Bearer ffk_<...>`.
+ */
+export function extractApiCredentialFromRequest(req: Request): string | null {
+  const apiKeyHeader = readHeaderString(req.headers['x-api-key']);
+  if (apiKeyHeader && apiKeyHeader.trim().length > 0) {
+    return apiKeyHeader.trim();
+  }
+
+  const authHeader = readHeaderString(req.headers.authorization);
+  if (!authHeader) return null;
+
+  if (/^ApiKey\s+/i.test(authHeader)) {
+    const token = authHeader.replace(/^ApiKey\s+/i, '').trim();
+    return token.length > 0 ? token : null;
+  }
+
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7).trim();
+    if (isApiCredentialToken(token)) {
+      return token;
+    }
+  }
+
+  return null;
+}
+
+function getRequestContextMeta(req: Request): {
+  requestId?: string | undefined;
+  ip?: string | undefined;
+  userAgent?: string | undefined;
+} {
+  const requestId = readHeaderString(req.headers['x-request-id']);
+  const userAgent = readHeaderString(req.headers['user-agent']);
+  return {
+    ...(requestId ? { requestId } : {}),
+    ...(req.ip ? { ip: req.ip } : {}),
+    ...(userAgent ? { userAgent } : {}),
+  };
+}
+
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
+  const rawApiKey = extractApiCredentialFromRequest(req);
+  if (rawApiKey !== null) {
+    const verified = verifyApiCredential(rawApiKey, getRequestContextMeta(req));
+    if (!verified.ok) {
+      res.status(verified.status).json({
+        error: {
+          code: verified.code,
+          message: verified.message,
+          details: {
+            ...(verified.details ?? {}),
+            recoveryHint: verified.recoveryHint,
+          },
+        },
+      });
+      return;
+    }
+
+    (req as AuthenticatedRequest).user = {
+      publicKey: verified.credential.walletAddress,
+      walletAddress: verified.credential.walletAddress,
+      authMethod: 'api_key',
+      credentialId: verified.credential.credentialId,
+      credentialKeyPrefix: verified.credential.keyPrefix,
+      scopes: verified.credential.scopes,
+    };
+    next();
+    return;
+  }
+
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) {
     res.status(401).json({ error: 'Unauthorized', message: 'Missing Bearer token' });
@@ -696,16 +779,158 @@ export function requireAuth(req: Request, res: Response, next: NextFunction): vo
   }
   (req as AuthenticatedRequest).user = {
     publicKey: payload.publicKey,
+    walletAddress: payload.publicKey,
     sessionId: payload.sessionId,
+    authMethod: 'jwt',
   };
   next();
+}
+
+/**
+ * Enforce that the request authenticated via a wallet-signed JWT session, not
+ * a wallet-scoped API credential. Prevents leaked API keys from managing
+ * credentials or invoking privileged admin endpoints.
+ */
+export function requireWalletSessionAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  const user = (req as AuthenticatedRequest).user;
+  if (!user?.publicKey) {
+    res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+    return;
+  }
+  if (user.authMethod === 'api_key') {
+    res.status(403).json({
+      error: {
+        code: 'WALLET_SESSION_REQUIRED',
+        message: 'This endpoint requires a wallet-signed session; API credentials are not permitted.',
+        details: {
+          recoveryHint:
+            'Authenticate via POST /v1/auth/challenge and POST /v1/auth/verify using your wallet.',
+        },
+      },
+    });
+    return;
+  }
+  next();
+}
+
+/**
+ * Enforce API credential scopes on protected routes.
+ * Wallet-signed JWT sessions pass through unchanged; API credentials must hold
+ * every required scope or receive 403 `INSUFFICIENT_SCOPE`.
+ */
+export function requireScope(
+  ...requiredScopes: ApiCredentialScope[]
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const user = (req as AuthenticatedRequest).user;
+    if (!user?.publicKey) {
+      res.status(401).json({ error: 'Unauthorized', message: 'Authentication required' });
+      return;
+    }
+    if (user.authMethod !== 'api_key') {
+      next();
+      return;
+    }
+
+    const granted = user.scopes ?? [];
+    const missing = requiredScopes.filter((scope) => !granted.includes(scope));
+    if (missing.length > 0) {
+      if (user.credentialId) {
+        recordCredentialScopeDenial({
+          credentialId: user.credentialId,
+          keyPrefix: user.credentialKeyPrefix,
+          walletAddress: user.publicKey,
+          grantedScopes: granted,
+          requiredScopes,
+          ...getRequestContextMeta(req),
+        });
+      }
+      res.status(403).json({
+        error: {
+          code: 'INSUFFICIENT_SCOPE',
+          message: `API credential lacks required scope(s): ${missing.join(', ')}`,
+          details: {
+            requiredScopes: [...requiredScopes],
+            missingScopes: missing,
+            grantedScopes: [...granted],
+            recoveryHint: `Create or rotate an API credential with scope(s): ${missing.join(', ')}.`,
+          },
+        },
+      });
+      return;
+    }
+
+    next();
+  };
+}
+
+/**
+ * Optional authentication middleware for public read routes that still enforces
+ * validity and required scopes whenever a caller explicitly presents an API
+ * credential. Anonymous requests continue untouched.
+ */
+export function optionalAuthWithScope(
+  ...requiredScopes: ApiCredentialScope[]
+): (req: Request, res: Response, next: NextFunction) => void {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const rawApiKey = extractApiCredentialFromRequest(req);
+    if (rawApiKey === null) {
+      next();
+      return;
+    }
+
+    const verified = verifyApiCredential(rawApiKey, {
+      requiredScopes,
+      ...getRequestContextMeta(req),
+    });
+
+    if (!verified.ok) {
+      res.status(verified.status).json({
+        error: {
+          code: verified.code,
+          message: verified.message,
+          details: {
+            ...(verified.details ?? {}),
+            recoveryHint: verified.recoveryHint,
+          },
+        },
+      });
+      return;
+    }
+
+    (req as AuthenticatedRequest).user = {
+      publicKey: verified.credential.walletAddress,
+      walletAddress: verified.credential.walletAddress,
+      authMethod: 'api_key',
+      credentialId: verified.credential.credentialId,
+      credentialKeyPrefix: verified.credential.keyPrefix,
+      scopes: verified.credential.scopes,
+    };
+    next();
+  };
 }
 
 export function requireAdmin(req: Request, res: Response, next: NextFunction): void {
   requireAuth(req, res, () => {
     const user = (req as AuthenticatedRequest).user;
+    if (user?.authMethod === 'api_key') {
+      res.status(403).json({
+        error: {
+          code: 'WALLET_SESSION_REQUIRED',
+          message: 'Admin endpoints require a wallet-signed session, not an API credential',
+          details: {
+            recoveryHint: 'Authenticate with the admin wallet via POST /v1/auth/verify.',
+          },
+        },
+      });
+      return;
+    }
     const adminKey = process.env.ADMIN_PUBLIC_KEY;
-    if (!adminKey || user.publicKey !== adminKey) {
+    if (!adminKey || user?.publicKey !== adminKey) {
       res.status(403).json({ error: 'Forbidden', message: 'Admin access required' });
       return;
     }

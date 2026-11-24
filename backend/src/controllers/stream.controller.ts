@@ -28,10 +28,21 @@ import {
 } from "../repositories/streamEvent.repository.js";
 import { findStreams } from "../repositories/stream.repository.js";
 import { sendApiError } from "../types/api-error.js";
+import { sendApiError as sendNormalizedApiError } from "../lib/api-error.js";
 import { getConfiguredStellarNetwork } from "../lib/stellar-network.js";
-
-const DEFAULT_STREAM_PAGE_SIZE = 20;
-const MAX_STREAM_PAGE_SIZE = 100;
+import {
+  normalizeStreamSearchQuery,
+  StreamQueryValidationError,
+} from "../lib/stream-query.js";
+import {
+  BatchStreamReadError,
+  executeBatchStreamRead,
+  validateBatchStreamReadRequest,
+} from "../services/stream-read.service.js";
+import {
+  attachFreshnessHeaders,
+  getChainFreshnessMetadata,
+} from "../services/freshness.service.js";
 
 /**
  * Hard cap on the number of streams fetched per user in the summary endpoint.
@@ -278,98 +289,128 @@ export const createStream = async (req: Request, res: Response) => {
 };
 
 /**
- * List streams by sender, recipient, status, token with sorting and pagination
+ * List streams with normalized search, filter, sort, pagination, and explicit
+ * chain freshness metadata (issues #230, #231).
  */
 export const listStreams = async (req: Request, res: Response) => {
   try {
-    if (req.query.network !== undefined && req.query.network !== getConfiguredStellarNetwork()) {
-      return sendApiError(
-        res,
-        409,
-        "NETWORK_MISMATCH",
-        `This indexer serves ${getConfiguredStellarNetwork()}, not ${String(req.query.network)}.`,
-      );
-    }
-
-    const {
-      sender,
-      recipient,
-      status,
-      token,
-      sort = "createdAt",
-      order = "desc",
-      limit = "20",
-      offset = "0",
-      cursor,
-    } = req.query;
-
-    // Validate status parameter
-    if (typeof status === "string") {
-      const validStatuses = ["active", "cancelled", "completed", "paused"];
-      if (!validStatuses.includes(status)) {
-        return sendApiError(res, 400, "INVALID_STATUS", `status must be one of: ${validStatuses.join(", ")}`);
-      }
-    }
-
-    // Validate sort field
-    const validSortFields = [
-      "createdAt",
-      "startTime",
-      "lastUpdateTime",
-      "depositedAmount",
-      "endTime",
-    ];
-    const sortField = validSortFields.includes(
-      typeof sort === "string" ? sort : "createdAt",
-    )
-      ? (sort as
-          | "createdAt"
-          | "startTime"
-          | "lastUpdateTime"
-          | "depositedAmount"
-          | "endTime")
-      : "createdAt";
-
-    // Validate and parse pagination parameters
-    const parsedLimit = Math.min(
-      typeof limit === "string"
-        ? Number.parseInt(limit, 10) || DEFAULT_STREAM_PAGE_SIZE
-        : DEFAULT_STREAM_PAGE_SIZE,
-      MAX_STREAM_PAGE_SIZE,
+    const { params, appliedFilters } = normalizeStreamSearchQuery(
+      req.query as Record<string, unknown>,
     );
-    const parsedOffset = typeof offset === 'string' ? Math.max(0, Number.parseInt(offset, 10) || 0) : 0;
-    const parsedCursor = typeof cursor === 'string' && /^\d+$/.test(cursor) ? cursor : undefined;
-    if (cursor !== undefined && !parsedCursor) {
-      return sendApiError(res, 400, "INVALID_CURSOR", "cursor must be a numeric stream ID");
-    }
 
-    const params: import("../repositories/stream.repository.js").FindStreamsParams = {
-      limit: parsedLimit,
-      offset: parsedOffset,
-      sortField,
-      sortOrder: order === "asc" ? "asc" : "desc",
-    };
-    if (parsedCursor) params.cursor = parsedCursor;
-    if (typeof sender === "string") params.sender = sender;
-    if (typeof recipient === "string") params.recipient = recipient;
-    if (typeof token === "string") params.tokenAddress = token;
-    if (typeof status === "string") {
-      params.status = status as 'active' | 'cancelled' | 'completed' | 'paused';
-    }
+    const [result, freshness] = await Promise.all([
+      findStreams(params),
+      getChainFreshnessMetadata({ source: "indexer" }),
+    ]);
 
-    const result = await findStreams(params);
+    attachFreshnessHeaders(res, freshness);
 
     return res.status(200).json({
       data: result.streams,
       total: result.total,
       hasMore: result.hasMore,
-      limit: parsedLimit,
-      offset: parsedOffset,
+      limit: params.limit,
+      offset: params.offset,
       nextCursor: result.nextCursor,
+      appliedFilters,
+      freshness,
     });
   } catch (error) {
+    if (error instanceof StreamQueryValidationError) {
+      sendNormalizedApiError(res, {
+        status: error.status,
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      });
+      return;
+    }
     logger.error("Error listing streams:", error);
-    return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
+    sendNormalizedApiError(res, {
+      status: 500,
+      code: "INTERNAL_SERVER_ERROR",
+      message: "A technical error occurred. Please try again later.",
+    });
+    return;
+  }
+};
+
+/**
+ * Bounded multi-stream read endpoint (issue #229).
+ *
+ * Fetches up to 50 streams in a single bounded database query, preserving
+ * deduplicated caller order, isolating per-item errors, and returning explicit
+ * missing/failed IDs alongside chain freshness metadata.
+ */
+export const batchReadStreams = async (req: Request, res: Response) => {
+  try {
+    const validated = validateBatchStreamReadRequest(
+      req.body,
+      req.query["network"],
+    );
+    const result = await executeBatchStreamRead(validated);
+    attachFreshnessHeaders(res, result.freshness);
+    return res.status(200).json(result);
+  } catch (error) {
+    if (error instanceof BatchStreamReadError) {
+      sendNormalizedApiError(res, {
+        status: error.status,
+        code: error.code,
+        message: error.message,
+        details: error.details,
+      });
+      return;
+    }
+    logger.error("Error in batchReadStreams:", error);
+    sendNormalizedApiError(res, {
+      status: 500,
+      code: "INTERNAL_SERVER_ERROR",
+      message: "A technical error occurred. Please try again later.",
+    });
+    return;
+  }
+};
+
+/**
+ * Expose explicit chain freshness and finality metadata for clients and
+ * operators (issue #231).
+ */
+export const getChainFreshness = async (req: Request, res: Response) => {
+  try {
+    const configuredNetwork = getConfiguredStellarNetwork();
+    const rawNetwork = req.query["network"];
+    if (
+      typeof rawNetwork === "string" &&
+      rawNetwork.trim().toLowerCase() !== configuredNetwork
+    ) {
+      sendNormalizedApiError(res, {
+        status: 409,
+        code: "NETWORK_MISMATCH",
+        message: `This indexer serves ${configuredNetwork}, not ${rawNetwork}.`,
+        details: {
+          configuredNetwork,
+          requestedNetwork: rawNetwork,
+          recoveryHint: `Query freshness against the ${configuredNetwork} endpoint.`,
+        },
+      });
+      return;
+    }
+
+    const includeNetworkTip = req.query["includeNetworkTip"] !== "false";
+    const freshness = await getChainFreshnessMetadata({
+      source: "indexer",
+      includeNetworkTip,
+    });
+    attachFreshnessHeaders(res, freshness);
+    return res.status(200).json(freshness);
+  } catch (error) {
+    logger.error("Error fetching chain freshness:", error);
+    sendNormalizedApiError(res, {
+      status: 500,
+      code: "INTERNAL_SERVER_ERROR",
+      message: "Unable to determine chain freshness metadata.",
+    });
+    return;
   }
 };
 
@@ -403,20 +444,32 @@ export const getStream = async (req: Request, res: Response) => {
       if (!chainStream) {
         return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
       }
-      return res.status(200).json({ ...chainStream, source: "chain" });
+      const freshness = await getChainFreshnessMetadata({ source: "chain" });
+      attachFreshnessHeaders(res, freshness);
+      return res.status(200).json({ ...chainStream, source: "chain", freshness });
     }
 
     // If DB data is stale, attempt live RPC fallback
     if (isStale(stream.updatedAt)) {
       const chainStream = await getStreamFromChain(parsedStreamId);
       if (chainStream) {
+        const freshness = await getChainFreshnessMetadata({
+          source: "chain",
+          recordUpdatedAt: stream.updatedAt,
+        });
+        attachFreshnessHeaders(res, freshness);
         return res
           .status(200)
-          .json({ ...stream, ...chainStream, source: "chain" });
+          .json({ ...stream, ...chainStream, source: "chain", freshness });
       }
     }
 
-    return res.status(200).json(stream);
+    const freshness = await getChainFreshnessMetadata({
+      source: "indexer",
+      recordUpdatedAt: stream.updatedAt,
+    });
+    attachFreshnessHeaders(res, freshness);
+    return res.status(200).json({ ...stream, freshness });
   } catch (error) {
     logger.error("Error fetching stream:", error);
     return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");
@@ -485,7 +538,7 @@ export const getStreamEvents = async (req: Request, res: Response) => {
       whereClause.eventType = eventType;
     }
 
-    const [queriedEvents, total] = await Promise.all([
+    const [queriedEvents, total, freshness] = await Promise.all([
       prisma.streamEvent.findMany({
         where: whereClause,
         // `timestamp` is not unique (events in the same block/ledger can
@@ -497,6 +550,7 @@ export const getStreamEvents = async (req: Request, res: Response) => {
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : { skip: offset }),
       }),
       prisma.streamEvent.count({ where: whereClause }),
+      getChainFreshnessMetadata({ source: "indexer" }),
     ]);
 
     const hasMore = cursor
@@ -505,12 +559,15 @@ export const getStreamEvents = async (req: Request, res: Response) => {
     const events = queriedEvents.slice(0, limit);
     const lastEvent = events.at(-1);
 
+    attachFreshnessHeaders(res, freshness);
+
     return res.status(200).json({
       data: events,
       events,
       total,
       hasMore,
       nextCursor: hasMore ? lastEvent?.id ?? null : null,
+      freshness,
     });
   } catch (error) {
     logger.error("Error fetching stream events:", error);
@@ -563,6 +620,8 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
       // Fallback: try live RPC for claimable amount
       const chainClaimable = await getClaimableFromChain(parsedStreamId);
       if (chainClaimable !== null) {
+        const freshness = await getChainFreshnessMetadata({ source: "chain" });
+        attachFreshnessHeaders(res, freshness);
         return res.status(200).json({
           streamId: parsedStreamId,
           claimableAmount: chainClaimable,
@@ -570,6 +629,7 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
           calculatedAt: Math.floor(Date.now() / 1000),
           cached: false,
           source: "chain",
+          freshness,
         });
       }
       return sendApiError(res, 404, "NOT_FOUND", "Stream not found");
@@ -579,6 +639,11 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
     if (isStale(stream.updatedAt)) {
       const chainClaimable = await getClaimableFromChain(parsedStreamId);
       if (chainClaimable !== null) {
+        const freshness = await getChainFreshnessMetadata({
+          source: "chain",
+          recordUpdatedAt: stream.updatedAt,
+        });
+        attachFreshnessHeaders(res, freshness);
         return res.status(200).json({
           streamId: parsedStreamId,
           claimableAmount: chainClaimable,
@@ -586,6 +651,7 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
           calculatedAt: Math.floor(Date.now() / 1000),
           cached: false,
           source: "chain",
+          freshness,
         });
       }
     }
@@ -594,8 +660,13 @@ export const getStreamClaimableAmount = async (req: Request, res: Response) => {
       stream,
       requestedAt,
     );
+    const freshness = await getChainFreshnessMetadata({
+      source: "indexer",
+      recordUpdatedAt: stream.updatedAt,
+    });
+    attachFreshnessHeaders(res, freshness);
 
-    return res.status(200).json(result);
+    return res.status(200).json({ ...result, freshness });
   } catch (error) {
     logger.error("Error calculating stream claimable amount:", error);
     return sendApiError(res, 500, "INTERNAL_SERVER_ERROR", "A technical error occurred. Please try again later.");

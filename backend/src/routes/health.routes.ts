@@ -6,6 +6,7 @@ import { isRedisAvailable } from '../lib/redis.js';
 import { checkRpcHealth } from '../services/sorobanService.js';
 import { sorobanEventWorker } from '../workers/soroban-event-worker.js';
 import { SUPPORTED_VERSIONS, DEFAULT_VERSION } from '../middleware/api-version.middleware.js';
+import { computeChainFreshness } from '../services/freshness.service.js';
 
 const router = Router();
 
@@ -106,6 +107,14 @@ router.get('/', async (_req: Request, res: Response) => {
 
   setIndexerLedgers(state?.lastLedger ?? 0, networkLedger);
 
+  const chainFreshness = computeChainFreshness({
+    source: 'indexer',
+    indexedLedger: state?.lastLedger ?? null,
+    networkLedger: networkLedger > 0 ? networkLedger : null,
+    indexedAt: state?.updatedAt ?? null,
+    probeError: dbStatus !== 'connected' ? 'DATABASE_UNAVAILABLE' : null,
+  });
+
   const responseBody = {
     status,
     db: dbStatus,
@@ -117,6 +126,7 @@ router.get('/', async (_req: Request, res: Response) => {
     indexerDegraded: eventCounters.degraded,
     indexerLedgerLag:
       networkLedger > 0 ? Math.max(0, networkLedger - (state?.lastLedger ?? 0)) : null,
+    chainFreshness,
     uptime: process.uptime(),
     // Supported API versions — clients SHOULD poll this field and surface a
     // warning when the version they pin is no longer in `supported`.
