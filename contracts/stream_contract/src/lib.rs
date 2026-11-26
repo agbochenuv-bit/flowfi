@@ -3206,3 +3206,4 @@ fn validate_token(env: &Env, token_address: &Address) -> Result<(), StreamError>
         .map_err(|_| StreamError::IncompatibleToken)?;
     Ok(())
 }
+
