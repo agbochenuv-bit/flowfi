@@ -120,7 +120,7 @@ jobs:
         workspace: "contracts -> target"
 
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+      uses: github/codeql-action/init@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v3
       with:
         languages: ${{ matrix.language }}
         
@@ -131,7 +131,7 @@ jobs:
 
     - name: Autobuild
       if: matrix.language != 'rust'
-      uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v3
+      uses: github/codeql-action/autobuild@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v3
       
     - name: Perform CodeQL Analysis
       uses: github/codeql-action/analyze@1bd86f2fdb4b86187fa4059f16f31a3202acc9ea # v3
